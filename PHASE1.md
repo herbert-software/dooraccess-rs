@@ -62,19 +62,23 @@ Phase1 代码不破坏 Phase0 交叉链路。
 **0 外部 crate**。4 模块全用 `std`（含 `std::net::Ipv4Addr`）。serde/tokio/libc 等取舍留后续 Phase
 各自量体型决策（D2）。crate 重构为 lib+bin：`src/lib.rs` 暴露 4 模块，`src/main.rs` 保持 Phase0 probe 不变。
 
-## 5. 向量漂移门（诚实状态）
+## 5. 向量漂移门（✅ 已接通生效）
 
-`.github/workflows/ci.yml` 新增 `golden-drift` job（方案②）：跨仓 checkout 私有 `dooraccess-go`
+`.github/workflows/ci.yml` 的 `golden-drift` job（方案②）：跨仓 checkout 私有 `dooraccess-go`
 + `setup-go` + 重跑 export + 与 committed 向量逐字节 diff，不一致即 fail。
 
-**⚠ 已知缺口（未接通）**：该 job 需 secret `DOORACCESS_GO_TOKEN`（对私有 `HerbertGao/dooraccess-go`
-有 read 权限的 PAT/deploy-key）才能 checkout。**secret 未配置前，漂移门未生效**——committed 向量
-可静默漂移于 Go，Rust 可能对旧向量假绿。配置该 secret 后方为真机械门。（此标注本身是 prose 自律，
-按 spec tasks 2.5 元诚实要求显式记录；接通该 secret 是 apply 者收尾动作。）
+**状态：已接通并验证生效（2026-06-08）**。`DOORACCESS_GO_TOKEN` secret（细粒度 PAT，对
+`HerbertGao/dooraccess-go` Contents:Read）已配置；主分支 push CI run **`golden-drift` job 实跑
+26s 通过**——真实拉取 dooraccess-go + 重跑 Go 导出 + diff committed 向量一致。**机械门 live**：
+此后 Go daemon 改 wire/schema 而 committed 向量未同步更新，主分支 CI 会 fail，杜绝 Rust 对旧向量假绿。
+
+> Dependabot PR 跑在受限 secret 上下文拿不到该 token，且 action 升级永不改 golden 向量，故该 job
+> 用 `if: github.actor != 'dependabot[bot]'` 在 dependabot PR 上跳过（不影响主分支机械门）。
 
 ## 6. 结论
 
 Phase1 **通过**：4 个确定性模块 Rust 等价实现 + 100% golden parity（对真实 Go 向量）+ 0-crate gate 守住
 + MIPS 交叉编译验证（+4.7KB 可忽略增量、仍 BE/softfloat/静态）。具备进入 Phase2（bare HTTP + HA push）条件。
 
-剩余收尾：配置 `DOORACCESS_GO_TOKEN` secret 激活漂移门；`dooraccess-rs` 子仓 commit + Phase1 tag（task 9.3，git 写操作留人工）。
+剩余收尾：`dooraccess-rs` 子仓 Phase1 tag（task 9.3 唯一未完项，git 写操作留人工）。
+（`DOORACCESS_GO_TOKEN` secret 已配、漂移门已接通验证生效，见 §5。）
