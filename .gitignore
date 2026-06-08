@@ -1,0 +1,14 @@
+# Rust build output
+/target/
+
+# OpenWrt SDK download + extracted sysroot (large, fetched via `make fetch-sdk`).
+# The linker wrapper itself lives in scripts/ and IS tracked.
+/.openwrt-sdk/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

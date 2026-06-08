@@ -1,0 +1,13 @@
+[package]
+name = "dooraccess-rs-probe"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+strip = true
+opt-level = "z"

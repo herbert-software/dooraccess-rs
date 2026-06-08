@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  OPENWRT_SDK_VER: "24.10.1"
+
+jobs:
+  check:
+    name: check (host)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        run: rustup component add rustfmt clippy
+      - name: rustfmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --release -- -D warnings
+      - name: build (host)
+        run: cargo build --release
+      - name: test (host)
+        run: cargo test
+      - name: run host probe
+        run: ./target/release/dooraccess-rs-probe
+
+  mips-build:
+    name: cross-build MIPS BE soft-float
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly + rust-src + llvm-tools
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup component add rust-src llvm-tools-preview --toolchain nightly
+      - name: Install zstd
+        run: sudo apt-get update && sudo apt-get install -y zstd
+      - name: Cache OpenWrt SDK sysroot
+        uses: actions/cache@v4
+        with:
+          path: .openwrt-sdk
+          key: openwrt-sdk-${{ env.OPENWRT_SDK_VER }}-ath79-mips_24kc
+      - name: Fetch SDK sysroot
+        run: make fetch-sdk
+      - name: Cross-build static MIPS probe
+        run: make build-mips
+      - name: Verify MIPS BE + soft-float + static
+        run: make verify-mips
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dooraccess-rs-probe-mips
+          path: target/mips-unknown-linux-musl/release/dooraccess-rs-probe
