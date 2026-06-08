@@ -22,7 +22,7 @@ fn load_golden() -> String {
 
 fn hex_to_bytes(s: &str) -> Vec<u8> {
     let s = s.trim();
-    assert!(s.len() % 2 == 0, "odd hex length: {:?}", s);
+    assert!(s.len().is_multiple_of(2), "odd hex length: {:?}", s);
     (0..s.len())
         .step_by(2)
         .map(|i| {

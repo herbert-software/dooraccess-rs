@@ -100,3 +100,54 @@ Rust 已对齐**部署目标 int32 语义**（非 64-bit host）：
 > golden 向量（64-bit host 抓取）结构盲区，靠差分测试发现；回归测试见 tests/golden_config.rs
 > (validate_uri_overlong_octet / conv_int_int32_range) + tests/golden_wire.rs (parse_response_req_over_i32)，
 > 经 revert 实证非 vacuous。
+
+---
+
+## §HTTP /info — HACS v0.4.0 字段核对（G3 硬核对，2026-06-08）
+
+**来源**：本地 `hacs-dooraccess/` grep（`config_flow.py`、`__init__.py`、`button.py`、`lock.py`、`camera.py`、`api.py`）。
+
+### jsonInfo 6 字段 vs HACS 实际读取
+
+| `/info` 字段 | HACS 是否读取 | 读取位置 / 用途 | 与 Rust `info::render_json` 对齐 |
+|--------------|---------------|-----------------|----------------------------------|
+| `daemon` | ✅ | `config_flow.py`：`info.get("daemon") != "dooraccess-go"` | ✅ 常量 `"dooraccess-go"` |
+| `version` | ⚠️ 间接 | `config_flow` 仅校验 daemon；版本 prefix check 在 CHANGELOG 提及，当前 `config_flow.py` 未硬编码 | ✅ 输出 `version` 字段 |
+| `brand` | ⚠️ 未直接读 | v0.1.6 后 `config_flow` 改查 `daemon` 而非 `brand`；字段仍输出供 sanity | ✅ 常量 `"anjubao"` |
+| `monitor` | ✅ | `button.py` / `lock.py` setup：`info.get("monitor")` | ✅ `cfg.sip` |
+| `outdoor_stations` | ✅ | `button.py` / `lock.py` / `__init__.py`：`info.get("outdoor_stations")`，元素 `["sip"]` | ✅ 空 `[]` |
+| `video` | ✅ | `__init__.py`：`info.get("video")` 整块 | ✅ 嵌套 struct 声明序 |
+
+### `video` 子字段 vs HACS
+
+| 子字段 | HACS 是否读取 | 读取位置 | 对齐 |
+|--------|---------------|----------|------|
+| `forward` | ✅ fallback | `__init__.py`：`video_block.get("forward_supported", video_block.get("forward"))` | ✅ |
+| `forward_supported` | ✅ 主路径 | `__init__.py` / `camera.py` `available` | ✅ = `cfg.video.forward` |
+| `protocol` | ❌ | 无 grep 命中 | ✅ 仍输出（Go 同源） |
+| `format` | ✅ | `__init__.py`：`video_block.get("format")` 默认 `"flv"` | ✅ |
+| `cache_path` | ❌ | 无 grep 命中 | ✅ 仍输出（Go 同源） |
+
+### 差异 / 备注
+
+- **无字段集分叉**：HACS v0.4.0 消费的 `/info` 字段 ⊆ Go `jsonInfo` 6 字段；Rust 按 Go `render_json.go` 声明序输出即可。
+- **`version` / `brand`**：HACS 探活主门禁是 `daemon`，非 `brand`；保留输出与 Go 字节等价，非多余字段。
+- **`lookup_wwan` 平台**：Go `net.InterfaceByName` 跨平台；Rust Linux 用 `SIOCGIFADDR` ioctl，macOS 开发机构造返空（`PushDiagnosis` fallback 行为与 Go「失败返空串」一致）。部署目标 OpenWrt/Linux 走 ioctl 路径。
+
+### Phase 2 review-loop 厘清的 Go 对齐 / 已知降级（2026-06-08）
+
+- **`/unlock` 失败状态码 = Phase-2 占位**：Go `handleUnlock` 经 `respondWireFailure` 把 sender 失败分类为
+  200/-103(SilentFIN)、503/-5(Timeout)、503/-1(其它)。Rust Phase-2 一律 **200 + result=-1(ERR)**——这是 spec §133
+  显式推迟到 **Phase 3** 的「错误分类」的占位行为（`trait Sender` 缝在 ExecuteUnlock 边界，分类属 Phase-3
+  `port-rust-listeners-unlock`）。**非假绿**：成功路径（result=0）字节等价；失败路径状态码/result 分类待 Phase-3
+  真 sender + 错误分类一并实现。HACS 若依据 HTTP 503 判 daemon 下游故障，须知 Phase-2 不发 503（已记此差异）。
+- **auto_toggle / unlock body 解析 = Go json.Unmarshal 语义**（R1 + R2 修正，已逐边界对齐 go run 实测）：
+  RAW `len==0` 空 body / `{}` / 缺字段 / `null` / `{"on":null}` → 零值（auto_*=false / To=""），非 400；
+  **纯空白 body "   "（raw 非空）→ 报错 400**（Go 查 RAW 字节 len，非 trim）；key **大小写不敏感**；
+  **重复 key last-wins**（`{"on":true,"on":false}`→false）；`{"on":1}` 等非 bool 值 / 非法 JSON → 400。
+  已加单测锁定（`auto_toggle_body_matches_go_unmarshal_semantics` 覆盖全部上述边界 / `unlock_empty_body_falls_to_missing_to`）。
+- **JSON 转义表 = Go encoding/json**（review-loop R1 修正）：U+2028/U+2029 两模式无条件转 ` / `；
+  仅 C0(`< 0x20`) 转义，DEL(0x7F)/C1 不转。已加单测锁定（`escape_edge_cases_match_go`，go run 实测基线）。
+- **body deadline = whole-request**（review-loop R1 修正）：body 读取在 headers 后切到 `read_timeout`（30s）而非更紧的
+  `read_header_timeout`（5s），复刻 Go lazy-body 时序。诚实时序测试 `read_timeout_is_whole_request_deadline`
+  断言 body 落在 header-deadline 与 req-deadline 之间时仍 200 OK。

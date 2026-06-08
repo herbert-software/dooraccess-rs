@@ -92,7 +92,7 @@ jobs:
           DOORACCESS_GOLDEN_DIR: ${{ github.workspace }}/_fresh-golden
         run: |
           mkdir -p "$DOORACCESS_GOLDEN_DIR"
-          for pkg in codec wire18022 config automationstate; do
+          for pkg in codec wire18022 config automationstate http8080; do
             go test -tags export -run ExportGolden ./internal/$pkg/
           done
       - name: Diff committed golden vs fresh Go export
@@ -101,5 +101,9 @@ jobs:
           for f in bcd.txt uri.txt wire.txt config.txt results.txt automation_state.txt; do
             diff -u "dooraccess-rs/testdata/golden/$f" "_fresh-golden/$f" \
               || { echo "::error::golden 向量漂移：committed $f 与当前 Go 输出不一致"; exit 1; }
+          done
+          for f in parser.txt endpoint_body.txt endpoint_socket.txt middleware.txt hapush.txt mux404.txt; do
+            diff -u "dooraccess-rs/testdata/golden/http/$f" "_fresh-golden/http/$f" \
+              || { echo "::error::golden HTTP 向量漂移：committed http/$f 与当前 Go 输出不一致"; exit 1; }
           done
           echo "✓ committed golden 向量与当前 Go 输出逐字节一致"
