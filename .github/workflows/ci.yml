@@ -15,7 +15,7 @@ jobs:
     name: check (host)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install stable toolchain
         run: rustup component add rustfmt clippy
       - name: rustfmt
@@ -33,7 +33,7 @@ jobs:
     name: cross-build MIPS BE soft-float
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install nightly + rust-src + llvm-tools
         run: |
           rustup toolchain install nightly --profile minimal
@@ -74,11 +74,11 @@ jobs:
     if: github.actor != 'dependabot[bot]'
     steps:
       - name: Checkout dooraccess-rs (golden vectors)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: dooraccess-rs
       - name: Checkout private dooraccess-go
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: HerbertGao/dooraccess-go
           token: ${{ secrets.DOORACCESS_GO_TOKEN }}
