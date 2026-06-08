@@ -181,7 +181,11 @@ fn write_request(
 ) -> Result<(), String> {
     write!(stream, "{method} {target} HTTP/1.1\r\n")
         .map_err(|e| format!("httpx: write request line: {e}"))?;
-    for (k, vals) in header.iter() {
+    // 按 key 排序后写,保证 request 字节确定性（`Header` 内部 HashMap iter 序随机；
+    // 与 Go `httpx/client.go` sort.Strings + `response.rs` 对齐）。
+    let mut entries: Vec<(&String, &Vec<String>)> = header.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    for (k, vals) in entries {
         for v in vals {
             write!(stream, "{k}: {v}\r\n").map_err(|e| format!("httpx: write header: {e}"))?;
         }
