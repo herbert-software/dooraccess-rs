@@ -173,29 +173,36 @@ fn map_wire_kind(err: &WireError) -> WireKind {
 impl UnlockWire for WireSenderAdapter {
     /// 单次三步握手 710→711→518→519（锚 Go `tryUnlockOnce`）。
     ///
-    /// `per_attempt_timeout`：`Some` 时（ring fail-fast probe）以该值覆盖 sender 每阶段
-    /// timeout（让未就绪外机挂住的连接到点切断）；`None` 用 sender 配置的 5s。
+    /// `per_attempt_cap`：`Some` 时（ring fail-fast probe）每步上限为该值（让未就绪外机挂住的
+    /// 连接到点切断）；`None` 用 sender 默认 5s（[`wire_sender::DEFAULT_TIMEOUT`]）。
+    /// `deadline`：总 cap——710/518 两步**共享**这同一个递减的剩余 cap（修复 bugbot #1：对齐 Go
+    /// 两次 `SendContext(ctx,...)` 传同一 ctx），故每步在 **send 前**重算
+    /// `op_timeout = min(per_attempt_cap_or_default, deadline.remaining())`，使第二步预算 =
+    /// `min(cap, 第一步消耗后剩余)`，两步合计 ≤ 剩余 cap、不超 2×。`deadline.remaining()` 为 None
+    /// （NeverExpire/无 cap）时每步仅用 per_attempt_cap_or_default，不施 cap 层。
+    #[allow(clippy::too_many_arguments)]
     fn try_once(
         &self,
         caller_bcd: [u8; 4],
         callee_bcd: [u8; 4],
         target_ip: &str,
         target_port: u16,
-        per_attempt_timeout: Option<Duration>,
+        per_attempt_cap: Option<Duration>,
+        deadline: &dyn Deadline,
         cancel: &AtomicBool,
     ) -> AttemptOutcome {
-        // per-attempt timeout 覆盖：clone sender 改 timeout（短连接每帧独立 socket，
-        // clone 廉价）。None → 用原 sender 5s。
-        let sender = match per_attempt_timeout {
-            Some(t) => {
-                let mut s = self.wire.clone();
-                s.timeout = Some(t);
-                s
-            }
-            None => self.wire.clone(),
+        // 每步 send 前重算 op_timeout = min(本路径单帧上限, 那一刻的剩余总 cap)。
+        // 本路径单帧上限 = per_attempt_cap（ring probe）或 sender 默认 5s（HTTP 路径）。
+        // 两步分别取此刻 deadline.remaining()——故 cap 预算在 710→518 间递减、共享。
+        let cap = per_attempt_cap.unwrap_or(wire_sender::DEFAULT_TIMEOUT);
+        let op_timeout = || match deadline.remaining() {
+            Some(remaining) => cap.min(remaining),
+            None => cap,
         };
 
         // 1. unlock-A（req=710），期望 req=711。
+        let mut sender = self.wire.clone();
+        sender.timeout = Some(op_timeout());
         let resp_a = match sender.send_context(
             cancel,
             target_ip,
@@ -219,6 +226,9 @@ impl UnlockWire for WireSenderAdapter {
         }
 
         // 2. unlock-B（req=518 标准 + 校验和），期望 req=519。
+        // op_timeout() 此刻重算 → 拿第一步消耗后的剩余 cap（两步共享递减预算）。
+        let mut sender = self.wire.clone();
+        sender.timeout = Some(op_timeout());
         let resp_b = match sender.send_context(
             cancel,
             target_ip,
@@ -286,6 +296,207 @@ impl Sender for WireSenderAdapter {
 // 在此覆盖——验 WireError → WireKind → classify_wire_err(i32) 的端到端映射。
 // （tests/golden_listeners.rs 只能验公开 is_retryable_error 的 retryable bool。）
 // ===========================================================================
+
+// ===========================================================================
+// tests（修复 bugbot #1）：try_once 两步共享递减剩余 cap，合计不超 2×单步上限。
+// ===========================================================================
+
+#[cfg(test)]
+mod shared_budget_tests {
+    use super::*;
+    use crate::unlock::{Deadline, UnlockStage, UnlockWire};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    /// 记录每次 `remaining()` 返回值的 fake Deadline：按调用次序吐出 `seq` 中的值
+    /// （超出末尾重复末值）；`expired()` 在剩余为 ZERO 时为 true。
+    struct ScriptedDeadline {
+        seq: Vec<Option<Duration>>,
+        calls: AtomicUsize,
+    }
+    impl Deadline for ScriptedDeadline {
+        fn expired(&self) -> bool {
+            // 与本测无关（run_unlock_with_retry 才调）；保守按当前应返值是否 ZERO。
+            let i = self.calls.load(Ordering::SeqCst).min(self.seq.len() - 1);
+            matches!(self.seq[i], Some(d) if d.is_zero())
+        }
+        fn remaining(&self) -> Option<Duration> {
+            let i = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.seq[i.min(self.seq.len() - 1)]
+        }
+    }
+
+    /// 构造一个合法响应帧：`07 b8` magic + LE 长度 + 00 00 reserved + `req=N&query=` + 10 字节 body。
+    fn build_resp(req: &str, body10: [u8; 10]) -> Vec<u8> {
+        let mut frame_body = Vec::new();
+        frame_body.extend_from_slice(format!("req={req}&query=").as_bytes());
+        frame_body.extend_from_slice(&body10);
+        let mut frame = vec![0x07u8, 0xb8];
+        frame.extend_from_slice(&(frame_body.len() as u16).to_le_bytes());
+        frame.push(0x00);
+        frame.push(0x00);
+        frame.extend_from_slice(&frame_body);
+        frame
+    }
+
+    /// 711 标准 body 模板（与 wire18022::RESP_711_BODY 一致，validate_response 严校）。
+    fn build_711() -> Vec<u8> {
+        build_resp(
+            "711",
+            [0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00],
+        )
+    }
+
+    /// 第一步（710）正常回 711，但服务器先 sleep 消耗预算；第二步（518）连上后
+    /// 永不响应。Deadline 在第二步 remaining 返回一个**比单步 cap 小**的剩余 →
+    /// 第二步必须按那个更小的剩余超时（证明两步共享递减 cap，而非各起新 cap）。
+    #[test]
+    fn try_once_second_step_bounded_by_remaining_cap() {
+        let conn_idx = Arc::new(AtomicUsize::new(0));
+        let r711 = build_711();
+        let conn_idx_c = conn_idx.clone();
+
+        let ln = TcpListener::bind("127.0.0.1:0").expect("listen");
+        let port = ln.local_addr().unwrap().port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_c = stop.clone();
+        let server = thread::spawn(move || {
+            for conn in ln.incoming() {
+                if stop_c.load(Ordering::SeqCst) {
+                    return;
+                }
+                let Ok(mut c) = conn else { return };
+                let idx = conn_idx_c.fetch_add(1, Ordering::SeqCst);
+                let r711 = r711.clone();
+                thread::spawn(move || {
+                    let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut buf = [0u8; 256];
+                    let _ = c.read(&mut buf);
+                    if idx == 0 {
+                        // 第一步：回 711（让握手进入第二步）。
+                        let _ = c.write_all(&r711);
+                    } else {
+                        // 第二步：永不响应，长 sleep 让客户端按其 read timeout 超时。
+                        thread::sleep(Duration::from_secs(3));
+                    }
+                    drop(c);
+                });
+            }
+        });
+
+        // 单步 cap=5s（HTTP 默认）；但 Deadline 第二步剩余=400ms → 第二步 read 应在 ~400ms
+        // 超时返回 Timeout，而非 5s。第一步剩余给足（2s）让 711 能回。
+        let deadline = ScriptedDeadline {
+            seq: vec![
+                Some(Duration::from_secs(2)),       // 710 步剩余
+                Some(Duration::from_millis(400)),   // 518 步剩余（被收紧）
+            ],
+            calls: AtomicUsize::new(0),
+        };
+        let adapter = WireSenderAdapter::new(wire_sender::Sender::default());
+        let cancel = AtomicBool::new(false);
+
+        let start = Instant::now();
+        let outcome = adapter.try_once(
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+            "127.0.0.1",
+            port,
+            None, // HTTP 路径：单步 cap=sender 默认 5s
+            &deadline,
+            &cancel,
+        );
+        let elapsed = start.elapsed();
+
+        stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(("127.0.0.1", port));
+        let _ = server.join();
+
+        // 第二步应因收紧的 400ms 剩余 cap 超时（而非 5s 单步上限）。
+        assert!(
+            matches!(
+                outcome,
+                AttemptOutcome::WireErr {
+                    stage: UnlockStage::UnlockB,
+                    ..
+                }
+            ),
+            "第二步应 wire 超时（UnlockB），got {outcome:?}"
+        );
+        // 合计耗时受递减剩余约束：远小于 2×5s，更小于单步 5s 上限的两倍。
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "两步共享递减 cap，合计应远小于 2×5s，实际 {elapsed:?}"
+        );
+    }
+
+    /// remaining()==None（无 cap）时每步仅用 per_attempt_cap（不施 cap 层）——
+    /// 验 None 路径不 panic 且能正常握手成功。
+    #[test]
+    fn try_once_no_cap_uses_per_attempt_only() {
+        let r711 = build_711();
+        let r519 = build_resp("519", [0u8; 10]);
+
+        let conn_idx = Arc::new(AtomicUsize::new(0));
+        let conn_idx_c = conn_idx.clone();
+        let ln = TcpListener::bind("127.0.0.1:0").expect("listen");
+        let port = ln.local_addr().unwrap().port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_c = stop.clone();
+        let server = thread::spawn(move || {
+            for conn in ln.incoming() {
+                if stop_c.load(Ordering::SeqCst) {
+                    return;
+                }
+                let Ok(mut c) = conn else { return };
+                let idx = conn_idx_c.fetch_add(1, Ordering::SeqCst);
+                let (r711, r519) = (r711.clone(), r519.clone());
+                thread::spawn(move || {
+                    let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut buf = [0u8; 256];
+                    let _ = c.read(&mut buf);
+                    let _ = c.write_all(if idx == 0 { &r711 } else { &r519 });
+                    drop(c);
+                });
+            }
+        });
+
+        struct NoCap;
+        impl Deadline for NoCap {
+            fn expired(&self) -> bool {
+                false
+            }
+            fn remaining(&self) -> Option<Duration> {
+                None
+            }
+        }
+
+        let adapter = WireSenderAdapter::new(wire_sender::Sender {
+            timeout: Some(Duration::from_secs(2)),
+            ..Default::default()
+        });
+        let cancel = AtomicBool::new(false);
+        let outcome = adapter.try_once(
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+            "127.0.0.1",
+            port,
+            None,
+            &NoCap,
+            &cancel,
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(("127.0.0.1", port));
+        let _ = server.join();
+
+        assert_eq!(outcome, AttemptOutcome::Ok, "无 cap 路径应正常握手成功");
+    }
+}
 
 #[cfg(test)]
 mod golden_errclass_tests {

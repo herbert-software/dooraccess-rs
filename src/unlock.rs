@@ -142,18 +142,23 @@ pub fn classify_wire_err(kind: WireKind) -> i32 {
 
 /// 单次三步握手抽象（锚 Go `tryUnlockOnce`）。
 ///
-/// `per_attempt_timeout`：`Some(d)` 时（ring fail-fast probe）本次 attempt 须在 `d` 内
-/// 完成、到点切断重探；`None`（HTTP 路径）用 sender 自身的 5s timeout。`cancel`：父 ctx
-/// 取消（SIGTERM/HACS 断开）时立即放弃。返回 [`AttemptOutcome`]。
+/// `per_attempt_cap`：`Some(d)` 时（ring fail-fast probe）每步上限为 `d`（到点切断重探）；
+/// `None`（HTTP 路径）每步用 sender 自身的 5s 默认。`deadline`：总 cap（锚 Go `tryUnlockOnce`
+/// 收到的 `ctx`=attemptCtx=HTTP 路径 tctx 总 cap）——710/518 两步**共享**这同一个递减的剩余
+/// cap，故每步实际超时 = `min(per_attempt_cap_or_default, deadline.remaining())`，两步合计 ≤
+/// 剩余 cap（对齐 Go 两次 `SendContext(ctx,...)` 传同一 ctx）。`cancel`：父 ctx 取消
+/// （SIGTERM/HACS 断开）时立即放弃。返回 [`AttemptOutcome`]。
 pub trait UnlockWire: Send + Sync {
     /// 执行一次 710→711→518→519 握手。
+    #[allow(clippy::too_many_arguments)]
     fn try_once(
         &self,
         caller_bcd: [u8; 4],
         callee_bcd: [u8; 4],
         target_ip: &str,
         target_port: u16,
-        per_attempt_timeout: Option<Duration>,
+        per_attempt_cap: Option<Duration>,
+        deadline: &dyn Deadline,
         cancel: &AtomicBool,
     ) -> AttemptOutcome;
 }
@@ -343,24 +348,19 @@ pub fn run_unlock_with_retry(
 
         // 每次 attempt 的单帧超时对齐 Go 两层：sender 固定 5s SO_*TIMEO（`SendContext` 内
         // `conn.SetDeadline(now+5s)`）∧ 剩余总 cap（attemptCtx=tctx 在 cap 命中时 `conn.Close()`）。
-        // 故 per-attempt 上限 = min(本路径单帧上限, 剩余总 cap)：
-        //   - 本路径单帧上限 = per_attempt_timeout（ring fail-fast probe=800ms）
-        //     或缺省时的 sender 默认 5s（HTTP 路径，复用 wire_sender::DEFAULT_TIMEOUT）。
-        //   - 剩余总 cap = deadline.remaining()；None（NeverExpire/无 cap）时不施加 cap 层，
-        //     透传本路径单帧上限（per_attempt_timeout 原样，可能 None=sender 用自身默认 5s）。
-        // 结果：HTTP→min(5s,remaining)；ring→min(800ms,remaining)；无 cap→per_attempt 透传。
-        let per_attempt_cap = per_attempt_timeout.unwrap_or(crate::wire_sender::DEFAULT_TIMEOUT);
-        let effective_per_attempt = match deadline.remaining() {
-            Some(remaining) => Some(per_attempt_cap.min(remaining)),
-            None => per_attempt_timeout,
-        };
-
+        // 关键（修复 bugbot #1）：一次 attempt 内 710+518 两步**共享**递减的剩余总 cap——Go 把
+        // **同一个 ctx** 传给两次 `SendContext`，第二步的 cap 预算 = 第一步消耗后的剩余。故不在此
+        // 预算单个 effective 传下去（那样每步各起新 5s 预算 → 合计可达 2×effective、超剩余 cap），
+        // 而是把 `per_attempt_cap`（本路径单帧上限：ring probe=800ms / HTTP=None→sender 默认 5s）
+        // 与 `deadline`（总 cap，可重读递减剩余）一并传进 try_once，由其对 710/518 **各自**在调
+        // send 前重算 `min(per_attempt_cap_or_default, deadline.remaining())`。
         let outcome = wire.try_once(
             caller_bcd,
             callee_bcd,
             target_ip,
             target_port,
-            effective_per_attempt,
+            per_attempt_timeout,
+            deadline,
             cancel,
         );
 
@@ -463,7 +463,10 @@ pub fn execute_unlock(
         retry_interval,
     );
 
-    // 结果分类（锚 handlers.go:345-364）。
+    // 结果分类（锚 handlers.go:345-364）。归一后的 wire_kind 回写到返回值（修复 bugbot #3：
+    // cap 击中翻 Timeout 后须同步 wire_kind，使 result 与 wire_kind 一致——对齐 Go
+    // `UnlockOutcome.WireErr` 是已归一值的契约）。
+    let mut wire_kind = wire_kind;
     if result == result_code::OK || result == result_code::ERR {
         // OK / 业务错：result 已是最终值。
     } else if terminated_by_bye {
@@ -487,6 +490,8 @@ pub fn execute_unlock(
         } else {
             kind
         };
+        // 回写归一后的 kind（与 result 一致，对齐 Go WireErr 已归一契约）。
+        wire_kind = Some(kind);
         result = classify_wire_err(kind);
     } else {
         // 无 wire_kind 的中断路径（cancel/cap 在首次尝试前命中）→ NO_RING（保持 Go
@@ -545,13 +550,15 @@ mod tests {
     }
 
     impl UnlockWire for MockWire {
+        #[allow(clippy::too_many_arguments)]
         fn try_once(
             &self,
             _caller_bcd: [u8; 4],
             _callee_bcd: [u8; 4],
             _target_ip: &str,
             _target_port: u16,
-            _per_attempt_timeout: Option<Duration>,
+            _per_attempt_cap: Option<Duration>,
+            _deadline: &dyn Deadline,
             _cancel: &AtomicBool,
         ) -> AttemptOutcome {
             let i = self.calls.fetch_add(1, Ordering::SeqCst);
@@ -1071,6 +1078,46 @@ mod tests {
         assert!(out.wire_kind.is_some(), "应保留末次 wire_kind 供归一分类");
     }
 
+    // --- 场景（修复 bugbot #3）：cap 击中 + unlock-B 非可重试错 → wire_kind 回写归一为
+    //     Timeout，与 result(-5) 一致 ---
+
+    #[test]
+    fn unlock_b_non_retryable_cap_hit_remaps_wire_kind() {
+        // unlock-B wire 失败（Other，非可重试）直接返 Some(Other)（710 已 ack 禁重试）。
+        // Deadline 首次 top-of-loop 检查未过期（让 attempt 跑），之后过期 → execute_unlock
+        // 归一分支 `expired && !retryable` 命中：kind 翻成 Timeout → result=-5，wire_kind 须
+        // 同步回写为 Timeout（不留陈旧 Other）。
+        struct ExpireAfterFirstCheck {
+            checks: AtomicUsize,
+        }
+        impl Deadline for ExpireAfterFirstCheck {
+            fn expired(&self) -> bool {
+                // 第 0 次（run_unlock_with_retry top-of-loop）未过期；之后（execute_unlock
+                // 归一分支）过期。
+                self.checks.fetch_add(1, Ordering::SeqCst) >= 1
+            }
+            fn remaining(&self) -> Option<Duration> {
+                Some(Duration::from_secs(2))
+            }
+        }
+        let wire = MockWire::new(vec![AttemptOutcome::WireErr {
+            stage: UnlockStage::UnlockB,
+            err: WireKind::Other,
+        }]);
+        let cancel = AtomicBool::new(false);
+        let sleeper = NoopSleeper::new();
+        let deadline = ExpireAfterFirstCheck {
+            checks: AtomicUsize::new(0),
+        };
+        let out = run(&wire, None, &cancel, &sleeper, &deadline, None);
+        assert_eq!(out.result, result_code::TIMEOUT, "cap 击中非可重试 → -5");
+        assert_eq!(
+            out.wire_kind,
+            Some(WireKind::Timeout),
+            "wire_kind 须回写为归一后的 Timeout，与 result 一致（不留陈旧 Other）"
+        );
+    }
+
     // --- classify_wire_err 直测 ---
 
     #[test]
@@ -1150,6 +1197,7 @@ mod tests {
             max_seen: Arc<AtomicI32>,
         }
         impl UnlockWire for SerialWire {
+            #[allow(clippy::too_many_arguments)]
             fn try_once(
                 &self,
                 _c: [u8; 4],
@@ -1157,6 +1205,7 @@ mod tests {
                 _ip: &str,
                 _p: u16,
                 _t: Option<Duration>,
+                _deadline: &dyn Deadline,
                 _cancel: &AtomicBool,
             ) -> AttemptOutcome {
                 let n = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;

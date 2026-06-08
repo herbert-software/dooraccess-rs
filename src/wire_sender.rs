@@ -239,19 +239,24 @@ impl Sender {
         // 阻塞的 read/write 立即返错（Go 侧 ctx.Done() → conn.Close()）。
         let watcher = CancelWatcher::spawn(&stream, cancel, deadline);
 
-        let result = self.write_then_read(&stream, frame, want_recv, timeout, cancel);
+        let result = self.write_then_read(&stream, frame, want_recv, timeout, deadline, cancel);
         // 显式停监视线程（drop 也会停，写明意图）。
         drop(watcher);
         result
     }
 
     /// write frame（+ 可选 read 响应）；各阶段套 deadline。
+    ///
+    /// `deadline`：本次 send 的绝对 deadline（= `connect 起点 + timeout`），与 [`CancelWatcher`]
+    /// 用的同一个——n==0 EOF 分支据此区分「deadline 触发 watcher shutdown」（→ Timeout）与
+    /// 「外机真 silent FIN」（→ SilentFin），见下方注释（修复 bugbot #2）。
     fn write_then_read(
         &self,
         stream: &TcpStream,
         frame: &[u8],
         want_recv: bool,
         timeout: Duration,
+        deadline: Instant,
         cancel: &AtomicBool,
     ) -> Result<Option<Vec<u8>>, WireError> {
         // write 阶段 deadline。
@@ -296,6 +301,14 @@ impl Sender {
             // 误判成可重试 SilentFin(-103)。
             if cancel.load(Ordering::SeqCst) {
                 return Err(WireError::Canceled { stage: "read" });
+            }
+            // 修复 bugbot #2：CancelWatcher 不仅监视 cancel，也监视本次 send 的 deadline
+            // （wire_sender.rs CancelWatcher::spawn 内 `cancel || Instant::now()>=deadline` →
+            // `shutdown(Both)`）。若 deadline 已过而 cancel 未置位，这个 Ok(0) 是 deadline
+            // 触发 shutdown 的产物、**不是**外机 silent FIN——对齐 Go `conn.Close()` 因 deadline
+            // 让 Read 返错（非 EOF）归 Timeout/-5（而非可重试 SilentFin/-103）。
+            if Instant::now() >= deadline {
+                return Err(WireError::Timeout { stage: "read" });
             }
             // 0 字节响应 + EOF = silent FIN（外机 ring 状态机拒绝 / idle timeout）。
             // 锚 Go：`if n == 0 { if err == nil || err == io.EOF { return ErrSilentFIN } }`。
