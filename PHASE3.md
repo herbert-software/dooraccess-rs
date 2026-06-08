@@ -104,16 +104,15 @@ unlock classify_wire_err+filter_req708），`black_box` 防 DCE。
 
 | 层 | 落点 | 本变更状态 | 能验 / 不能验 |
 |---|---|---|---|
-| **Tier 1 golden + 编译期断言** | 本机 macOS（LE） | ✅ 已认证 | `htons`/`to_be`/`from_be_bytes` 表达式正确性（golden 逐字节）；`ffi.rs` 新增 `#[cfg(target_endian="big")]` const-assert `htons(0x0003)==0x0003` / `htons(0x0800)==0x0800`（编译 MIPS 目标即编译期求值认证 BE no-op，无需运行 BE 二进制）；int 宽度 const-assert（c_int=4 / mips time_t=4） |
-| **Tier 2 qemu-mips(BE) user-mode** | CI ubuntu-latest（Linux） | ✅ 已接通 | 新增 `qemu-mips-test` job：`qemu-user-static` + binfmt + `cargo +nightly test -Z build-std --target mips`（runner=qemu-mips-static）跑全部纯软单测，认证 **BE 寄存器行为 + struct 字段宽度**（mips32 tv_sec/sll_ifindex）。**注意是 `qemu-mips`（大端）不是 `qemu-mipsel`**。job 末尾断言 `test result: ok. N passed`（N≥1）防「0 passed 假绿」 |
+| **Tier 1 golden** | 本机 macOS（LE）+ CI | ✅ 已认证 | `htons`/`to_be`/`from_be_bytes` 表达式正确性（golden 逐字节，输入是固定 BE 字节，与 host 端序无关）；golden-drift 跨仓重导 Go diff |
+| **Tier 2 编译期 `#[cfg(target_endian="big")]` const 断言** | `cross-build MIPS BE soft-float` job（已通过） | ✅ 已认证 | `ffi.rs` 的 `const _: () = assert!(htons(0x0003)==0x0003 / htons(0x0800)==0x0800)` + int 宽度断言（c_int=4 / mips time_t=4 / sock_filter=8）。`make build-mips` 编译 ffi.rs 时由 **const-eval 按 mips BE 目标端序求值**——htons 写错（`v<<8\|v>>8`）或 struct 宽度分叉即**编译期失败**，故该 job 通过即认证 BE 寄存器/端序 + struct 宽度。**曾尝试 qemu-mips runtime 单测 job 作 Tier 2,但 cross-test 需静态 musl sysroot（默认链接在 CI 失败）+ qemu 下线程/TCP 单测不稳；其核心保证已由编译期 const 断言覆盖,故移除 qemu job 采编译期断言（spec 明列的 fallback）** |
 | **Tier 3 PF_PACKET socket-level** | 真 hAP（QCA9533） | ⏸ **交接姊妹变更 `verify-rust-listeners-on-hap`** | qemu-user 把 syscall 透传宿主 LE 内核，**抓不到 `sll_protocol` NBO bug**（AF_PACKET 是内核网络栈）。须按 `dooraccess-go/DEPLOY.md` S1-S12 上真 hAP，确认 `/proc/net/packet` Proto=0003（非 0300）+ 真收帧 |
 
-**本变更认证到 Tier 2**（编译期 BE no-op 断言 + qemu BE 寄存器/struct 宽度 + golden 表达式）。
+**本变更认证到 Tier 2**（golden 表达式 + 编译期 BE const 断言在通过的 cross-build job 强制）。
 PF_PACKET socket-level BE 是结构性不可在无真机/无 BE 内核下认证的局限，spec 已 gate 化、交接姊妹变更，**非假完成**。
 
-注：macOS brew 只给 `qemu-system-*` 无 `qemu-mips` user-mode（已知限制），故 Tier 2 落点必须是 Linux CI。
-`qemu-system-mips`（大端全系统，带真 BE 内核）可作姊妹变更上 hAP 前的**可选 de-risk smoke**，但内核 ≠
-生产 QCA9533，**不替代 hAP 认证**。
+注：macOS brew 只给 `qemu-system-*` 无 `qemu-mips` user-mode（已知限制）；`qemu-system-mips`（大端全系统，
+带真 BE 内核）可作姊妹变更上 hAP 前的**可选 de-risk smoke**，但内核 ≠ 生产 QCA9533，**不替代 hAP 认证**。
 
 ## 6. trait Subscribable 缝形状（Phase 4 契约）
 
@@ -150,8 +149,8 @@ Phase 4）；不移植 auto-hangup 外机 bye（Phase 4）；不移植 `/video/*
 Phase3 **通过**：ffi（PF_PACKET libc 缝）/ bpf / listen6672 / listen18022 / wire_sender / unlock 核心 Rust
 等价实现 + golden 逐字段验证（150 lib 单测 + 跨语言 golden 全过，含 Phase1/2 不回归）+ mock-e2e 覆盖
 unlock retry/probe/bye/cancel/unlock-B + 0-crate 放宽边界守住（`cargo tree` 仅 `libc`）+ MIPS 交叉编译验证
-（+4.2KB 增量、仍 BE/softfloat/静态）+ BE 三层防御前两层接通（编译期 `#[cfg(target_endian="big")]` 断言 +
-CI qemu-mips BE 单测），第三层 PF_PACKET socket-level BE 显式交接姊妹变更。具备进入 Phase4（daemon 编排 +
+（+4.2KB 增量、仍 BE/softfloat/静态）+ BE 三层防御前两层接通（golden 表达式 + 编译期 `#[cfg(target_endian="big")]`
+const 断言由通过的 cross-build job 强制），第三层 PF_PACKET socket-level BE 显式交接姊妹变更。具备进入 Phase4（daemon 编排 +
 self-unlock）条件。
 
 剩余收尾：

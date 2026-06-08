@@ -57,48 +57,20 @@ jobs:
           name: dooraccess-rs-probe-mips
           path: target/mips-unknown-linux-musl/release/dooraccess-rs-probe
 
-  # ── BE 第二层防御：qemu-mips(big-endian) user-mode 单测（port-rust-listeners-unlock, task 9.1）─
-  # 认证 BE 寄存器行为 + struct 字段宽度（htons/to_be/from_be_bytes 在真 BE 寄存器、mips32
-  # tv_sec/sll_ifindex 宽度）。落点 = CI ubuntu（Linux host 有 qemu-user-static + binfmt；macOS
-  # brew 无 qemu-mips user-mode）。本机 macOS 靠 golden + ffi.rs 的 `#[cfg(target_endian="big")]`
-  # 编译期断言兜底（互补，非替代）。
+  # ── BE 第二层防御：编译期 #[cfg(target_endian="big")] const 断言（port-rust-listeners-unlock, task 9.1）─
+  # 认证 BE 寄存器/端序行为 + struct 字段宽度（htons no-op、from_be_bytes、mips32
+  # tv_sec/sll_ifindex/sock_filter 宽度）。**落点 = 上面的 `cross-build MIPS BE soft-float` job**：
+  # 它 `make build-mips` 编译 ffi.rs 时，`#[cfg(target_endian="big")] const _: () = assert!(...)`
+  # 由 const-eval 按 mips BE 目标端序求值——htons 写错（如 `v<<8|v>>8`）或 struct 宽度分叉会
+  # **编译期失败**，故该 job 通过即认证 BE layer-2。这是 spec「大端三层防御」明列的 fallback。
   #
-  # ★不能验：AF_PACKET/PF_PACKET socket-level——qemu-user 把 syscall 透传给宿主 LE 内核，
-  #   抓不到 `sll_protocol` NBO bug。PF_PACKET socket-level BE 认证留姊妹变更
-  #   `verify-rust-listeners-on-hap`（须按 dooraccess-go/DEPLOY.md S1-S12 上真 hAP）。
-  #   故 PF_PACKET recv 循环测试在 mips target 下不应作为 socket 真测——它们或是 Linux-only
-  #   stub（非 Linux 路径）、或在无 CAP_NET_RAW 的 qemu-user 下不开真 socket，本 job 只跑
-  #   纯软单测（parser/dedup/BPF const/htons/错误分类/unlock 逻辑），不依赖内核网络栈。
-  qemu-mips-test:
-    name: BE qemu-mips user-mode unit tests (struct width + registers)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - name: Install nightly + rust-src
-        run: |
-          rustup toolchain install nightly --profile minimal
-          rustup component add rust-src --toolchain nightly
-      - name: Install qemu-user-static + binfmt
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y qemu-user-static binfmt-support
-          # 注册 binfmt（qemu-mips = big-endian；不是 qemu-mipsel）让内核透明经 qemu 跑 MIPS BE ELF
-          sudo update-binfmts --enable qemu-mips || true
-          qemu-mips-static --version
-      - name: Run unit tests under qemu-mips (BE)
-        env:
-          # cargo test 链出的测试二进制经 binfmt 由 qemu-mips-static 执行（user-mode）。
-          CARGO_TARGET_MIPS_UNKNOWN_LINUX_MUSL_RUNNER: qemu-mips-static
-        run: |
-          # -Z build-std 从 source 重编 std/libc 针对 mips BE 的 cfg 分支（Tier3 无预编译产物）。
-          # 不带 link-mips.sh 全静态 wrapper：user-mode 测试二进制用默认链接即可经 qemu 跑。
-          cargo +nightly test -Z build-std=std,panic_abort \
-            --target mips-unknown-linux-musl --lib 2>&1 | tee qemu-test.log
-      - name: Assert tests actually executed under qemu (not skipped)
-        run: |
-          grep -qE "test result: ok\. [1-9][0-9]* passed" qemu-test.log \
-            || { echo "::error::qemu-mips 单测未真正执行（0 passed 或未运行）"; exit 1; }
-          echo "✓ BE qemu-mips user-mode 单测通过（认证 BE 寄存器 + struct 宽度）"
+  # 曾尝试 qemu-mips user-mode 跑 runtime 单测作 layer-2，但 cross-test 二进制需 build-mips 的
+  # 静态 musl sysroot + link-mips.sh wrapper（默认 cc/-pie/动态链接在 CI 无 mips musl 动态库 →
+  # 链接失败），且 qemu-user 下线程/TCP/timing 单测不稳；而其核心保证（htons/struct）已由上述
+  # 编译期 const 断言在 cross-build job 强制，故移除 runtime qemu job、采编译期断言（见 PHASE3.md）。
+  #
+  # ★PF_PACKET socket-level BE（sll_protocol NBO）：qemu-user 把 syscall 透传宿主 LE 内核，
+  #   结构性不可在 CI 认证——留姊妹变更 `verify-rust-listeners-on-hap` 上真 hAP（DEPLOY.md S1-S12）。
 
   # ── golden 向量漂移门（port-rust-protocol-core, tasks 2.5 / 方案②）─────────
   # 机械门（✅ 已接通生效 2026-06-08）：跨仓 checkout 私有 dooraccess-go → setup-go

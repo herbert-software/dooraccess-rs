@@ -191,7 +191,7 @@ pub fn build_url(host: &str, port: i64, api: &str) -> String {
 fn iface_ipv4_addrs(iface: &str) -> Vec<Ipv4Addr> {
     #[cfg(target_os = "linux")]
     {
-        return linux_iface_ipv4(iface);
+        linux_iface_ipv4(iface)
     }
     #[cfg(not(target_os = "linux"))]
     {
