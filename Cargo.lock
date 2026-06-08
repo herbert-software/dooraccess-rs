@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "dooraccess-rs-probe"
+name = "dooraccess-rs"
 version = "0.0.0"

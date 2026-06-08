@@ -1,0 +1,32 @@
+# result codes golden — SoT: Go local/dooraccess-go internal/codec results.go
+# <NAME>|<int-value>
+ResultOK|0
+ResultNoChange|1
+ResultPartial|7
+ResultNotRun|8
+ResultErr|-1
+ResultInvalid|-2
+ResultTimeout|-5
+ResultNotFound|-6
+ResultUnsupport|-8
+ResultLenLimit|-9
+ResultNoConfig|-100
+ResultLoginFail|-101
+ResultPcapFail|-102
+ResultNoRing|-103
+ResultFileRead|-302
+ResultFileWrite|-303
+ResultIPUnreach|1100
+ResultIPOK|1101
+ResultIPBusy|1102
+ResultIPConflict|1103
+ResultNetErr|1001
+ResultConnFail|1002
+ResultConnTime|1003
+ResultDNSFail|1004
+ResultTLSErr|1005
+ResultNetOK|2000
+ResultNoReturn|2001
+ResultAuthErr|4000
+ResultAuthFail|4001
+ResultAuthDeny|4002

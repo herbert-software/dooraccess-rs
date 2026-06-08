@@ -1,0 +1,32 @@
+# uri golden — SoT: Go local/dooraccess-go internal/codec ParseURI（含 D5 IPv4 收紧）
+# ok|<uri>|<name>|<ip>|<port>     err|<uri>|<Format|NameLen|IPv4Only|Port>
+# 拒绝向量分类标注见 EXCEPTIONS.md §URI：
+#   01.2.3.4      → 双语言一致拒绝（Go net.ParseIP 自 1.17/CVE-2021-29923 拒 + Rust 拒）
+#   ::ffff:1.2.3.4 → 唯一真 Go↔Rust 分叉；本变更已改 Go codec/uri.go 拒 → 跨语言共享拒绝向量
+ok|12340000@10.0.0.10:18022|12340000|10.0.0.10|18022
+ok|12345678@10.0.0.20:18022|12345678|10.0.0.20|18022
+ok|00000000@127.0.0.1:1|00000000|127.0.0.1|1
+ok|99999999@10.0.0.1:65535|99999999|10.0.0.1|65535
+err||Format
+err|@1.2.3.4:18022|Format
+err|12340000|Format
+err|12340000@|Format
+err|12340000@1.2.3.4|Format
+err|12340000@1.2.3.4:|Format
+err|12340000@:18022|Format
+err|garbage|Format
+err|0602@1.2.3.4:18022|NameLen
+err|123400001@1.2.3.4:18022|NameLen
+err|1@1.2.3.4:18022|NameLen
+err|123@1.2.3.4:1|NameLen
+err|12340000@::1:18022|IPv4Only
+err|12340000@2001:db8::1:18022|IPv4Only
+err|12340000@notanip:18022|IPv4Only
+err|12345678@bad:1|IPv4Only
+err|12340000@01.2.3.4:18022|IPv4Only
+err|12340000@::ffff:1.2.3.4:18022|IPv4Only
+err|12340000@1.2.3.4:0|Port
+err|12340000@1.2.3.4:65536|Port
+err|12340000@1.2.3.4:abc|Port
+err|12340000@1.2.3.4:-1|Port
+err|12345678@1.2.3.4:0|Port

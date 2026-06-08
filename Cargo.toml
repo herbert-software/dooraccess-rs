@@ -1,7 +1,16 @@
 [package]
-name = "dooraccess-rs-probe"
+name = "dooraccess-rs"
 version = "0.0.0"
 edition = "2021"
+
+[lib]
+name = "dooraccess_rs"
+path = "src/lib.rs"
+
+# Phase0 probe bin keeps its original target name for continuity.
+[[bin]]
+name = "dooraccess-rs-probe"
+path = "src/main.rs"
 
 [dependencies]
 

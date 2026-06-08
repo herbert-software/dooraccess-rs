@@ -1,0 +1,27 @@
+version: 2
+updates:
+  # GitHub Actions —— 当前唯一真正有更新面的生态。
+  # ci.yml 用了 actions/checkout / cache / upload-artifact，dependabot 盯它们的 major/patch。
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "dependencies"
+      - "github-actions"
+
+  # Cargo —— Phase1 是 0-crate gate（Cargo.toml [dependencies] 为空），当前 no-op、不产 PR。
+  # 先接好：Phase1+ 一旦引入 crate，dependabot 自动盯版本。
+  # 注意：任何 cargo 依赖 PR = 已引入新依赖 = 触 D2「是否接受 Rust 依赖集」决策，
+  #       须人工 review（量 MIPS 体型增量），禁止 auto-merge。
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "deps"
+    labels:
+      - "dependencies"
+      - "rust"

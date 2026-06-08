@@ -1,0 +1,22 @@
+# bcd golden — SoT: Go local/dooraccess-go internal/codec EncodeBCD/DecodeBCD
+# encode|<in-ascii>|<out-hex4>   decode|<in-hex4>|<out-ascii8>   encode_err|<in>|<sentinel>
+encode|12340000|12340000
+encode|12345678|12345678
+encode|00000000|00000000
+encode|abcdef00|abcdef00
+encode|ABCDEF00|abcdef00
+encode_err||ErrBCDLength
+encode_err|06|ErrBCDLength
+encode_err|0602|ErrBCDLength
+encode_err|0602000|ErrBCDLength
+encode_err|123400001|ErrBCDLength
+encode_err|abc|ErrBCDLength
+encode_err|0602hi00|ErrBCDFormat
+encode_err|06g20000|ErrBCDFormat
+encode_err|06 20000|ErrBCDFormat
+encode_err|06020 00|ErrBCDFormat
+encode_err|abcdefgz|ErrBCDFormat
+decode|12340000|12340000
+decode|12345678|12345678
+decode|00000000|00000000
+decode|abcdef00|abcdef00

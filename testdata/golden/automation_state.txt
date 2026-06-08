@@ -1,0 +1,87 @@
+# automation_state golden — SoT: Go local/dooraccess-go internal/automationstate parse/render
+# 块格式见 export_golden_test.go 头注释；INPUT_HEX/OUTPUT_HEX 为逐字节真值。
+### CASE|basic-tf
+KIND|parse_ok
+INPUT_HEX|6175746f5f756e6c6f636b3d747275650a6175746f5f68616e6775703d66616c73650a
+EXPECT|auto_unlock=true,auto_hangup=false
+### END
+### CASE|basic-ft
+KIND|parse_ok
+INPUT_HEX|6175746f5f756e6c6f636b3d66616c73650a6175746f5f68616e6775703d747275650a
+EXPECT|auto_unlock=false,auto_hangup=true
+### END
+### CASE|comment-reverse-zeroone
+KIND|parse_ok
+INPUT_HEX|3b206461656d6f6e2d6d616e616765643b20646f206e6f742068616e642d656469740a6175746f5f68616e6775703d747275650a6175746f5f756e6c6f636b3d300a
+EXPECT|auto_unlock=false,auto_hangup=true
+### END
+### CASE|numeric-bools
+KIND|parse_ok
+INPUT_HEX|6175746f5f756e6c6f636b3d310a6175746f5f68616e6775703d310a
+EXPECT|auto_unlock=true,auto_hangup=true
+### END
+### CASE|case-insensitive
+KIND|parse_ok
+INPUT_HEX|6175746f5f756e6c6f636b3d545255450a6175746f5f68616e6775703d46616c73650a
+EXPECT|auto_unlock=true,auto_hangup=false
+### END
+### CASE|hash-comment
+KIND|parse_ok
+INPUT_HEX|23206865616465720a6175746f5f756e6c6f636b3d300a6175746f5f68616e6775703d300a
+EXPECT|auto_unlock=false,auto_hangup=false
+### END
+### CASE|empty
+KIND|parse_err
+INPUT_HEX|
+EXPECT|ErrParse
+### END
+### CASE|only-one-key
+KIND|parse_err
+INPUT_HEX|6175746f5f756e6c6f636b3d747275650a
+EXPECT|ErrParse
+### END
+### CASE|illegal-bool
+KIND|parse_err
+INPUT_HEX|6175746f5f756e6c6f636b3d6d617962650a6175746f5f68616e6775703d66616c73650a
+EXPECT|ErrParse
+### END
+### CASE|half-write
+KIND|parse_err
+INPUT_HEX|6175746f5f756e6c6f636b3d747275
+EXPECT|ErrParse
+### END
+### CASE|missing-eq
+KIND|parse_err
+INPUT_HEX|6175746f5f756e6c6f636b20747275650a6175746f5f68616e6775703d66616c73650a
+EXPECT|ErrParse
+### END
+### CASE|unexpected-key
+KIND|parse_err
+INPUT_HEX|6175746f5f756e6c6f636b3d747275650a6175746f5f68616e6775703d66616c73650a72696e675f61743d3132330a
+EXPECT|ErrParse
+### END
+### CASE|both-keys-but-bad
+KIND|parse_err
+INPUT_HEX|6175746f5f756e6c6f636b3d747275650a6175746f5f68616e6775703d320a
+EXPECT|ErrParse
+### END
+### CASE|render-false-false
+KIND|render
+INPUT|auto_unlock=false,auto_hangup=false
+OUTPUT_HEX|6175746f5f756e6c6f636b3d66616c73650a6175746f5f68616e6775703d66616c73650a
+### END
+### CASE|render-true-false
+KIND|render
+INPUT|auto_unlock=true,auto_hangup=false
+OUTPUT_HEX|6175746f5f756e6c6f636b3d747275650a6175746f5f68616e6775703d66616c73650a
+### END
+### CASE|render-false-true
+KIND|render
+INPUT|auto_unlock=false,auto_hangup=true
+OUTPUT_HEX|6175746f5f756e6c6f636b3d66616c73650a6175746f5f68616e6775703d747275650a
+### END
+### CASE|render-true-true
+KIND|render
+INPUT|auto_unlock=true,auto_hangup=true
+OUTPUT_HEX|6175746f5f756e6c6f636b3d747275650a6175746f5f68616e6775703d747275650a
+### END

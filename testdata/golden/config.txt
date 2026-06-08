@@ -1,0 +1,109 @@
+# config golden — SoT: Go local/dooraccess-go internal/config (ParseINI/LoadConfig/validateURI)
+# 块 '### CASE|<name>' ... '### END'; field|<path>|<val>; warning|<exact>; count|<what>|<n>;
+# validateuri|<uri>|<accept|reject>。INI 怪癖见 iniparser_test.go / config_test.go 同款 case。
+### CASE|prod-shape
+field|sip|06021103@172.16.106.91:18022
+field|iface|br-door
+field|listen.addr|0.0.0.0
+field|listen.port|8080
+field|hass.ipaddr|192.168.2.66
+field|hass.port|8123
+field|hass.api|/api/dooraccess/REDACTED
+field|hass.token|REDACTED.LLT.token
+field|video.forward|true
+field|video.format|flv
+field|video.cache_path|
+count|stations|1
+field|stations[0].sip|06020000@172.16.106.152:18022
+field|stations[0].rtsp_url|
+count|warnings|0
+### END
+### CASE|inline-comments
+field|name|hi
+field|count|5
+field|enabled|true
+count|warnings|0
+### END
+### CASE|quoted-semicolon
+field|name|hello;world
+count|warnings|0
+### END
+### CASE|odd-quote
+field|name|"open ; not a comment
+count|warnings|0
+### END
+### CASE|array-trim
+field|tags|a,b,c,d,e
+count|warnings|0
+### END
+### CASE|empty-value
+field|name|
+field|count|0
+field|enabled|false
+count|warnings|0
+### END
+### CASE|unknown-key
+field|name|ok
+warning|config: unknown key "unknown_key"
+count|warnings|1
+### END
+### CASE|unknown-section
+field|name|ok
+warning|config: unknown section [automation]
+count|warnings|1
+### END
+### CASE|bool-variants
+field|enabled["true"]|true
+field|enabled["True"]|true
+field|enabled["TRUE"]|true
+field|enabled["1"]|true
+field|enabled["false"]|false
+field|enabled["False"]|false
+field|enabled["0"]|false
+field|enabled[""]|false
+### END
+### CASE|multi-station-append
+count|stations|3
+field|stations[0].sip|a@1.1.1.1:1
+field|stations[1].sip|b@2.2.2.2:2
+field|stations[2].sip|c@3.3.3.3:3
+### END
+### CASE|same-subname-merge
+count|stations|1
+field|stations[0].sip|a@1.1.1.1:1
+field|stations[0].rtsp_url|rtsp://a
+### END
+### CASE|loadconfig-validbody
+field|deprecated|brand,elev,family,notification
+field|automation.auto_unlock|false
+field|automation.auto_hangup|false
+field|missing|
+### END
+### CASE|validateuri
+validateuri|12340000@10.0.0.10:18022|accept
+validateuri|12345678@10.0.0.1:1|accept
+validateuri|99999999@1.2.3.4:65535|accept
+validateuri|abcdef00@10.0.0.1:8080|accept
+validateuri|12340000@0.0.0.0:18022|accept
+validateuri||reject
+validateuri|12340000|reject
+validateuri|@1.2.3.4:18022|reject
+validateuri|12340000@|reject
+validateuri|12340000@1.2.3.4|reject
+validateuri|12340000@1.2.3.4:|reject
+validateuri|12340000@:18022|reject
+validateuri|0602@1.2.3.4:18022|reject
+validateuri|123400000@1.2.3.4:18022|reject
+validateuri|0602xxxx@1.2.3.4:18022|reject
+validateuri|12340000@1.2.3:18022|reject
+validateuri|12340000@1.2.3.4.5:18022|reject
+validateuri|12340000@1.2.3.999:18022|reject
+validateuri|12340000@1.2.3.4:0|reject
+validateuri|12340000@1.2.3.4:65536|reject
+validateuri|12340000@1.2.3.4:abc|reject
+validateuri|12340000@bad-host:18022|reject
+validateuri|12340000@001.002.003.004:18022|reject
+validateuri|12340000@10.0.0.04:18022|reject
+validateuri|12340000@10.00.0.4:18022|reject
+validateuri|12340000@::ffff:1.2.3.4:18022|reject
+### END
