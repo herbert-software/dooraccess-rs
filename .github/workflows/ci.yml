@@ -58,14 +58,13 @@ jobs:
           path: target/mips-unknown-linux-musl/release/dooraccess-rs-probe
 
   # ── golden 向量漂移门（port-rust-protocol-core, tasks 2.5 / 方案②）─────────
-  # 机械门：跨仓 checkout 私有 dooraccess-go → setup-go → 重新跑 export → 与
-  # committed testdata/golden/ 逐字节 diff，不一致即 fail。防 Go daemon 改了
-  # wire/schema 后 Rust 继续对旧向量假绿。
+  # 机械门（✅ 已接通生效 2026-06-08）：跨仓 checkout 私有 dooraccess-go → setup-go
+  # → 重新跑 export → 与 committed testdata/golden/ 逐字节 diff，不一致即 fail。防 Go
+  # daemon 改了 wire/schema 后 Rust 继续对旧向量假绿。主分支 push 实跑通过（见 PHASE1.md §5）。
   #
-  # ⚠ 已知缺口（未接通前）：本 job 需 secret `DOORACCESS_GO_TOKEN`（对私有
-  #    HerbertGao/dooraccess-go 有 read 权限的 PAT/deploy-key）才能 checkout。
-  #    secret 未配置时本 job 会失败/跳过 → 漂移门**未生效**，committed 向量可
-  #    静默漂移于 Go。配置该 secret 后漂移门方为真机械门（见 PHASE1.md §漂移门）。
+  # 依赖 secret `DOORACCESS_GO_TOKEN`（对私有 HerbertGao/dooraccess-go 有 Contents:Read
+  # 的细粒度 PAT），已配置。若该 secret 失效/移除，本 job 会因跨仓 checkout 失败而 fail，
+  # 即漂移门退化为「未接通」——此时须重配 secret，不可当作向量已对齐。
   golden-drift:
     name: golden vector drift gate (committed == current Go)
     runs-on: ubuntu-latest
