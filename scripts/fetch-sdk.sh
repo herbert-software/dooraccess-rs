@@ -21,7 +21,11 @@ mkdir -p "$dest"
 echo "fetch-sdk: downloading $SDK_URL"
 curl -fSL --retry 2 -o "$dest/sdk.tar.zst" "$SDK_URL"
 echo "fetch-sdk: extracting toolchain lib/ subtree"
-zstd -dc "$dest/sdk.tar.zst" | tar -xf - -C "$dest" "*/toolchain-mips_24kc_gcc-13.3.0_musl/lib/*"
+# GNU tar (Linux) needs --wildcards for glob patterns; bsdtar (macOS) globs by
+# default and rejects --wildcards, so add it only for GNU tar.
+TAR_WILDCARDS=""
+tar --version 2>/dev/null | grep -qi 'GNU tar' && TAR_WILDCARDS="--wildcards"
+zstd -dc "$dest/sdk.tar.zst" | tar -x $TAR_WILDCARDS -f - -C "$dest" "*/toolchain-mips_24kc_gcc-13.3.0_musl/lib/*"
 rm -f "$dest/sdk.tar.zst"
 
 for f in lib/libc.a lib/crt1.o lib/crti.o lib/crtn.o; do
