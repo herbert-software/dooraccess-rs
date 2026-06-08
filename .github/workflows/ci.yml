@@ -69,6 +69,9 @@ jobs:
   golden-drift:
     name: golden vector drift gate (committed == current Go)
     runs-on: ubuntu-latest
+    # Dependabot PR 跑在受限 secret 上下文，拿不到 DOORACCESS_GO_TOKEN（跨仓 checkout 必失败）；
+    # 且 dependabot 只升级 action 版本、永不改 golden 向量，漂移门对它无意义 → 跳过。
+    if: github.actor != 'dependabot[bot]'
     steps:
       - name: Checkout dooraccess-rs (golden vectors)
         uses: actions/checkout@v4
