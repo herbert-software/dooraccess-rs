@@ -392,8 +392,8 @@ mod shared_budget_tests {
         // 超时返回 Timeout，而非 5s。第一步剩余给足（2s）让 711 能回。
         let deadline = ScriptedDeadline {
             seq: vec![
-                Some(Duration::from_secs(2)),       // 710 步剩余
-                Some(Duration::from_millis(400)),   // 518 步剩余（被收紧）
+                Some(Duration::from_secs(2)),     // 710 步剩余
+                Some(Duration::from_millis(400)), // 518 步剩余（被收紧）
             ],
             calls: AtomicUsize::new(0),
         };
