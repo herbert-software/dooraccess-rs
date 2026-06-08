@@ -1,0 +1,14 @@
+# wire_sender.txt — sender 帧字节 + 错误分类向量（组 E，task 8.1）。
+# SoT = Go internal/wire18022（Build*Frame / IsRetryableError）+ http8080.classifyWireErr 语义。
+# 行格式：frame|<kind>|<from>|<to>|<framehex>
+#         errclass|<kind>|<retryable bool>|<result_code>
+frame|unlock_a|06020000|06021103|07b81e0000007265713d3731302671756572793d06020000060211030100000003000000
+frame|unlock_b|06020000|06021103|07b8180000007265713d3531382671756572793d22060200000602110346
+frame|bye|06021103|06021103|07b81e0000007265713d3730382671756572793d06021103060211030100000003000000
+frame|appoint|06021103||07b8170000007265713d3531382671756572793ded0001000011030007
+frame|preview|||07b8180000007265713d3730352671756572793d00000100000003000001
+errclass|silent_fin|true|-103
+errclass|timeout|true|-5
+errclass|connection_reset|true|-1
+errclass|broken_pipe|true|-1
+errclass|other_connrefused|false|-1

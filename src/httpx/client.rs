@@ -156,9 +156,7 @@ fn tcp_connect(
             None => {
                 return Err(format!(
                     "httpx: dial {hostport}: {}",
-                    last_err.unwrap_or_else(|| {
-                        io::Error::other("connect failed")
-                    })
+                    last_err.unwrap_or_else(|| { io::Error::other("connect failed") })
                 ));
             }
             Some(t) if start.elapsed() >= t => {
@@ -185,8 +183,7 @@ fn write_request(
         .map_err(|e| format!("httpx: write request line: {e}"))?;
     for (k, vals) in header.iter() {
         for v in vals {
-            write!(stream, "{k}: {v}\r\n")
-                .map_err(|e| format!("httpx: write header: {e}"))?;
+            write!(stream, "{k}: {v}\r\n").map_err(|e| format!("httpx: write header: {e}"))?;
         }
     }
     stream
@@ -197,16 +194,16 @@ fn write_request(
             .write_all(body)
             .map_err(|e| format!("httpx: write body: {e}"))?;
     }
-    stream
-        .flush()
-        .map_err(|e| format!("httpx: flush: {e}"))?;
+    stream.flush().map_err(|e| format!("httpx: flush: {e}"))?;
     Ok(())
 }
 
 /// 把 `"http://host[:port]/path[?query]"` 拆成 `host:port` + `/path?query`。
 pub fn split_url(raw_url: &str) -> Result<(String, String), String> {
     if !raw_url.starts_with("http://") {
-        return Err(format!("httpx: only http:// URLs supported, got {raw_url:?}"));
+        return Err(format!(
+            "httpx: only http:// URLs supported, got {raw_url:?}"
+        ));
     }
     let rest = &raw_url["http://".len()..];
     if rest.is_empty() {
@@ -254,9 +251,7 @@ mod tests {
                     if trimmed.is_empty() {
                         break;
                     }
-                    if let Some(rest) = trimmed
-                        .to_ascii_lowercase()
-                        .strip_prefix("content-length:")
+                    if let Some(rest) = trimmed.to_ascii_lowercase().strip_prefix("content-length:")
                     {
                         content_length = rest.trim().parse().unwrap_or(0);
                     }
@@ -308,8 +303,7 @@ mod tests {
             timeout: Some(Duration::from_secs(1)),
         };
         let mut req =
-            new_request(METHOD_POST, &format!("http://{addr}/unlock"), Some(body))
-                .unwrap();
+            new_request(METHOD_POST, &format!("http://{addr}/unlock"), Some(body)).unwrap();
         req.set_header("Content-Type", "application/json");
         req.set_header("Authorization", "Bearer xxx");
         let resp = c.do_request(&req).unwrap();

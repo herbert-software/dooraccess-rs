@@ -6,7 +6,7 @@ use super::{
     canonical_mime_header_key, Header, HttpProtocolError, ReadRequestError, ReadRequestResult,
     Request, Url, METHOD_GET, METHOD_POST, STATUS_BAD_GATEWAY, STATUS_BAD_REQUEST,
     STATUS_METHOD_NOT_ALLOWED, STATUS_PAYLOAD_TOO_LARGE, STATUS_REQUEST_HEADER_TOO_BIG,
-    STATUS_URI_TOO_LONG, STATUS_UPGRADE_REQUIRED,
+    STATUS_UPGRADE_REQUIRED, STATUS_URI_TOO_LONG,
 };
 
 pub const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
@@ -43,11 +43,9 @@ pub fn read_request<R: BufRead>(
 
     let (headers, host) = read_headers(br)?;
     if version == "HTTP/1.1" && host.is_empty() {
-        return Err(HttpProtocolError::new(
-            STATUS_BAD_REQUEST,
-            "HTTP/1.1 requires Host header",
-        )
-        .into());
+        return Err(
+            HttpProtocolError::new(STATUS_BAD_REQUEST, "HTTP/1.1 requires Host header").into(),
+        );
     }
 
     if let Some(te) = headers.get("Transfer-Encoding") {
@@ -114,9 +112,9 @@ pub fn read_request<R: BufRead>(
 }
 
 fn parse_content_length(cl: &str) -> Result<i64, ReadRequestError> {
-    let n: i64 = cl
-        .parse()
-        .map_err(|_| HttpProtocolError::new(STATUS_BAD_REQUEST, format!("invalid Content-Length: {cl}")))?;
+    let n: i64 = cl.parse().map_err(|_| {
+        HttpProtocolError::new(STATUS_BAD_REQUEST, format!("invalid Content-Length: {cl}"))
+    })?;
     if n < 0 {
         return Err(HttpProtocolError::new(
             STATUS_BAD_REQUEST,
@@ -152,11 +150,9 @@ fn read_line<R: BufRead>(br: &mut R, limit: usize) -> Result<String, ReadRequest
             break;
         }
         if buf.len() >= limit {
-            return Err(HttpProtocolError::new(
-                STATUS_URI_TOO_LONG,
-                "line exceeds bufio buffer",
-            )
-            .into());
+            return Err(
+                HttpProtocolError::new(STATUS_URI_TOO_LONG, "line exceeds bufio buffer").into(),
+            );
         }
     }
     let line = if buf.len() >= 2 && buf[buf.len() - 2] == b'\r' && buf[buf.len() - 1] == b'\n' {
@@ -171,13 +167,19 @@ fn read_line<R: BufRead>(br: &mut R, limit: usize) -> Result<String, ReadRequest
 
 /// 解析 `"METHOD URI HTTP/1.1"`。
 pub fn parse_request_line(line: &str) -> Result<(&str, &str, &str), ReadRequestError> {
-    let sp1 = line
-        .find(' ')
-        .ok_or_else(|| HttpProtocolError::new(STATUS_BAD_REQUEST, format!("malformed request line: {line}")))?;
+    let sp1 = line.find(' ').ok_or_else(|| {
+        HttpProtocolError::new(
+            STATUS_BAD_REQUEST,
+            format!("malformed request line: {line}"),
+        )
+    })?;
     let rest = &line[sp1 + 1..];
-    let sp2 = rest
-        .find(' ')
-        .ok_or_else(|| HttpProtocolError::new(STATUS_BAD_REQUEST, format!("malformed request line: {line}")))?;
+    let sp2 = rest.find(' ').ok_or_else(|| {
+        HttpProtocolError::new(
+            STATUS_BAD_REQUEST,
+            format!("malformed request line: {line}"),
+        )
+    })?;
     let method = &line[..sp1];
     let target = &rest[..sp2];
     let version = &rest[sp2 + 1..];
@@ -210,16 +212,13 @@ fn read_headers<R: BufRead>(br: &mut R) -> Result<(Header, String), ReadRequestE
             .into());
         }
         if i >= MAX_HEADER_COUNT {
-            return Err(HttpProtocolError::new(
-                STATUS_REQUEST_HEADER_TOO_BIG,
-                "too many headers",
-            )
-            .into());
+            return Err(
+                HttpProtocolError::new(STATUS_REQUEST_HEADER_TOO_BIG, "too many headers").into(),
+            );
         }
-        let colon = line
-            .find(':')
-            .filter(|&p| p > 0)
-            .ok_or_else(|| HttpProtocolError::new(STATUS_BAD_REQUEST, format!("malformed header: {line}")))?;
+        let colon = line.find(':').filter(|&p| p > 0).ok_or_else(|| {
+            HttpProtocolError::new(STATUS_BAD_REQUEST, format!("malformed header: {line}"))
+        })?;
         let key = line[..colon].trim();
         let value = line[colon + 1..].trim();
         let ck = canonical_mime_header_key(key);
@@ -258,9 +257,12 @@ pub fn parse_status_line(line: &str) -> Result<u16, HttpProtocolError> {
             format!("missing HTTP/ prefix: {line}"),
         ));
     }
-    let code: u16 = parts[1]
-        .parse()
-        .map_err(|_| HttpProtocolError::new(STATUS_BAD_GATEWAY, format!("invalid status code: {}", parts[1])))?;
+    let code: u16 = parts[1].parse().map_err(|_| {
+        HttpProtocolError::new(
+            STATUS_BAD_GATEWAY,
+            format!("invalid status code: {}", parts[1]),
+        )
+    })?;
     if !(100..=999).contains(&code) {
         return Err(HttpProtocolError::new(
             STATUS_BAD_GATEWAY,
@@ -281,9 +283,8 @@ pub struct ClientResponse {
 /// Client 端读响应：status line + headers + body（支持 Content-Length / chunked）。
 pub fn read_response<R: BufRead>(br: &mut R) -> Result<ClientResponse, io::Error> {
     let line = read_line(br, MAX_REQUEST_LINE_BYTES).map_err(io_err_from_read_request)?;
-    let code = parse_status_line(&line).map_err(|e| {
-        io::Error::new(io::ErrorKind::InvalidData, e.to_string())
-    })?;
+    let code = parse_status_line(&line)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
     let (headers, _) = read_headers(br).map_err(io_err_from_read_request)?;
 
@@ -313,12 +314,8 @@ pub fn read_response<R: BufRead>(br: &mut R) -> Result<ClientResponse, io::Error
             ));
         }
         let mut body = vec![0u8; n as usize];
-        br.read_exact(&mut body).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("httpx: read response body: {e}"),
-            )
-        })?;
+        br.read_exact(&mut body)
+            .map_err(|e| io::Error::new(e.kind(), format!("httpx: read response body: {e}")))?;
         body
     } else {
         Vec::new()
@@ -335,9 +332,7 @@ fn io_err_from_read_request(e: ReadRequestError) -> io::Error {
     match e {
         ReadRequestError::Io(e) => e,
         ReadRequestError::Eof => io::Error::new(io::ErrorKind::UnexpectedEof, "unexpected EOF"),
-        ReadRequestError::Protocol(e) => {
-            io::Error::new(io::ErrorKind::InvalidData, e.to_string())
-        }
+        ReadRequestError::Protocol(e) => io::Error::new(io::ErrorKind::InvalidData, e.to_string()),
     }
 }
 
@@ -347,10 +342,7 @@ fn read_chunked_body<R: BufRead>(br: &mut R) -> Result<Vec<u8>, io::Error> {
         let line = read_line(br, 256).map_err(|e| {
             io::Error::new(io::ErrorKind::InvalidData, format!("read chunk size: {e}"))
         })?;
-        let size_str = line
-            .split([';', ' ', '\t'])
-            .next()
-            .unwrap_or("");
+        let size_str = line.split([';', ' ', '\t']).next().unwrap_or("");
         let size = i64::from_str_radix(size_str, 16).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -366,7 +358,10 @@ fn read_chunked_body<R: BufRead>(br: &mut R) -> Result<Vec<u8>, io::Error> {
         if size == 0 {
             loop {
                 let trailer = read_line(br, MAX_REQUEST_LINE_BYTES).map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidData, format!("read chunk trailer: {e}"))
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("read chunk trailer: {e}"),
+                    )
                 })?;
                 if trailer.is_empty() {
                     return Ok(buf);
@@ -393,4 +388,3 @@ fn read_chunked_body<R: BufRead>(br: &mut R) -> Result<Vec<u8>, io::Error> {
         })?;
     }
 }
-

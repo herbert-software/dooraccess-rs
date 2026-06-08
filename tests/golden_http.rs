@@ -117,9 +117,7 @@ fn header_eq(headers: &[(String, String)], key: &str, want: &str) {
 
 fn header_present(headers: &[(String, String)], key: &str) -> bool {
     let lk = key.to_ascii_lowercase();
-    headers
-        .iter()
-        .any(|(k, _)| k.to_ascii_lowercase() == lk)
+    headers.iter().any(|(k, _)| k.to_ascii_lowercase() == lk)
 }
 
 fn roundtrip_raw_server(handler: Arc<dyn Handler>, raw_req: &[u8]) -> Vec<u8> {
@@ -181,7 +179,8 @@ fn parser_golden() {
                 assert_eq!(f.len(), 6, "fields: {line}");
                 let raw = hex_to_bytes(f[2]);
                 let mut br = Cursor::new(&raw);
-                let req = read_request(&mut br, || {}).unwrap_or_else(|_| panic!("parse_ok {}", f[1]));
+                let req =
+                    read_request(&mut br, || {}).unwrap_or_else(|_| panic!("parse_ok {}", f[1]));
                 assert_eq!(req.method, f[3]);
                 assert_eq!(req.url.path, f[4]);
                 assert_eq!(req.host, f[5]);
@@ -191,7 +190,8 @@ fn parser_golden() {
                 let raw = hex_to_bytes(f[2]);
                 let want_status: u16 = f[3].parse().expect("status");
                 let mut br = Cursor::new(&raw);
-                let err = read_request(&mut br, || {}).expect_err(&format!("parse_reject {}", f[1]));
+                let err =
+                    read_request(&mut br, || {}).expect_err(&format!("parse_reject {}", f[1]));
                 let got = match err {
                     dooraccess_rs::httpx::ReadRequestError::Protocol(e) => e.status,
                     other => panic!("unexpected err {other:?}"),
@@ -244,9 +244,7 @@ fn endpoint_body_golden() {
                 ("auto_unlock", JsonValue::Bool(true)),
                 ("auto_hangup", JsonValue::Bool(false)),
             ]),
-            "stations_guard" => {
-                body_via_write_json(&[("result", JsonValue::Number(-100))])
-            }
+            "stations_guard" => body_via_write_json(&[("result", JsonValue::Number(-100))]),
             "error_json_405" => {
                 // 裸 body：error_json body = writeJSON 的 {"error":...} struct marshal。
                 encode_struct(
@@ -265,11 +263,7 @@ fn endpoint_body_golden() {
             other => panic!("unknown body case {other}"),
         };
 
-        assert_eq!(
-            bytes_to_hex(&got),
-            bytes_to_hex(&want),
-            "body case {name}"
-        );
+        assert_eq!(bytes_to_hex(&got), bytes_to_hex(&want), "body case {name}");
     }
 }
 
@@ -307,7 +301,10 @@ fn endpoint_socket_golden() {
         let got = parse_http_response_full(&got_raw);
 
         assert_eq!(got.status, want.status, "{name} status");
-        assert!(header_present(&got.headers, "Connection"), "{name} Connection");
+        assert!(
+            header_present(&got.headers, "Connection"),
+            "{name} Connection"
+        );
         assert_eq!(
             header_present(&got.headers, "Transfer-Encoding"),
             header_present(&want.headers, "Transfer-Encoding"),
@@ -333,7 +330,11 @@ fn endpoint_socket_golden() {
             _ => {}
         }
 
-        assert_eq!(bytes_to_hex(&got.body), bytes_to_hex(&want.body), "{name} body");
+        assert_eq!(
+            bytes_to_hex(&got.body),
+            bytes_to_hex(&want.body),
+            "{name} body"
+        );
     }
 }
 
@@ -386,7 +387,11 @@ fn middleware_golden() {
 
         assert_eq!(got.status, want_status, "{name}");
         assert_eq!(got.status, want.status, "{name}");
-        assert_eq!(bytes_to_hex(&got.body), bytes_to_hex(&want.body), "{name} body");
+        assert_eq!(
+            bytes_to_hex(&got.body),
+            bytes_to_hex(&want.body),
+            "{name} body"
+        );
 
         match name {
             "unlock_get_405" => {
@@ -399,10 +404,7 @@ fn middleware_golden() {
                 );
             }
             "unlock_no_stations" => {
-                assert_eq!(
-                    String::from_utf8_lossy(&got.body),
-                    r#"{"result":-100}"#
-                );
+                assert_eq!(String::from_utf8_lossy(&got.body), r#"{"result":-100}"#);
             }
             _ => {}
         }

@@ -115,7 +115,8 @@ impl Server {
                     if self.closing.load(Ordering::SeqCst) {
                         return Err(Box::new(ServerClosedError));
                     }
-                    if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut {
+                    if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut
+                    {
                         continue;
                     }
                     return Err(Box::new(io::Error::new(
@@ -402,9 +403,11 @@ mod deadline_tests {
     fn read_header_timeout_tighter_than_read_timeout() {
         use super::super::{HandlerFunc, STATUS_OK};
 
-        let handler: Arc<dyn Handler> = Arc::new(HandlerFunc(|w: &mut dyn crate::httpx::ResponseWriter, _r: &crate::httpx::Request| {
-            w.write_header(STATUS_OK);
-        }));
+        let handler: Arc<dyn Handler> = Arc::new(HandlerFunc(
+            |w: &mut dyn crate::httpx::ResponseWriter, _r: &crate::httpx::Request| {
+                w.write_header(STATUS_OK);
+            },
+        ));
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().unwrap();
         let read_timeout = Duration::from_millis(2000);
@@ -425,8 +428,7 @@ mod deadline_tests {
         conn.write_all(b"GET / HTTP/1.1\r\n")
             .expect("partial headers");
         thread::sleep(Duration::from_millis(200));
-        conn.set_read_timeout(Some(Duration::from_millis(500)))
-            .ok();
+        conn.set_read_timeout(Some(Duration::from_millis(500))).ok();
         let mut buf = [0u8; 256];
         let n = conn.read(&mut buf).unwrap_or(0);
         let resp = String::from_utf8_lossy(&buf[..n]);
@@ -442,9 +444,11 @@ mod deadline_tests {
     fn read_timeout_is_whole_request_deadline() {
         use super::super::{HandlerFunc, STATUS_OK};
 
-        let handler: Arc<dyn Handler> = Arc::new(HandlerFunc(|w: &mut dyn crate::httpx::ResponseWriter, _r: &crate::httpx::Request| {
-            w.write_header(STATUS_OK);
-        }));
+        let handler: Arc<dyn Handler> = Arc::new(HandlerFunc(
+            |w: &mut dyn crate::httpx::ResponseWriter, _r: &crate::httpx::Request| {
+                w.write_header(STATUS_OK);
+            },
+        ));
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().unwrap();
         // read_timeout 给足（1500ms）避免并行测试 CPU 争用下 flaky；body 在 350ms 发——
@@ -492,12 +496,14 @@ mod deadline_tests {
     fn write_timeout_zero_allows_slow_write() {
         use super::super::{HandlerFunc, STATUS_OK};
 
-        let handler: Arc<dyn Handler> = Arc::new(HandlerFunc(|w: &mut dyn crate::httpx::ResponseWriter, _r: &crate::httpx::Request| {
-            thread::sleep(Duration::from_millis(150));
-            w.header().set("Content-Length", "2");
-            w.write_header(STATUS_OK);
-            let _ = w.write(b"ok");
-        }));
+        let handler: Arc<dyn Handler> = Arc::new(HandlerFunc(
+            |w: &mut dyn crate::httpx::ResponseWriter, _r: &crate::httpx::Request| {
+                thread::sleep(Duration::from_millis(150));
+                w.header().set("Content-Length", "2");
+                w.write_header(STATUS_OK);
+                let _ = w.write(b"ok");
+            },
+        ));
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().unwrap();
         let h = Arc::clone(&handler);
@@ -515,8 +521,7 @@ mod deadline_tests {
         let mut conn = TcpStream::connect(addr).expect("connect");
         conn.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
             .expect("req");
-        conn.set_read_timeout(Some(Duration::from_secs(2)))
-            .ok();
+        conn.set_read_timeout(Some(Duration::from_secs(2))).ok();
         let mut resp = Vec::new();
         conn.read_to_end(&mut resp).expect("read resp");
         assert!(

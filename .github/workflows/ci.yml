@@ -57,6 +57,49 @@ jobs:
           name: dooraccess-rs-probe-mips
           path: target/mips-unknown-linux-musl/release/dooraccess-rs-probe
 
+  # ── BE 第二层防御：qemu-mips(big-endian) user-mode 单测（port-rust-listeners-unlock, task 9.1）─
+  # 认证 BE 寄存器行为 + struct 字段宽度（htons/to_be/from_be_bytes 在真 BE 寄存器、mips32
+  # tv_sec/sll_ifindex 宽度）。落点 = CI ubuntu（Linux host 有 qemu-user-static + binfmt；macOS
+  # brew 无 qemu-mips user-mode）。本机 macOS 靠 golden + ffi.rs 的 `#[cfg(target_endian="big")]`
+  # 编译期断言兜底（互补，非替代）。
+  #
+  # ★不能验：AF_PACKET/PF_PACKET socket-level——qemu-user 把 syscall 透传给宿主 LE 内核，
+  #   抓不到 `sll_protocol` NBO bug。PF_PACKET socket-level BE 认证留姊妹变更
+  #   `verify-rust-listeners-on-hap`（须按 dooraccess-go/DEPLOY.md S1-S12 上真 hAP）。
+  #   故 PF_PACKET recv 循环测试在 mips target 下不应作为 socket 真测——它们或是 Linux-only
+  #   stub（非 Linux 路径）、或在无 CAP_NET_RAW 的 qemu-user 下不开真 socket，本 job 只跑
+  #   纯软单测（parser/dedup/BPF const/htons/错误分类/unlock 逻辑），不依赖内核网络栈。
+  qemu-mips-test:
+    name: BE qemu-mips user-mode unit tests (struct width + registers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install nightly + rust-src
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup component add rust-src --toolchain nightly
+      - name: Install qemu-user-static + binfmt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static binfmt-support
+          # 注册 binfmt（qemu-mips = big-endian；不是 qemu-mipsel）让内核透明经 qemu 跑 MIPS BE ELF
+          sudo update-binfmts --enable qemu-mips || true
+          qemu-mips-static --version
+      - name: Run unit tests under qemu-mips (BE)
+        env:
+          # cargo test 链出的测试二进制经 binfmt 由 qemu-mips-static 执行（user-mode）。
+          CARGO_TARGET_MIPS_UNKNOWN_LINUX_MUSL_RUNNER: qemu-mips-static
+        run: |
+          # -Z build-std 从 source 重编 std/libc 针对 mips BE 的 cfg 分支（Tier3 无预编译产物）。
+          # 不带 link-mips.sh 全静态 wrapper：user-mode 测试二进制用默认链接即可经 qemu 跑。
+          cargo +nightly test -Z build-std=std,panic_abort \
+            --target mips-unknown-linux-musl --lib 2>&1 | tee qemu-test.log
+      - name: Assert tests actually executed under qemu (not skipped)
+        run: |
+          grep -qE "test result: ok\. [1-9][0-9]* passed" qemu-test.log \
+            || { echo "::error::qemu-mips 单测未真正执行（0 passed 或未运行）"; exit 1; }
+          echo "✓ BE qemu-mips user-mode 单测通过（认证 BE 寄存器 + struct 宽度）"
+
   # ── golden 向量漂移门（port-rust-protocol-core, tasks 2.5 / 方案②）─────────
   # 机械门（✅ 已接通生效 2026-06-08）：跨仓 checkout 私有 dooraccess-go → setup-go
   # → 重新跑 export → 与 committed testdata/golden/ 逐字节 diff，不一致即 fail。防 Go
@@ -92,13 +135,20 @@ jobs:
           DOORACCESS_GOLDEN_DIR: ${{ github.workspace }}/_fresh-golden
         run: |
           mkdir -p "$DOORACCESS_GOLDEN_DIR"
-          for pkg in codec wire18022 config automationstate http8080; do
+          # listen6672 / listen18022 含 linux-only export（extractUDPPayload/extractTCPPayload，
+          # `//go:build linux && export`）——CI runner 是 ubuntu(linux)，原生编译跑得到。
+          for pkg in codec wire18022 config automationstate http8080 listen6672 listen18022; do
             go test -tags export -run ExportGolden ./internal/$pkg/
           done
       - name: Diff committed golden vs fresh Go export
         run: |
           # 只比对导出测试生成的向量文件（EXCEPTIONS.md 是手写文档，不参与漂移 diff）
-          for f in bcd.txt uri.txt wire.txt config.txt results.txt automation_state.txt; do
+          # listener/BPF/sender 向量（组 E，task 8.4）：bpf.txt（6672+18022 双写互验）+
+          # listen{6672,18022}.txt（parser/classify/numquery）+ listen{6672,18022}_extract.txt
+          # （linux-only extract）+ wire_sender.txt（sender 帧 + 错误分类）。
+          for f in bcd.txt uri.txt wire.txt config.txt results.txt automation_state.txt \
+                   bpf.txt listen6672.txt listen6672_extract.txt \
+                   listen18022.txt listen18022_extract.txt wire_sender.txt; do
             diff -u "dooraccess-rs/testdata/golden/$f" "_fresh-golden/$f" \
               || { echo "::error::golden 向量漂移：committed $f 与当前 Go 输出不一致"; exit 1; }
           done

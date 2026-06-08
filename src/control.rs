@@ -9,8 +9,6 @@ use std::sync::Arc;
 
 use crate::codec::{self, result};
 use crate::config::Config;
-use crate::info;
-use crate::sender::Sender;
 use crate::httpx::json::{encode_struct, JsonOptions, JsonValue};
 use crate::httpx::mux::ServeMux;
 #[allow(unused_imports)]
@@ -18,6 +16,8 @@ use crate::httpx::{
     Handler, HandlerFunc, Header, Request, ResponseWriter, METHOD_GET, METHOD_POST,
     STATUS_BAD_REQUEST, STATUS_METHOD_NOT_ALLOWED, STATUS_OK,
 };
+use crate::info;
+use crate::sender::Sender;
 
 /// Go `httpx.StatusUnsupportedMedia`（`types.go`）；`httpx/mod.rs` 未导出，本模块自用。
 const STATUS_UNSUPPORTED_MEDIA: u16 = 415;
@@ -40,8 +40,7 @@ pub fn write_json(w: &mut dyn ResponseWriter, status: u16, body: Option<&[(&str,
         return;
     };
     let buf = encode_struct(fields, JsonOptions::MARSHAL);
-    w.header()
-        .set("Content-Length", &buf.len().to_string());
+    w.header().set("Content-Length", &buf.len().to_string());
     w.write_header(status);
     let _ = w.write(&buf);
 }
@@ -308,10 +307,7 @@ impl<H: Handler> Handler for MethodGuard<H> {
             error_json(
                 w,
                 STATUS_METHOD_NOT_ALLOWED,
-                &format!(
-                    "method {} not allowed; use {}",
-                    r.method, self.allowed
-                ),
+                &format!("method {} not allowed; use {}", r.method, self.allowed),
             );
             return;
         }
@@ -376,10 +372,7 @@ impl<H: Handler> Handler for RequireStationsConfigured<H> {
             write_json(
                 w,
                 STATUS_OK,
-                Some(&[(
-                    "result",
-                    JsonValue::Number(result::NO_CONFIG as i64),
-                )]),
+                Some(&[("result", JsonValue::Number(result::NO_CONFIG as i64))]),
             );
             return;
         }
@@ -395,8 +388,13 @@ impl<H: Handler> Handler for RequireStationsConfigured<H> {
 ///
 /// 对齐 Go `server.go`：
 /// `methodGuardPOST(requireJSONContentType(s.requireStationsConfigured(handler)))`
-pub fn chain_business_post<H: Handler>(cfg: Arc<Config>, inner: H) -> MethodGuard<RequireJsonContentType<RequireStationsConfigured<H>>> {
-    method_guard_post(require_json_content_type(require_stations_configured(cfg, inner)))
+pub fn chain_business_post<H: Handler>(
+    cfg: Arc<Config>,
+    inner: H,
+) -> MethodGuard<RequireJsonContentType<RequireStationsConfigured<H>>> {
+    method_guard_post(require_json_content_type(require_stations_configured(
+        cfg, inner,
+    )))
 }
 
 /// 控制面 POST endpoint 链：`POST` + JSON Content-Type（无 stations guard）。
@@ -418,7 +416,6 @@ pub struct AutomationState {
 
 impl AutomationState {
     pub fn new(auto_unlock: bool, auto_hangup: bool) -> Self {
-        
         Self {
             auto_unlock: AtomicBool::new(auto_unlock),
             auto_hangup: AtomicBool::new(auto_hangup),
@@ -722,16 +719,14 @@ fn handle_unlock(st: &ServerInner, w: &mut dyn ResponseWriter, r: &Request) {
     };
 
     let cancel = AtomicBool::new(false);
-    let res = match st.sender.execute_unlock(
-        caller_bcd,
-        callee_bcd,
-        &target_ip,
-        target_port,
-        &cancel,
-    ) {
-        Ok(code) => code,
-        Err(_) => result::ERR,
-    };
+    let res =
+        match st
+            .sender
+            .execute_unlock(caller_bcd, callee_bcd, &target_ip, target_port, &cancel)
+        {
+            Ok(code) => code,
+            Err(_) => result::ERR,
+        };
     respond_business_result(st, w, "unlock", res, &from, &to);
 }
 
@@ -823,7 +818,9 @@ fn format_uri_err(e: &codec::UriError, uri: &str) -> String {
 
 fn format_bcd_err(e: &codec::BcdError, uri: &str) -> String {
     match e {
-        codec::BcdError::Length { got } => format!("bcd: name must be 8 hex digits: {uri:?} (len={got})"),
+        codec::BcdError::Length { got } => {
+            format!("bcd: name must be 8 hex digits: {uri:?} (len={got})")
+        }
         codec::BcdError::Format { ch, index } => {
             format!("bcd: invalid hex digit {ch:?} at index {index}: {uri:?}")
         }
@@ -1226,7 +1223,11 @@ mod tests {
             ("Application/JSON", STATUS_OK, true),
             ("APPLICATION/JSON; CHARSET=UTF-8", STATUS_OK, true),
             ("application/JSON; charset=utf-8", STATUS_OK, true),
-            ("application/x-www-form-urlencoded", STATUS_UNSUPPORTED_MEDIA, false),
+            (
+                "application/x-www-form-urlencoded",
+                STATUS_UNSUPPORTED_MEDIA,
+                false,
+            ),
             ("", STATUS_UNSUPPORTED_MEDIA, false),
             ("text/plain", STATUS_UNSUPPORTED_MEDIA, false),
             ("application/json garbage", STATUS_UNSUPPORTED_MEDIA, false),
@@ -1451,7 +1452,7 @@ mod tests {
         assert_eq!(parse_auto_toggle_body(br#"{"on":true}"#), Ok(true));
         assert_eq!(parse_auto_toggle_body(br#"{"ON":true}"#), Ok(true)); // 大小写不敏感
         assert!(parse_auto_toggle_body(b"[bad").is_err()); // 非法 JSON → Err
-        // review-loop R2 修正的边界：
+                                                           // review-loop R2 修正的边界：
         assert_eq!(parse_auto_toggle_body(br#"{"on":null}"#), Ok(false)); // null 值 → 零值（非 400）
         assert!(parse_auto_toggle_body(b"   ").is_err()); // 纯空白（raw 非空）→ Go Unmarshal 报错 → 400
         assert_eq!(
@@ -1622,7 +1623,14 @@ mod tests {
 
     #[test]
     fn get_playback_empty_body_content_length_zero() {
-        let s = Server::new(sample_server_cfg(), "v0.2.0", None, None, None, MockSender::success());
+        let s = Server::new(
+            sample_server_cfg(),
+            "v0.2.0",
+            None,
+            None,
+            None,
+            MockSender::success(),
+        );
         let h = s.handler();
         let req = test_request_path("GET", "/playback", None, b"");
         let (status, headers, body) = Recorder::new().pipe(|w| h.serve_http(w, &req));
@@ -1633,7 +1641,14 @@ mod tests {
 
     #[test]
     fn maybe_push_noop_when_nil() {
-        let s = Server::new(sample_server_cfg(), "v0.2.0", None, None, None, MockSender::success());
+        let s = Server::new(
+            sample_server_cfg(),
+            "v0.2.0",
+            None,
+            None,
+            None,
+            MockSender::success(),
+        );
         s.maybe_push("unlock", &[("result", "0")]);
     }
 
@@ -1649,7 +1664,14 @@ mod tests {
     fn maybe_push_calls_pusher_when_set() {
         let called = Arc::new(AtomicBool::new(false));
         let pusher: Arc<dyn Pusher> = Arc::new(FlagPusher(Arc::clone(&called)));
-        let s = Server::new(sample_server_cfg(), "v0.2.0", None, None, Some(pusher), MockSender::success());
+        let s = Server::new(
+            sample_server_cfg(),
+            "v0.2.0",
+            None,
+            None,
+            Some(pusher),
+            MockSender::success(),
+        );
         s.maybe_push("unlock", &[("result", "0")]);
         assert!(called.load(Ordering::SeqCst));
     }
@@ -1666,14 +1688,7 @@ mod tests {
         // 方法调用 `.clone()` 得 Arc<MockSender> 再于带注解 let 处 unsize 到 Arc<dyn Sender>；
         // 用 `Arc::clone(&mock)`（UFCS）会让推断反向流、误判 &mock 须为 &Arc<dyn Sender>。
         let sender: Arc<dyn Sender> = mock.clone();
-        let s = Server::new(
-            sample_server_cfg(),
-            "v0.2.0",
-            None,
-            None,
-            None,
-            sender,
-        );
+        let s = Server::new(sample_server_cfg(), "v0.2.0", None, None, None, sender);
         let h = s.handler();
         let req = test_request_path(
             "POST",
@@ -1737,7 +1752,9 @@ mod tests {
         );
         let (status, _, body) = Recorder::new().pipe(|w| h.serve_http(w, &req));
         assert_eq!(status, STATUS_BAD_REQUEST);
-        assert!(String::from_utf8(body).unwrap().contains("missing 'to' field"));
+        assert!(String::from_utf8(body)
+            .unwrap()
+            .contains("missing 'to' field"));
     }
 
     #[test]
@@ -1759,7 +1776,9 @@ mod tests {
         );
         let (status, _, body) = Recorder::new().pipe(|w| h.serve_http(w, &req));
         assert_eq!(status, STATUS_BAD_REQUEST);
-        assert!(String::from_utf8(body).unwrap().contains("invalid 'from' URI"));
+        assert!(String::from_utf8(body)
+            .unwrap()
+            .contains("invalid 'from' URI"));
     }
 
     #[test]

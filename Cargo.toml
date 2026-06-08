@@ -13,6 +13,13 @@ name = "dooraccess-rs-probe"
 path = "src/main.rs"
 
 [dependencies]
+# crate gate 放宽边界（Phase 3，D-A / spec「crate gate 放宽边界」）：
+# 0-crate → std + libc only。libc **唯一**外部 crate，破口框死三处：
+#   ① listen6672 PF_PACKET ② listen18022 PF_PACKET ③ wire_sender SO_BINDTODEVICE
+# 拒 nix / pnet / socket2 / tokio；任何超出须新 OpenSpec change。
+# T1 探针（2026-06-08）实测 libc 0.2.186 mips 目标完整导出 sock_fprog/sock_filter/
+# sockaddr_ll/packet_mreq/timeval + 全常量，直接用 libc 类型不手搓（const-assert size 守门）。
+libc = "0.2"
 
 [profile.release]
 panic = "abort"

@@ -95,9 +95,7 @@ pub fn render_json(sd: &SelfDesc) -> Vec<u8> {
     } else {
         sd.stations
             .iter()
-            .map(|s| {
-                JsonValue::Struct(vec![("sip".into(), JsonValue::String(s.sip.clone()))])
-            })
+            .map(|s| JsonValue::Struct(vec![("sip".into(), JsonValue::String(s.sip.clone()))]))
             .collect()
     };
 
