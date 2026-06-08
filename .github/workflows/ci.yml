@@ -41,7 +41,7 @@ jobs:
       - name: Install zstd
         run: sudo apt-get update && sudo apt-get install -y zstd
       - name: Cache OpenWrt SDK sysroot
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .openwrt-sdk
           key: openwrt-sdk-${{ env.OPENWRT_SDK_VER }}-ath79-mips_24kc
