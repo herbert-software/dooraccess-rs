@@ -239,26 +239,37 @@ pub trait Deadline: Send + Sync {
 
 /// 生产总 cap：以构造时刻 + [`UNLOCK_TOTAL_CAP`] 派生绝对 deadline。
 pub struct InstantDeadline {
-    deadline: Instant,
+    cap: Duration,
+    /// **惰性起点**：首次 `expired()`/`remaining()` 调用时才捕获 `Instant::now()`。
+    /// execute_unlock 在拿 `post_wire_mu` 锁**后**才首次查 deadline,故 cap 从拿锁时
+    /// 起算——等锁时间不计入总 cap（对齐 Go：`postMu.Lock()` 在 `WithTimeout(ctx,cap)`
+    /// 之前,handlers.go:309 vs 323）。`OnceLock` 保持 `Send + Sync`。
+    started: std::sync::OnceLock<Instant>,
 }
 
 impl InstantDeadline {
-    /// 以 `now + cap` 为绝对 deadline。
+    /// cap 时长；绝对 deadline 在首次查询时惰性确定为 `首次查询时刻 + cap`。
     pub fn new(cap: Duration) -> Self {
         Self {
-            deadline: Instant::now() + cap,
+            cap,
+            started: std::sync::OnceLock::new(),
         }
+    }
+
+    /// 惰性绝对 deadline = `首次调用时刻 + cap`。
+    fn deadline(&self) -> Instant {
+        *self.started.get_or_init(Instant::now) + self.cap
     }
 }
 
 impl Deadline for InstantDeadline {
     fn expired(&self) -> bool {
-        Instant::now() >= self.deadline
+        Instant::now() >= self.deadline()
     }
 
     fn remaining(&self) -> Option<Duration> {
         // 到点返回 Some(ZERO)（saturating_duration_since 已到点即为 0）。
-        Some(self.deadline.saturating_duration_since(Instant::now()))
+        Some(self.deadline().saturating_duration_since(Instant::now()))
     }
 }
 
