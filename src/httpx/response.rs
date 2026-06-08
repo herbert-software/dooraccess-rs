@@ -67,7 +67,12 @@ impl<W: Write> ResponseWriter for ResponseWriterImpl<W> {
         let reason = if reason.is_empty() { "Status" } else { reason };
         let _ = write!(self.bw, "HTTP/1.1 {code} {reason}\r\n");
 
-        for (k, vals) in self.headers.iter() {
+        // 按 key 排序后写,保证输出确定性（`Header` 内部是 HashMap,iter 序随机会让
+        // HTTP 响应 header 顺序每次不同；HTTP 语义与顺序无关、HACS 按名解析,但 byte-exact
+        // golden / 跨语言 parity 需确定序）。与 Go `httpx/response.go` 的 sort.Strings 对齐。
+        let mut entries: Vec<(&String, &Vec<String>)> = self.headers.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (k, vals) in entries {
             for v in vals {
                 let _ = write!(self.bw, "{k}: {v}\r\n");
             }

@@ -50,11 +50,7 @@ impl HaPushClient {
     }
 
     /// 同步发一次反向 push（JSON body + Bearer auth）。
-    pub fn push(
-        &self,
-        event: &str,
-        fields: &BTreeMap<String, String>,
-    ) -> Result<(), PushError> {
+    pub fn push(&self, event: &str, fields: &BTreeMap<String, String>) -> Result<(), PushError> {
         if self.cfg.hass.api.is_empty() {
             self.logf("HA Push skipped: api not configured");
             return Err(PushError::NotConfigured(NotConfiguredError));
@@ -67,20 +63,20 @@ impl HaPushClient {
         }
 
         let body_bytes = encode_map(&body, JsonOptions::MARSHAL);
-        self.logf(&format!("HA Push: {}", String::from_utf8_lossy(&body_bytes)));
+        self.logf(&format!(
+            "HA Push: {}",
+            String::from_utf8_lossy(&body_bytes)
+        ));
 
         let target = build_url(
             &self.cfg.hass.ipaddr,
             self.cfg.hass.port,
             &self.cfg.hass.api,
         );
-        let mut req = new_request(METHOD_POST, &target, Some(&body_bytes))
-            .map_err(PushError::Request)?;
+        let mut req =
+            new_request(METHOD_POST, &target, Some(&body_bytes)).map_err(PushError::Request)?;
         req.set_header("Content-Type", "application/json");
-        req.set_header(
-            "Authorization",
-            &format!("Bearer {}", self.cfg.hass.token),
-        );
+        req.set_header("Authorization", &format!("Bearer {}", self.cfg.hass.token));
 
         let resp = self.http.do_request(&req).map_err(|e| {
             self.logf(&format!("HA Push failed: {e}"));
@@ -195,7 +191,7 @@ pub fn build_url(host: &str, port: i64, api: &str) -> String {
 fn iface_ipv4_addrs(iface: &str) -> Vec<Ipv4Addr> {
     #[cfg(target_os = "linux")]
     {
-        return linux_iface_ipv4(iface);
+        linux_iface_ipv4(iface)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -279,16 +275,10 @@ mod tests {
     #[test]
     fn pick_non_loopback_ipv4_cases() {
         assert_eq!(
-            pick_non_loopback_ipv4(&[
-                Ipv4Addr::new(127, 0, 0, 1),
-                Ipv4Addr::new(192, 168, 1, 10),
-            ]),
+            pick_non_loopback_ipv4(&[Ipv4Addr::new(127, 0, 0, 1), Ipv4Addr::new(192, 168, 1, 10),]),
             "192.168.1.10"
         );
-        assert_eq!(
-            pick_non_loopback_ipv4(&[Ipv4Addr::new(127, 0, 0, 1)]),
-            ""
-        );
+        assert_eq!(pick_non_loopback_ipv4(&[Ipv4Addr::new(127, 0, 0, 1)]), "");
         assert_eq!(pick_non_loopback_ipv4(&[]), "");
     }
 

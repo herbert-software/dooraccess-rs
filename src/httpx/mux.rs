@@ -1,6 +1,6 @@
 //! 极简 path-only 路由（复刻 Go `mux.go`）。
 
-use super::{Handler, Request, ResponseWriter, STATUS_NOT_FOUND, Url, METHOD_GET};
+use super::{Handler, Request, ResponseWriter, Url, METHOD_GET, STATUS_NOT_FOUND};
 
 /// path-only 路由表：精确优先，then 最长前缀匹配。
 pub struct ServeMux {
@@ -89,8 +89,7 @@ impl Default for ServeMux {
 }
 
 fn http404(w: &mut dyn ResponseWriter) {
-    w.header()
-        .set("Content-Type", "text/plain; charset=utf-8");
+    w.header().set("Content-Type", "text/plain; charset=utf-8");
     w.header().set("Content-Length", "9");
     w.write_header(STATUS_NOT_FOUND);
     let _ = w.write(b"Not Found");

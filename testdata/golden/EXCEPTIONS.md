@@ -151,3 +151,52 @@ Rust 已对齐**部署目标 int32 语义**（非 64-bit host）：
 - **body deadline = whole-request**（review-loop R1 修正）：body 读取在 headers 后切到 `read_timeout`（30s）而非更紧的
   `read_header_timeout`（5s），复刻 Go lazy-body 时序。诚实时序测试 `read_timeout_is_whole_request_deadline`
   断言 body 落在 header-deadline 与 req-deadline 之间时仍 200 OK。
+
+---
+
+## §listeners — listen6672 / listen18022 / BPF / wire_sender 向量（组 E，port-rust-listeners-unlock）
+
+向量文件 `bpf.txt` / `listen6672.txt` / `listen6672_extract.txt` / `listen18022.txt` /
+`listen18022_extract.txt` / `wire_sender.txt` 由 `dooraccess-go` 的
+`internal/listen6672` + `internal/listen18022` 的 `export_golden_test.go`（跨平台）
++ `export_golden_linux_test.go`（`//go:build linux && export`）**真实 Go 导出**
+（2026-06-08 实跑：跨平台部分 host `go test`、linux-only extract 部分 Docker `golang:1.25`
+`go test -tags export`；本节向量**非模拟推导**，已用真实导出落盘）。
+
+### ① BPF const 双写互验 + 端口 k 值（D-D：烤 const 不移植汇编器）
+
+- **SoT**：`golang.org/x/net/bpf.Assemble`（Go `buildBPFFilter` 的 `[]bpf.Instruction`）。
+- `bpf.txt` 同时含 `bpf6672`（11 条）+ `bpf18022`（13 条）两段；listen6672 与 listen18022
+  两个 export test **各自写完整 bpf.txt**（互镜像，幂等内容一致）——改任一 filter 须同步两处
+  镜像，否则两包写出的 bpf.txt 不一致、drift gate diff 即 fail（双写互验）。
+- 端口烤为 const：6672=`0x1a10`（`bpf6672[8].k`）、18022=`0x4666`（`bpf18022[8].k` 源端口 +
+  `bpf18022[10].k` 目的端口，src 或 dst = 18022 都接受）。Rust `bpf::BPF_6672`/`BPF_18022`
+  对 `bpf.txt` 逐字段（op/jt/jf/k）断言相等（`tests/golden_bpf.rs`）；若不一致即组 A 烤错。
+
+### ② 响铃 byte19 多值识别（0x8c / 0x94 / 0x95 全判 ring）★ E9 锚点
+
+- **SoT**：Go `listen6672/parser.go:88` `case 0x8c, 0x94, 0x95:`（v0.3.3 fix-doorbell-pipeline）。
+- byte19（subtype）疑似 session counter / event token——同一呼叫事件内 8 帧一致、跨事件取不同值
+  （实测 0x94 / 0x95 / 0x8c）。只认单值 0x94 会漏判 0x8c/0x95 的真实响铃帧（即 Go v0.3.3 已修
+  的漏分类 bug）。`listen6672.txt` 三值各一帧 + 呼梯 0x90 一帧（→ elevator_key），Rust `classify`
+  对每帧的 `EventKind.as_str()` 断言等于 Go `kind.String()`（`tests/golden_listeners.rs`）。
+
+### ③ extract 向量是 linux-only Go 导出（Rust extract 跨平台）
+
+- Go `extractUDPPayload` / `extractTCPPayload` 定义在 `listener_linux.go`（`//go:build linux`），
+  故 `*_extract.txt` 经 Docker linux 容器导出；CI `golden-drift` job 在 ubuntu(linux) runner
+  上原生重导。Rust `extract_udp_payload` / `extract_tcp_payload` 是跨平台 `pub fn`（无 cfg 门），
+  host `cargo test` 读已 committed 的静态 fixture 即可断言（无需 linux）。
+
+### ④ wire_sender 错误分类（classifyWireErr 语义复刻）
+
+- **SoT**：Go `wire18022.IsRetryableError` + `http8080.classifyWireErr`（handlers.go:714）。
+- `wire_sender.txt` 的 `errclass` 行含 `retryable bool`（公开 API）+ `result_code`：
+  silent_fin→`-103`(NO_RING) / timeout→`-5`(TIMEOUT) / 其它(connection_reset/broken_pipe/
+  connrefused)→`-1`(ERR)。Go export **逐字复刻** `classifyWireErr` 的 `errors.Is` 链 + codec 常量
+  （classifyWireErr 是 http8080 包私有，无法跨包直调）。
+- Rust 侧：`tests/golden_listeners.rs` 验 `is_retryable_error`（公开）的 bool 列；result_code 列
+  因 `sender::map_wire_kind` 私有，在 `src/sender.rs` 内 `#[cfg(test)]`（`golden_errclass_result_code`）
+  验 `WireError → map_wire_kind → classify_wire_err(i32)` 端到端等于 golden。
+- sender 帧（`frame` 行）= `wire18022.Build*Frame`（与 §wire 的 `wire.txt` 同源 builder，此处覆盖
+  sender 实际发送的 5 帧 kind：unlock_a/unlock_b/bye/appoint/preview）。

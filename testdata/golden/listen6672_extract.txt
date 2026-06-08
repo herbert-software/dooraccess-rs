@@ -1,0 +1,7 @@
+# listen6672_extract.txt — extractUDPPayload L2 帧→payload golden（组 E，task 8.1，linux-only）。
+# SoT = Go internal/listen6672/listener_linux.go:extractUDPPayload（Ethernet/IPv4/UDP 头拆解）。
+# 行格式：extract|<framehex>|<payloadhex>|<srcip>|<srcport>
+#         extract_reject|<reason>|<framehex>
+extract|ffffffffffff000ce80000010800450000310000000040110000ac106a98ac106aca1a101a10001d00000006021103060211520000000001000000004094b6|0006021103060211520000000001000000004094b6|172.16.106.152|6672
+extract_reject|non-ipv4|ffffffffffff000ce800000186dd450000310000000040110000ac106a98ac106aca1a101a10001d00000006021103060211520000000001000000004094b6
+extract_reject|too-short|ffffffffffff000ce80000010800450000310000
