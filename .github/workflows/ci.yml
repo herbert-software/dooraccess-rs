@@ -52,7 +52,7 @@ jobs:
       - name: Verify MIPS BE + soft-float + static
         run: make verify-mips
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dooraccess-rs-probe-mips
           path: target/mips-unknown-linux-musl/release/dooraccess-rs-probe
