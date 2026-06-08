@@ -647,7 +647,7 @@ impl Listener {
             self.dedup.is_some()
         ));
 
-        let mut buf = [0u8; 1500];
+        let mut buf = [0u8; 1514]; // ETH header(14) + MTU(1500);防最大 untagged 帧截断（与 listen18022 一致）
         loop {
             if shutdown.load(Ordering::SeqCst) {
                 return Ok(());
