@@ -740,6 +740,101 @@ impl Config {
     }
 }
 
+// ===========================================================================
+// ResolveIfaceList（Phase 4 G3a 移植，锚 Go `Config.ResolveIfaceList`）
+// ===========================================================================
+
+/// listen6672 / listen18022 应监听的 PF_PACKET slave 接口解析失败原因（锚 Go sentinel）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IfaceError {
+    /// `iface` 与 `iface_list` 都空（Go `ErrIfaceMissing`）。
+    Missing,
+    /// `iface` 是 bridge 但 `brif/` 无 slave（Go `ErrBridgeNoSlaves`）。
+    BridgeNoSlaves { bridge: String },
+    /// sysfs 读盘失败（非 NotExist）。
+    Read { path: String, msg: String },
+}
+
+impl std::fmt::Display for IfaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IfaceError::Missing => write!(f, "iface and iface_list both empty"),
+            IfaceError::BridgeNoSlaves { bridge } => {
+                write!(f, "bridge {bridge} has no slaves")
+            }
+            IfaceError::Read { path, msg } => write!(f, "read {path}: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for IfaceError {}
+
+/// sysfs 根（与 Go `sysClassNet` 等价；测试可覆写）。
+const SYS_CLASS_NET: &str = "/sys/class/net";
+
+impl Config {
+    /// 算出应监听的 PF_PACKET 接口列表（逐行对齐 Go `ResolveIfaceList`）：
+    ///
+    ///   1. `iface_list` 显式非空 → 直接返回（escape hatch，跳过自动展开）。
+    ///   2. `iface` 空 → `IfaceError::Missing`。
+    ///   3. `iface` 是 linux bridge（`/sys/class/net/<iface>/bridge/` 存在）→ 读
+    ///      `brif/*` 展开成 slave 列表；空 slave → `BridgeNoSlaves`。
+    ///   4. 否则（物理接口，无 bridge 目录）→ 单元素 `[iface]`。
+    ///
+    /// **纯 sysfs（`std::fs`）路径**：仅 `stat` `bridge/` + `read_dir` `brif/`，**不**调
+    /// `net.Interfaces`、**不**触 ifindex/字节序——故无新 BE 面（design「桥解析若实现也碰
+    /// BE ifindex」对应的是 ifindex 读取分支，Go `ResolveIfaceList` 走 brif 名枚举不读
+    /// ifindex，本移植与其字面一致）。
+    pub fn resolve_iface_list(&self) -> Result<Vec<String>, IfaceError> {
+        self.resolve_iface_list_in(SYS_CLASS_NET)
+    }
+
+    /// `resolve_iface_list` 的 sysfs 根参数化版本（测试注入 fake sysfs 用）。
+    pub fn resolve_iface_list_in(&self, sys_class_net: &str) -> Result<Vec<String>, IfaceError> {
+        if !self.iface_list.is_empty() {
+            return Ok(self.iface_list.clone());
+        }
+        if self.iface.is_empty() {
+            return Err(IfaceError::Missing);
+        }
+        let bridge_path = format!("{sys_class_net}/{}/bridge", self.iface);
+        match fs::metadata(&bridge_path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // 非 bridge（物理接口）→ 单元素返回。
+                return Ok(vec![self.iface.clone()]);
+            }
+            Err(e) => {
+                return Err(IfaceError::Read {
+                    path: bridge_path,
+                    msg: e.to_string(),
+                });
+            }
+            Ok(_) => {}
+        }
+        let brif_path = format!("{sys_class_net}/{}/brif", self.iface);
+        let entries = fs::read_dir(&brif_path).map_err(|e| IfaceError::Read {
+            path: brif_path.clone(),
+            msg: e.to_string(),
+        })?;
+        let mut slaves: Vec<String> = Vec::new();
+        for e in entries {
+            let e = e.map_err(|e| IfaceError::Read {
+                path: brif_path.clone(),
+                msg: e.to_string(),
+            })?;
+            slaves.push(e.file_name().to_string_lossy().into_owned());
+        }
+        // read_dir 顺序非确定 → 排序对齐 Go `os.ReadDir` 的确定性。
+        slaves.sort();
+        if slaves.is_empty() {
+            return Err(IfaceError::BridgeNoSlaves {
+                bridge: self.iface.clone(),
+            });
+        }
+        Ok(slaves)
+    }
+}
+
 /// 从 path 读盘 + 解析 + 默认值 + deprecated 检测 + 校验（Go `LoadConfig`）。
 ///
 /// `std::fs` 读盘属确定性范围 IN（design D3）。
@@ -885,4 +980,80 @@ pub fn validate_uri(uri: &str) -> Result<(), String> {
         return Err(format!("port {port_str:?} out of range"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod iface_tests {
+    use super::*;
+
+    fn cfg_with(iface: &str, iface_list: &[&str]) -> Config {
+        Config {
+            iface: iface.to_string(),
+            iface_list: iface_list.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn explicit_iface_list_overrides() {
+        let c = cfg_with("br-door", &["eth0.2", "eth1"]);
+        // 即便 iface 是 bridge，显式 iface_list 直接返回（escape hatch）。
+        assert_eq!(
+            c.resolve_iface_list_in("/nonexistent_sysfs").unwrap(),
+            vec!["eth0.2".to_string(), "eth1".to_string()]
+        );
+    }
+
+    #[test]
+    fn empty_both_is_missing() {
+        let c = cfg_with("", &[]);
+        assert_eq!(
+            c.resolve_iface_list_in("/nonexistent").unwrap_err(),
+            IfaceError::Missing
+        );
+    }
+
+    #[test]
+    fn bridge_expands_to_slaves() {
+        let root = std::env::temp_dir().join(format!("dars_sysfs_{}", std::process::id()));
+        let brif = root.join("br-door/brif");
+        fs::create_dir_all(&brif).unwrap();
+        fs::create_dir_all(root.join("br-door/bridge")).unwrap();
+        fs::write(brif.join("eth0.2"), b"").unwrap();
+        fs::write(brif.join("eth1"), b"").unwrap();
+
+        let c = cfg_with("br-door", &[]);
+        let mut got = c.resolve_iface_list_in(root.to_str().unwrap()).unwrap();
+        got.sort();
+        assert_eq!(got, vec!["eth0.2".to_string(), "eth1".to_string()]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn physical_iface_returns_single() {
+        // 物理接口：无 bridge 目录 → 单元素返回。
+        let root = std::env::temp_dir().join(format!("dars_sysfs_phys_{}", std::process::id()));
+        fs::create_dir_all(root.join("eth0")).unwrap();
+        let c = cfg_with("eth0", &[]);
+        assert_eq!(
+            c.resolve_iface_list_in(root.to_str().unwrap()).unwrap(),
+            vec!["eth0".to_string()]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bridge_with_no_slaves_errors() {
+        let root = std::env::temp_dir().join(format!("dars_sysfs_empty_{}", std::process::id()));
+        fs::create_dir_all(root.join("br0/bridge")).unwrap();
+        fs::create_dir_all(root.join("br0/brif")).unwrap();
+        let c = cfg_with("br0", &[]);
+        assert_eq!(
+            c.resolve_iface_list_in(root.to_str().unwrap()).unwrap_err(),
+            IfaceError::BridgeNoSlaves {
+                bridge: "br0".to_string()
+            }
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
 }

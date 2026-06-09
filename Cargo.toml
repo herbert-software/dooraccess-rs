@@ -7,9 +7,10 @@ edition = "2021"
 name = "dooraccess_rs"
 path = "src/lib.rs"
 
-# Phase0 probe bin keeps its original target name for continuity.
+# Phase 4：src/main.rs 是 daemon 编排入口（Phase 0-3 的 passive-shadow 探针迁至
+# examples/probe.rs，`cargo build --example probe` 构建，逻辑零回归）。
 [[bin]]
-name = "dooraccess-rs-probe"
+name = "dooraccess-rs"
 path = "src/main.rs"
 
 [dependencies]

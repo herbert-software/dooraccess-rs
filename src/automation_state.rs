@@ -1,8 +1,9 @@
-// Phase1: automation_state 模块（parse + render，不接写盘）。
+// automation_state 模块（parse + render + 原子写 Persister）。
 //
-// 移植 Go `local/dooraccess-go internal/automationstate` 的两个纯函数 `parse` / `render`。
-// **不**移植 `writeAtomic` / `Persister`（原子写 + 串行化锁 + 节流）——有状态写盘超出
-// Phase1 范围，推迟到后续 daemon Phase。
+// 移植 Go `local/dooraccess-go internal/automationstate`：
+//   - Phase1：两个纯函数 `parse` / `render`。
+//   - Phase4（本组 G1）：`write_atomic`（temp + rename 原子写）+ `Persister`（自带内部锁
+//     串行化 + 纯值去重，逐行对齐 Go `Persist`）。
 //
 // 文件格式（INI 2 行）：
 //
@@ -104,4 +105,137 @@ pub fn render(st: State) -> Vec<u8> {
     out.push_str(if st.auto_hangup { "true" } else { "false" });
     out.push('\n');
     out.into_bytes()
+}
+
+// ===========================================================================
+// 原子写 + Persister（Phase4 G1，锚 Go `writeAtomic` / `Persister`）
+// ===========================================================================
+
+use std::path::Path;
+use std::sync::Mutex;
+
+/// temp 文件后缀（固定名覆盖写：rename 前崩留的残留下次被覆盖，禁唯一/pid 名累积
+/// 16MB flash，逐字对齐 Go `tempSuffix`）。
+const TEMP_SUFFIX: &str = ".tmp";
+
+/// 原子写：写固定名 temp（**同目录**）→ `rename` 到目标（锚 Go `writeAtomic`）。
+///
+/// `path + ".tmp"` 与 `path` 必然同目录（POSIX `rename` 同文件系统内原子替换；跨 fs
+/// rename 非原子——同目录前缀拼接结构性保证同目录，无需运行时断言跨 fs）。
+///
+/// 串行化由 caller（`Persister` 的内部锁）保证。失败返 `io::Error`（caller best-effort
+/// log，不 crash、不让 endpoint 失败）。rename 失败时清掉残留 temp（best-effort）。
+pub fn write_atomic(path: &Path, st: State) -> std::io::Result<()> {
+    // tmp 名 = 目标路径 + ".tmp"，与目标同目录（结构性同 fs）。
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(TEMP_SUFFIX);
+    let tmp = std::path::PathBuf::from(tmp);
+
+    std::fs::write(&tmp, render(st))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // rename 失败：清残留 temp（best-effort），返错让 caller log。
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// 返回当前运行时两 flag 真值的回调类型（锚 Go `valueSource func() (autoUnlock, autoHangup bool)`）。
+///
+/// `Persist` 每次调用时读它取**当前真值**（非入队/构造时快照）——保证翻转后 pending
+/// 同值写不回退翻转值。
+pub type ValueSource = Box<dyn Fn() -> (bool, bool) + Send + Sync>;
+
+/// 写失败 warning 日志钩子类型（`None` 安全）。
+pub type LogFn = Box<dyn Fn(&str) + Send + Sync>;
+
+/// 串行化 + 纯值去重地把当前 flag 值落盘（锚 Go `Persister`）。
+///
+/// 用法：endpoint 改运行时 atomic flag 后调 `persist()`；`persist` 读 `value_source`
+/// 当前真值（非快照）+ 只在与已落盘值不同时写（**纯值去重**：重复同值 no-op、翻转立即
+/// 落盘，**无时间窗节流**——逐行对齐 Go `Persist`）。
+///
+/// 串行化由 `Persister` **自身的内部锁** `Mutex<PersistedState>` 保证（`persist` 由 HTTP
+/// 线程调，`/auto_unlock` 与 `/auto_hangup` 可在不同 HTTP 线程并发拨动；已删除的 wireMu
+/// 不覆盖此路径——故 Persister MUST 自带锁，不依赖 worker/wire 锁）。
+///
+/// 写失败 best-effort：log warning 但不返错给 endpoint、不 crash。
+pub struct Persister {
+    path: std::path::PathBuf,
+    value_source: ValueSource,
+    logf: Option<LogFn>,
+    /// 内部串行化锁 + 已落盘值（节流：当前==last 则 no-op）。
+    /// 锁同时串行化「读真值→比对→写盘→更新 last」整个临界区，防两次 persist 交错半写。
+    state: Mutex<PersistedState>,
+}
+
+/// 已落盘状态（受 `Persister.state` 锁保护）。
+struct PersistedState {
+    /// `last` 是否有效（首次 persist 前无意义，对齐 Go `hasWrote`）。
+    has_wrote: bool,
+    /// 已成功落盘的值（去重：当前==last 则 no-op）。
+    last: State,
+}
+
+impl Persister {
+    /// 构造一个 `Persister`（锚 Go `NewPersister`）。
+    ///
+    ///   - `path`：state 文件绝对路径（生产 `/etc/dooraccess-go/automation.state`，落 /etc overlay）。
+    ///   - `value_source`：返回当前运行时两 flag 真值 `(auto_unlock, auto_hangup)` 的回调。
+    ///     `persist` 每次读它取当前真值。
+    ///   - `logf`：写失败 warning 日志钩子（`None` 安全）。
+    pub fn new(path: std::path::PathBuf, value_source: ValueSource, logf: Option<LogFn>) -> Self {
+        Self {
+            path,
+            value_source,
+            logf,
+            state: Mutex::new(PersistedState {
+                has_wrote: false,
+                last: State {
+                    auto_unlock: false,
+                    auto_hangup: false,
+                },
+            }),
+        }
+    }
+
+    fn logf(&self, msg: &str) {
+        if let Some(f) = &self.logf {
+            f(msg);
+        }
+    }
+
+    /// 把当前 flag 真值落盘（串行化 + 纯值去重）。best-effort：写失败 log warning 不返错。
+    ///
+    /// 去重语义（逐行对齐 Go `Persist`）：读当前真值，仅在与已落盘值不同时写——重复同值
+    /// no-op（防 flash 磨损），值翻转立即落盘（**无时间窗去抖**）。
+    pub fn persist(&self) {
+        // 锁住整个临界区（读真值→去重比对→写盘→更新 last），串行化并发 persist。
+        // lock poison 时仍取内层数据继续（best-effort，落盘不该因别处 panic 而停摆）。
+        let mut guard = match self.state.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        let (au, ah) = (self.value_source)();
+        let cur = State {
+            auto_unlock: au,
+            auto_hangup: ah,
+        };
+
+        // 去重：当前真值 == 已落盘值 → 合并（no-op），不磨损 flash。
+        if guard.has_wrote && cur == guard.last {
+            return;
+        }
+
+        if let Err(e) = write_atomic(&self.path, cur) {
+            // best-effort：内存 flag 已更新，持久失败仅 log warning，不 crash、不让 endpoint 失败。
+            self.logf(&format!(
+                "automation.state persist failed (best-effort, flag still applied in-memory): {e}"
+            ));
+            return;
+        }
+        guard.last = cur;
+        guard.has_wrote = true;
+    }
 }

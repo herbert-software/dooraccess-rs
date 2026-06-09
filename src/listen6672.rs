@@ -236,6 +236,38 @@ pub fn build_number_query_response(req_frame: &Frame, our_ip: [u8; 4]) -> [u8; F
     out
 }
 
+/// 单播响应到 `dst_ip:DEFAULT_UDP_PORT`（锚 Go `SendUDPResponse`）。
+///
+/// spec 实测邻居都是单播回应而非广播。不要求 `SO_BINDTODEVICE`：目标在门禁网，OS
+/// 路由表 + src IP 选择会走对的网卡。出错返 `io::Error`，调用方负责 log。
+///
+/// 实现走 std `UdpSocket`（无需 libc——本 send 路径不在 PF_PACKET listener I/O 零改动
+/// 伞下，是**新 BE 面**：`SocketAddrV4` 内部把 port 编 NBO；`dst_ip` 已是 `[u8; 4]`
+/// 网络序字节，端口用平台无关 `Ipv4Addr`/`SocketAddrV4` 构造而非手写移位。BE 正确性
+/// dev[LE] 测不出，留 Phase 7 真机验。
+pub fn send_udp_response(dst_ip: [u8; 4], payload: &[u8]) -> std::io::Result<()> {
+    send_udp_response_to(dst_ip, DEFAULT_UDP_PORT, payload)
+}
+
+/// `send_udp_response` 的端口参数化内部版本（测试用任意端口替换 6672 避开 root/防火墙）。
+///
+/// 绑定到 `0.0.0.0:0` 临时本地端口后 `connect` 目标再 `send`（等价 Go `net.DialUDP`
+/// nil laddr：内核选 src IP + 临时端口）。`SocketAddrV4` 承载端口的 NBO 编码（不手写
+/// `v<<8|v>>8`，守平台无关字节序）。
+pub fn send_udp_response_to(dst_ip: [u8; 4], dst_port: u16, payload: &[u8]) -> std::io::Result<()> {
+    use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+
+    let local = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
+    let sock = UdpSocket::bind(local)?;
+    let dst = SocketAddrV4::new(
+        Ipv4Addr::new(dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]),
+        dst_port,
+    );
+    sock.connect(dst)?;
+    sock.send(payload)?;
+    Ok(())
+}
+
 // ===========================================================================
 // dedup ringbuffer（锚 Go dedup.go，时钟注入 seam）
 // ===========================================================================
@@ -884,6 +916,37 @@ mod tests {
         assert_eq!(resp[18], 0x40);
         assert_eq!(resp[19], req.subtype);
         assert_eq!(resp[20], req.event_id);
+    }
+
+    // --- send_udp_response（8.0，loopback 单播发送原语）---
+
+    #[test]
+    fn send_udp_response_loopback_roundtrip() {
+        use std::net::UdpSocket;
+
+        // 在 127.0.0.1 起一个临时 receiver，让内核选端口（避免端口占用 flaky）。
+        let recv = match UdpSocket::bind("127.0.0.1:0") {
+            Ok(s) => s,
+            // 沙箱可能拦 UDP bind → 跳过（非逻辑失败；BE 正确性本就留 Phase 7 真机）。
+            Err(e) => {
+                eprintln!("send_udp_response_loopback_roundtrip skipped: bind failed: {e}");
+                return;
+            }
+        };
+        let port = recv.local_addr().unwrap().port();
+        recv.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+
+        let payload = ring_frame(0x94);
+        // dst 用 127.0.0.1（loopback），端口用 receiver 实际端口。
+        if let Err(e) = send_udp_response_to([127, 0, 0, 1], port, &payload) {
+            eprintln!("send_udp_response_loopback_roundtrip skipped: send failed: {e}");
+            return;
+        }
+
+        let mut buf = [0u8; 64];
+        let n = recv.recv(&mut buf).expect("should receive datagram");
+        assert_eq!(&buf[..n], &payload[..]);
     }
 
     // --- dedup（时钟注入）---

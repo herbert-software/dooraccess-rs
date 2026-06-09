@@ -8,6 +8,7 @@
 //     不断言 message 字面）；覆盖缺 key / 未知 key / 非法 bool / 缺 = / 空 / 半写各路径。
 
 use dooraccess_rs::automation_state::{parse, render, ParseError, State};
+use dooraccess_rs::automation_state::{write_atomic, Persister};
 
 const GOLDEN: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -194,4 +195,169 @@ fn render_fixed_two_lines() {
         }),
         b"auto_unlock=true\nauto_hangup=false\n"
     );
+}
+
+// ===========================================================================
+// Persister / write_atomic（Phase4 G1，6.1-6.3）
+// ===========================================================================
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+
+/// 进程内唯一临时目录（避免引第三方 tempdir crate；守 crate gate std+libc only）。
+fn unique_tmp_dir(tag: &str) -> PathBuf {
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let pid = std::process::id();
+    let mut d = std::env::temp_dir();
+    d.push(format!("dooraccess_rs_persister_{tag}_{pid}_{n}"));
+    std::fs::create_dir_all(&d).expect("create temp dir");
+    d
+}
+
+// write_atomic：temp 与目标同目录、产出 = render 字节、无残留 .tmp。
+#[test]
+fn write_atomic_produces_render_bytes_no_tmp_residue() {
+    let dir = unique_tmp_dir("wa");
+    let path = dir.join("automation.state");
+    write_atomic(
+        &path,
+        State {
+            auto_unlock: true,
+            auto_hangup: false,
+        },
+    )
+    .expect("write_atomic ok");
+
+    let got = std::fs::read(&path).expect("read back");
+    assert_eq!(
+        got,
+        render(State {
+            auto_unlock: true,
+            auto_hangup: false
+        })
+    );
+    // rename 成功后无残留 .tmp。
+    let tmp = dir.join("automation.state.tmp");
+    assert!(!tmp.exists(), "no residual .tmp after successful rename");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// 拨动后原子落盘 + 重启回读一致（6.1/6.2 + spec「重启回读」）。
+#[test]
+fn persist_writes_then_reload_reads_back() {
+    let dir = unique_tmp_dir("rt");
+    let path = dir.join("automation.state");
+
+    let au = Arc::new(AtomicBool::new(true));
+    let ah = Arc::new(AtomicBool::new(false));
+    let (au_c, ah_c) = (au.clone(), ah.clone());
+    let p = Persister::new(
+        path.clone(),
+        Box::new(move || (au_c.load(Ordering::SeqCst), ah_c.load(Ordering::SeqCst))),
+        None,
+    );
+
+    p.persist();
+    // 重启回读：从盘上 parse 回与拨动值一致。
+    let raw = std::fs::read(&path).expect("file written");
+    assert_eq!(
+        parse(&raw),
+        Ok(State {
+            auto_unlock: true,
+            auto_hangup: false
+        })
+    );
+
+    // 翻转 auto_hangup → 再 persist → 盘上反映新值（无半写：parse 成功且为新值）。
+    ah.store(true, Ordering::SeqCst);
+    p.persist();
+    let raw = std::fs::read(&path).expect("file written");
+    assert_eq!(
+        parse(&raw),
+        Ok(State {
+            auto_unlock: true,
+            auto_hangup: true
+        })
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// 纯值去重：同值重复 persist 是 no-op（不重写文件）。
+//
+// 侧证手法：首次 persist 写文件 → 删文件 → 同值再 persist。若去重生效（no-op），文件
+// **不会**被重建；若去重失效则文件被重写出现。再翻转值 persist → 文件应重新出现（验
+// 翻转仍写）。
+#[test]
+fn persist_same_value_is_noop() {
+    let dir = unique_tmp_dir("dedup");
+    let path = dir.join("automation.state");
+
+    let au = Arc::new(AtomicBool::new(true));
+    let ah = Arc::new(AtomicBool::new(false));
+    let (au_c, ah_c) = (au.clone(), ah.clone());
+    let p = Persister::new(
+        path.clone(),
+        Box::new(move || (au_c.load(Ordering::SeqCst), ah_c.load(Ordering::SeqCst))),
+        None,
+    );
+
+    // 首次：写盘。
+    p.persist();
+    assert!(path.exists(), "first persist writes file");
+
+    // 删文件，同值再 persist → no-op，不重建。
+    std::fs::remove_file(&path).expect("remove");
+    p.persist();
+    assert!(
+        !path.exists(),
+        "same-value persist must be no-op (file not recreated)"
+    );
+
+    // 翻转值 → persist 应重新落盘。
+    au.store(false, Ordering::SeqCst);
+    p.persist();
+    assert!(path.exists(), "flipped value persist writes file");
+    assert_eq!(
+        parse(&std::fs::read(&path).unwrap()),
+        Ok(State {
+            auto_unlock: false,
+            auto_hangup: false
+        })
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// 落盘失败 best-effort：目录不可写（path 指向不存在的子目录）→ persist 不 panic、不阻塞，
+// log hook 收到一行错误（6.3）。
+#[test]
+fn persist_write_failure_is_best_effort() {
+    let dir = unique_tmp_dir("fail");
+    // 指向不存在的子目录下的文件 → write 必失败（父目录不存在）。
+    let path = dir.join("nonexistent_subdir").join("automation.state");
+
+    let logged = Arc::new(AtomicUsize::new(0));
+    let l_c = logged.clone();
+    let p = Persister::new(
+        path,
+        Box::new(|| (true, true)),
+        Some(Box::new(move |msg: &str| {
+            assert!(msg.contains("persist failed"), "log msg: {msg}");
+            l_c.fetch_add(1, Ordering::SeqCst);
+        })),
+    );
+
+    // 不应 panic。
+    p.persist();
+    assert_eq!(
+        logged.load(Ordering::SeqCst),
+        1,
+        "write failure must log one warning"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
