@@ -155,5 +155,67 @@ self-unlock）条件。
 
 剩余收尾：
 - `dooraccess-rs` 子仓 Phase3 git tag（git 写操作留人工）。
-- 姊妹变更 `verify-rust-listeners-on-hap`：PF_PACKET socket-level BE 真机认证（须按 `dooraccess-go/DEPLOY.md`
-  S1-S12 上真 hAP；memory 记 DoorLink 已物理下线，hAP 可达性须确认）。
+- 姊妹变更 `verify-rust-listeners-on-hap`：PF_PACKET socket-level BE 真机认证 → **见 §9（已认证核心层）**。
+
+## 9. hAP 真机验证（`verify-rust-listeners-on-hap`，2026-06-09）
+
+第三层 PF_PACKET socket-level BE 在 **hAP ac lite 真机（QCA9533 MIPS24Kc big-endian）** 以 passive-shadow
+只读探针认证。探针 = `dooraccess-rs-probe`（main.rs 扩展）：复用 `listen6672`/`listen18022` 的
+`ffi::open_packet_socket`/`bind`/`recv` 路径，两 listener 共享 shutdown Arc fail-stop + `--duration` 自限，
+log-only 回调 + logf，零 wire/unlock/push。
+
+**探针体型**：179516 字节（~175KB）、ELF 32-bit **MSB**（大端）、MIPS32、静态、stripped、softfloat。
+
+### §9.1 核心 BE 关切 —— PASS（guaranteed 交付，= change 命名目标）
+
+`scp -O` 上传 `/tmp`（`ls -l` 字节核对一致 179516，禁 hash）；`setsid` detach 起 `--duration 25`，
+4 socket 全 bind 成功（`listen18022`/`listen6672` × `eth1(ifindex3)`/`eth0.2(ifindex6)`，PROMISC + BPF active）。
+`/proc/net/packet` 按 inode 逐个对账探针 pid 的 4 个 socket：
+
+| probe fd | socket inode | Proto | Iface |
+|---|---|---|---|
+| 3 | 17086265 | **0003** | 3 (eth1) |
+| 4 | 17086267 | **0003** | 6 (eth0.2) |
+| 5 | 17086269 | **0003** | 3 (eth1) |
+| 6 | 17086271 | **0003** | 6 (eth0.2) |
+
+→ **探针存活 + 全 4 行 Proto==0003（非 BE bug 的 0300）+ 行数==4 无 bind 失败 = 核心 PASS**。
+即 Rust `htons(ETH_P_ALL)` + `libc` mips-musl `sockaddr_ll` 偏移在真大端内核登记正确——golden + qemu-user
+照不到的那层，真硅片认证完成。同输出生产 Go daemon 4 socket 仍全 0003（同内核已知正确参照一致）。
+
+### §9.2 无 OOM + 生产未扰动
+
+探针 **VmHWM = 208 KB**（远低于 Go daemon 基线 4.86MB、远低于任何 OOM 阈值）；系统 `MemFree` 全程稳定
+~11.5MB 无泄漏；生产 Go daemon `/automation` 健康（`auto_unlock:true` 未动）、4 socket 不受扰动（passive-shadow
+并存）。探针 `--duration 25s` 到点自 `exit(0)`（log 实证 "duration 25s elapsed — shutting down, exit(0)"），
+`/tmp` 清空，`/proc/net/packet` 0003 行回到 4（仅 Go daemon）。
+
+### §9.3 整管层（recv + BPF-attach ABI）—— PASS（主动监视取帧，Go daemon co-witness）
+
+取帧用 **主动监视**：`POST /auto_unlock off`（nc 裸 HTTP，bare httpx server 用 `{"on":false}` body；
+wget `--post-data` 因请求体框架不被 bare server 接受而失效）+ `GET /automation` 确认 `auto_unlock:false`
+后，用户室内机 .91 按"监视"主动调起外机 .152 视频。探针 `--duration 150` 捕获 **19 个真 18022 帧**
+（req=704 invite / 705 ack / 518,519 / 708,709 bye / 564,565,840,888,889），全按 anjubao 18022 wire
+正确解析（req 号 / src-dst-port / body_len 合理）；另捎带 **54 个 6672 帧**（含邻居 .92 byte19=0x96，经
+`EventKind::Unknown` 臂走 logf 可见——验证 §2.1 必接 logf）。
+
+**ground truth = 生产 Go daemon co-witness**（比 tcpdump 更硬）：`tcpdump -i br-door -p` 抓 0 帧——`.91↔.152`
+是 slave 段单播、非 host 地址流量，`-p` 又关了 promisc，br-door 看不到；而生产 Go daemon 跑同一套
+PROMISC-on-slave（eth1/eth0.2）捕获，syslog 与探针**逐帧一致**：`req=704 invite-query / 705 invite-ack /
+518 byte0=0x70 / 519 ack-OK / 708,709 bye / 564,565,840,888,889 / listen6672 unknown 0x96`。
+→ Rust 探针在真 BE 内核捕获并解析的帧 = 已验证参考实现逐帧相同 → **recv + BPF-attach ABI（18022 + 6672
+两通道）在真大端内核认证完成**。
+
+**安全实证**：Go daemon syslog `ring: src=172.16.106.91 not in cfg.Stations (dropped, neighbor or
+unconfigured station)` —— 主动监视（室内→外机，src=.91 不在 cfg.Stations）**未被判 ring、未触 self-unlock**；
+即便不关 self-unlock 也不会开门，关是纪律。采后 `POST /auto_unlock on` + `/auto_hangup on` 拨回
+（HACS 在 daemon 状态变更时反向同步其 off switch，连带把 auto_hangup 推成 false，故两 flag 都需恢复）、
+`GET /automation` 确认 `true,true` 稳定、清 `/tmp`、探针 4 行随退出消失。VmHWM/RSS 全程 < 1MB、free 无泄漏。
+
+### §9.4 判定 —— Phase 3 **完整通过**
+
+**核心 BE 关切 PASS（§9.1，命名目标）+ 整管 recv/BPF-attach ABI PASS（§9.3）= 第三层 PF_PACKET
+socket-level BE 全部认证。** BE 三层防御闭合：① golden 表达式 ②`#[cfg(target_endian="big")]` const 断言
+③ 真机 socket 注册 Proto=0003 + 真帧 recv（本节）。
+- Phase 4（daemon 编排 + self-unlock）可建在**已真机认证**的 listener 上。
+- Phase 7 灰度 + Phase 4「hAP 离线备用 binary 检查」前置满足。
