@@ -259,7 +259,10 @@ pub fn send_udp_response_to(dst_ip: [u8; 4], dst_port: u16, payload: &[u8]) -> s
 
     let local = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
     let sock = UdpSocket::bind(local)?;
-    let dst = SocketAddrV4::new(Ipv4Addr::new(dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]), dst_port);
+    let dst = SocketAddrV4::new(
+        Ipv4Addr::new(dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]),
+        dst_port,
+    );
     sock.connect(dst)?;
     sock.send(payload)?;
     Ok(())

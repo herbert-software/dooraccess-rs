@@ -1007,7 +1007,10 @@ mod iface_tests {
     #[test]
     fn empty_both_is_missing() {
         let c = cfg_with("", &[]);
-        assert_eq!(c.resolve_iface_list_in("/nonexistent").unwrap_err(), IfaceError::Missing);
+        assert_eq!(
+            c.resolve_iface_list_in("/nonexistent").unwrap_err(),
+            IfaceError::Missing
+        );
     }
 
     #[test]
@@ -1020,9 +1023,7 @@ mod iface_tests {
         fs::write(brif.join("eth1"), b"").unwrap();
 
         let c = cfg_with("br-door", &[]);
-        let mut got = c
-            .resolve_iface_list_in(root.to_str().unwrap())
-            .unwrap();
+        let mut got = c.resolve_iface_list_in(root.to_str().unwrap()).unwrap();
         got.sort();
         assert_eq!(got, vec!["eth0.2".to_string(), "eth1".to_string()]);
         let _ = fs::remove_dir_all(&root);
@@ -1049,7 +1050,9 @@ mod iface_tests {
         let c = cfg_with("br0", &[]);
         assert_eq!(
             c.resolve_iface_list_in(root.to_str().unwrap()).unwrap_err(),
-            IfaceError::BridgeNoSlaves { bridge: "br0".to_string() }
+            IfaceError::BridgeNoSlaves {
+                bridge: "br0".to_string()
+            }
         );
         let _ = fs::remove_dir_all(&root);
     }

@@ -111,10 +111,7 @@ impl PushTracker {
 
     /// 当前登记的 handle 数（含已结束未回收的；测试断言用）。
     pub fn len(&self) -> usize {
-        self.handles
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .len()
+        self.handles.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -408,7 +405,10 @@ mod tests {
         let (rtx, rrx) = mpsc::sync_channel::<UnlockOutcome>(1);
         submit_job(&tx, Job::Unlock(unlock_job(rtx))).unwrap();
         // handler 等 reply：worker panic → UnlockJob drop → reply sender drop → RecvError。
-        assert!(rrx.recv().is_err(), "worker panic 后 handler 应收 RecvError 不永等");
+        assert!(
+            rrx.recv().is_err(),
+            "worker panic 后 handler 应收 RecvError 不永等"
+        );
         let _ = worker.join(); // panic 线程 join 返 Err，忽略。
     }
 

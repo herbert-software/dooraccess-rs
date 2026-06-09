@@ -170,8 +170,12 @@ fn main() {
     black_box(nq_cb.is_some());
     let unavail = black_box(dooraccess_rs::orchestration::worker_unavailable_outcome());
     black_box(&unavail);
-    black_box(dooraccess_rs::orchestration::ipv4_str(black_box([10, 0, 0, 1])));
-    black_box(dooraccess_rs::orchestration::parse_ipv4(black_box("10.0.0.1")));
+    black_box(dooraccess_rs::orchestration::ipv4_str(black_box([
+        10, 0, 0, 1,
+    ])));
+    black_box(dooraccess_rs::orchestration::parse_ipv4(black_box(
+        "10.0.0.1",
+    )));
     let build18022_fp: fn(
         &dooraccess_rs::config::Config,
         Vec<String>,

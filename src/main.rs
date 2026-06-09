@@ -68,9 +68,10 @@ pub fn main_impl<W: Write>(args: &[String], stderr: &mut W) -> i32 {
         }
     };
 
-    logf(stderr, &format!(
-        "starting dooraccess-rs (anjubao replica), config={config_path}"
-    ));
+    logf(
+        stderr,
+        &format!("starting dooraccess-rs (anjubao replica), config={config_path}"),
+    );
 
     // ② config 加载（锚 Go `config.LoadConfig`）。
     let cfg = match config::load_config(&config_path) {
@@ -240,12 +241,21 @@ fn run<W: Write>(
     // slaves 解析：显式 iface_list 优先，否则桥成员枚举（§3.1，移植 resolve_iface_list）。
     let slaves: Vec<String> = match cfg.resolve_iface_list() {
         Ok(s) => {
-            logf(stderr, &format!("listeners: slaves={s:?} (resolved from iface={:?})", cfg.iface));
+            logf(
+                stderr,
+                &format!(
+                    "listeners: slaves={s:?} (resolved from iface={:?})",
+                    cfg.iface
+                ),
+            );
             s
         }
         Err(e) => {
             // 解析失败非致命（HTTP-only 模式继续，锚 Go main.go:170-174）。
-            logf(stderr, &format!("listeners: resolve iface list failed: {e} (listeners will not start)"));
+            logf(
+                stderr,
+                &format!("listeners: resolve iface list failed: {e} (listeners will not start)"),
+            );
             Vec::new()
         }
     };
@@ -281,7 +291,13 @@ fn run<W: Write>(
 
     // listen18022 线程：跑上面已构造的 Listener Arc（OnDetect 已装）。
     if let Some(l) = &listener18022 {
-        logf(stderr, &format!("listen18022: started on {:?} (PROMISC, BPF tcp:18022)", l.slaves));
+        logf(
+            stderr,
+            &format!(
+                "listen18022: started on {:?} (PROMISC, BPF tcp:18022)",
+                l.slaves
+            ),
+        );
         let l = Arc::clone(l);
         let sd = Arc::clone(&shutdown);
         listener_threads.push(
@@ -306,7 +322,13 @@ fn run<W: Write>(
             ..Default::default()
         };
         let l6672 = listen6672::Listener::new(slaves.clone(), callbacks);
-        logf(stderr, &format!("listen6672: started on {:?} (PROMISC, BPF udp:6672)", l6672.slaves));
+        logf(
+            stderr,
+            &format!(
+                "listen6672: started on {:?} (PROMISC, BPF udp:6672)",
+                l6672.slaves
+            ),
+        );
         let l = Arc::new(l6672);
         let sd = Arc::clone(&shutdown);
         listener_threads.push(
@@ -338,8 +360,9 @@ fn run<W: Write>(
     };
     // 手动 unlock 经 wire-worker 队列（决策 5）：HTTP /unlock handler 投 Job::Unlock + 等
     // 一次性 reply channel 回灌 UnlockOutcome（worker 已退/panic → 退化 wire-failure，不永等）。
-    let unlock_dispatch: Arc<dyn control::UnlockDispatch> =
-        Arc::new(WorkerUnlockDispatch { job_tx: job_tx.clone() });
+    let unlock_dispatch: Arc<dyn control::UnlockDispatch> = Arc::new(WorkerUnlockDispatch {
+        job_tx: job_tx.clone(),
+    });
     let ctrl_server = control::Server::with_dispatch(
         cfg.clone(),
         env!("CARGO_PKG_VERSION"),
@@ -355,23 +378,25 @@ fn run<W: Write>(
         let srv = Arc::clone(&http_server);
         let addr = http_addr.clone();
         let handler = Arc::clone(&http_handler);
-        std::thread::Builder::new()
-            .name("http8080".into())
-            .spawn(move || -> Result<(), String> {
+        std::thread::Builder::new().name("http8080".into()).spawn(
+            move || -> Result<(), String> {
                 let listener = std::net::TcpListener::bind(&addr)
                     .map_err(|e| format!("http8080: bind {addr}: {e}"))?;
                 match srv.serve(listener, handler) {
                     Ok(()) => Ok(()),
                     Err(e) => {
                         // ServerClosedError 是 graceful shutdown 正常返回，非 fatal。
-                        if e.downcast_ref::<dooraccess_rs::httpx::server::ServerClosedError>().is_some() {
+                        if e.downcast_ref::<dooraccess_rs::httpx::server::ServerClosedError>()
+                            .is_some()
+                        {
                             Ok(())
                         } else {
                             Err(format!("http8080: {e}"))
                         }
                     }
                 }
-            })?
+            },
+        )?
     };
     logf(stderr, &format!("http8080: listening on {http_addr}"));
 
@@ -394,8 +419,14 @@ fn run<W: Write>(
         Arc::clone(&shutdown),
         "automation_state".into(),
         vec![
-            ("auto_unlock".into(), bool_str(automation.load_auto_unlock())),
-            ("auto_hangup".into(), bool_str(automation.load_auto_hangup())),
+            (
+                "auto_unlock".into(),
+                bool_str(automation.load_auto_unlock()),
+            ),
+            (
+                "auto_hangup".into(),
+                bool_str(automation.load_auto_hangup()),
+            ),
         ],
     );
     // diagnosis：detached 线程内先 sleep ~500ms 站稳再 push；延迟期 honor shutdown。
@@ -406,7 +437,10 @@ fn run<W: Write>(
         std::time::Duration::from_millis(500),
     );
 
-    logf(stderr, "dooraccess-rs up (M1.5: listeners + http + worker + automation)");
+    logf(
+        stderr,
+        "dooraccess-rs up (M1.5: listeners + http + worker + automation)",
+    );
 
     // 阻塞到 SIGTERM/SIGINT，或 HTTP 线程提前结束（§9.3：bind 失败等 fatal——HTTP 是必备控制
     // 面，其线程早退即视为 fatal，不等信号、走 shutdown 排序后非零退出码）。listener 线程提前
@@ -417,7 +451,10 @@ fn run<W: Write>(
             break;
         }
         if http_thread.is_finished() {
-            logf(stderr, "http8080 thread exited (fatal: bind/serve failure), draining");
+            logf(
+                stderr,
+                "http8080 thread exited (fatal: bind/serve failure), draining",
+            );
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(200));

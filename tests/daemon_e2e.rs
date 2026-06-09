@@ -235,7 +235,11 @@ impl Pusher for SpyPusher {
 /// bind 失败（沙箱）返 None。
 fn start_http(
     handler: Arc<dyn Handler>,
-) -> Option<(std::net::SocketAddr, Arc<HttpServer>, thread::JoinHandle<()>)> {
+) -> Option<(
+    std::net::SocketAddr,
+    Arc<HttpServer>,
+    thread::JoinHandle<()>,
+)> {
     let listener = match TcpListener::bind("127.0.0.1:0") {
         Ok(l) => l,
         Err(e) => {
@@ -256,7 +260,11 @@ fn start_http(
 /// 连接）。serve 的 accept 循环用 nonblocking accept + 短 poll 周期释放 listener 锁，故
 /// `shutdown()` 的 take() 在一个 poll 周期内抢到锁取走 listener → serve 见 None+closing →
 /// 返 `ServerClosedError` 退出。无死锁、无悬挂线程。
-fn stop_http(_addr: std::net::SocketAddr, srv: Arc<HttpServer>, http_thread: thread::JoinHandle<()>) {
+fn stop_http(
+    _addr: std::net::SocketAddr,
+    srv: Arc<HttpServer>,
+    http_thread: thread::JoinHandle<()>,
+) {
     let _ = srv.shutdown(Some(Duration::from_secs(5)));
     http_thread.join().ok();
 }
@@ -332,8 +340,11 @@ fn build_control_handler(
 fn t10_1_daemon_start_info_automation_graceful_shutdown() {
     let cfg = e2e_config();
     let shutdown = never();
-    let (job_tx, worker) =
-        spawn_worker(Arc::new(FixedWire::new(AttemptOutcome::Ok)), None, shutdown.clone());
+    let (job_tx, worker) = spawn_worker(
+        Arc::new(FixedWire::new(AttemptOutcome::Ok)),
+        None,
+        shutdown.clone(),
+    );
     let automation = AutomationState::new(true, false);
     let pusher: Arc<dyn Pusher> = Arc::new(SpyPusher::new());
     let handler = build_control_handler(cfg, automation, None, pusher, job_tx.clone());
@@ -347,7 +358,10 @@ fn t10_1_daemon_start_info_automation_graceful_shutdown() {
     assert_eq!(status, 200, "GET /info status");
     let s = String::from_utf8_lossy(&body);
     assert!(s.contains("\"brand\""), "/info body: {s}");
-    assert!(s.contains("06021103@172.16.106.91:18022"), "/info monitor: {s}");
+    assert!(
+        s.contains("06021103@172.16.106.91:18022"),
+        "/info monitor: {s}"
+    );
 
     // GET /automation → 200 + auto_unlock=true auto_hangup=false（与构造一致）。
     let (status, body) = http_request(addr, "GET", "/automation", None);
@@ -372,8 +386,11 @@ fn t10_2_manual_unlock_through_worker_via_http() {
     let cfg = e2e_config();
     let shutdown = never();
     // mock 外机：FixedWire::Ok → unlock 成功 result=0。
-    let (job_tx, worker) =
-        spawn_worker(Arc::new(FixedWire::new(AttemptOutcome::Ok)), None, shutdown.clone());
+    let (job_tx, worker) = spawn_worker(
+        Arc::new(FixedWire::new(AttemptOutcome::Ok)),
+        None,
+        shutdown.clone(),
+    );
     let automation = AutomationState::new(false, false);
     let pusher: Arc<dyn Pusher> = Arc::new(SpyPusher::new());
     let handler = build_control_handler(cfg, automation, None, pusher, job_tx.clone());
@@ -385,7 +402,12 @@ fn t10_2_manual_unlock_through_worker_via_http() {
     // POST /unlock {from:室内机, to:外机} → 经 worker → reply 回灌 → 200 result=0。
     let body = br#"{"from":"06021103@172.16.106.91:18022","to":"06020000@172.16.106.152:18022"}"#;
     let (status, resp) = http_request(addr, "POST", "/unlock", Some(body));
-    assert_eq!(status, 200, "POST /unlock status: {}", String::from_utf8_lossy(&resp));
+    assert_eq!(
+        status,
+        200,
+        "POST /unlock status: {}",
+        String::from_utf8_lossy(&resp)
+    );
     let s = String::from_utf8_lossy(&resp);
     assert!(s.contains("\"result\":0"), "unlock OK result: {s}");
 
@@ -476,8 +498,11 @@ fn t10_2_genuine_business_err_maps_200() {
 fn t10_2_manual_unlock_worker_reply_paths() {
     // OK 路径。
     let shutdown = never();
-    let (tx, worker) =
-        spawn_worker(Arc::new(FixedWire::new(AttemptOutcome::Ok)), None, shutdown.clone());
+    let (tx, worker) = spawn_worker(
+        Arc::new(FixedWire::new(AttemptOutcome::Ok)),
+        None,
+        shutdown.clone(),
+    );
     let o = dispatch_unlock(&tx);
     assert_eq!(o.result, result::OK);
     daemon::submit_job(&tx, Job::Shutdown).ok();
@@ -547,7 +572,11 @@ fn t10_3_flag_priority_corrupt_state_degrades_to_config() {
         auto_hangup: true,
     };
     let (au, ah, src) = resolve_flags(&path, &cfg);
-    assert_eq!((au, ah, src), (false, true, "config"), "corrupt state → config 默认");
+    assert_eq!(
+        (au, ah, src),
+        (false, true, "config"),
+        "corrupt state → config 默认"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -581,8 +610,11 @@ fn t10_4_persister_toggle_atomic_persist_reload_via_http() {
 
     let cfg = e2e_config();
     let shutdown = never();
-    let (job_tx, worker) =
-        spawn_worker(Arc::new(FixedWire::new(AttemptOutcome::Ok)), None, shutdown.clone());
+    let (job_tx, worker) = spawn_worker(
+        Arc::new(FixedWire::new(AttemptOutcome::Ok)),
+        None,
+        shutdown.clone(),
+    );
 
     let automation = AutomationState::new(false, false);
     // Persister value_source 读运行时真值（share 同一组原子）。
@@ -625,8 +657,17 @@ fn t10_4_persister_toggle_atomic_persist_reload_via_http() {
     assert_eq!(status, 200);
     // 落盘后无半写：parse 成功且 == (true,false)。
     let st = automation_state::parse(&std::fs::read(&path).expect("state written")).expect("parse");
-    assert_eq!(st, State { auto_unlock: true, auto_hangup: false });
-    assert!(!dir.join("automation.state.tmp").exists(), "no residual .tmp");
+    assert_eq!(
+        st,
+        State {
+            auto_unlock: true,
+            auto_hangup: false
+        }
+    );
+    assert!(
+        !dir.join("automation.state.tmp").exists(),
+        "no residual .tmp"
+    );
 
     // 重启回读：用启动加载语义从盘读回一致。
     let (au, ah, src) = resolve_flags(&path, &e2e_config());
@@ -636,13 +677,22 @@ fn t10_4_persister_toggle_atomic_persist_reload_via_http() {
     std::fs::remove_file(&path).unwrap();
     let (status, _) = http_request(addr, "POST", "/auto_unlock", Some(br#"{"on":true}"#));
     assert_eq!(status, 200);
-    assert!(!path.exists(), "same-value persist is no-op (file not recreated)");
+    assert!(
+        !path.exists(),
+        "same-value persist is no-op (file not recreated)"
+    );
 
     // 翻转 → 重新落盘。
     let (status, _) = http_request(addr, "POST", "/auto_unlock", Some(br#"{"on":false}"#));
     assert_eq!(status, 200);
     let st = automation_state::parse(&std::fs::read(&path).expect("rewritten")).expect("parse");
-    assert_eq!(st, State { auto_unlock: false, auto_hangup: false });
+    assert_eq!(
+        st,
+        State {
+            auto_unlock: false,
+            auto_hangup: false
+        }
+    );
 
     shutdown.store(true, Ordering::SeqCst);
     worker_shutdown(&job_tx, worker);
@@ -660,8 +710,11 @@ fn t10_4_persist_failure_does_not_block_endpoint() {
 
     let cfg = e2e_config();
     let shutdown = never();
-    let (job_tx, worker) =
-        spawn_worker(Arc::new(FixedWire::new(AttemptOutcome::Ok)), None, shutdown.clone());
+    let (job_tx, worker) = spawn_worker(
+        Arc::new(FixedWire::new(AttemptOutcome::Ok)),
+        None,
+        shutdown.clone(),
+    );
     let automation = AutomationState::new(false, false);
     let auto_for_persist = automation.share();
     let persister = Arc::new(Persister::new(
@@ -696,7 +749,12 @@ fn t10_4_persist_failure_does_not_block_endpoint() {
 
     // 拨动 → persist 内部失败但 endpoint 仍 200（不 crash、不阻塞）。
     let (status, body) = http_request(addr, "POST", "/auto_unlock", Some(br#"{"on":true}"#));
-    assert_eq!(status, 200, "endpoint must succeed despite persist failure: {}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        status,
+        200,
+        "endpoint must succeed despite persist failure: {}",
+        String::from_utf8_lossy(&body)
+    );
     // 运行时 flag 仍生效（best-effort：内存已更新）。
     assert!(automation.load_auto_unlock());
 
@@ -815,7 +873,11 @@ fn t10_6_number_query_hit_responds_miss_drops() {
 
     // 未命中：target BCD = 06029999（别人）→ drop。
     l.dispatch([172, 16, 106, 9], &numquery_frame([0x06, 0x02, 0x99, 0x99]));
-    assert_eq!(hit.load(Ordering::SeqCst), 1, "未命中应安静 drop（计数不增）");
+    assert_eq!(
+        hit.load(Ordering::SeqCst),
+        1,
+        "未命中应安静 drop（计数不增）"
+    );
 }
 
 /// 构造一个号码查询 request 帧（event_flag=0 → NumberQuery）。
@@ -858,7 +920,8 @@ fn t10_7_second_unlock_queues_while_worker_busy_http_responsive() {
     // 第一个 unlock：在独立线程发（会卡在 worker 跑 GatedWire gate 上）。
     let a2 = addr;
     let first = thread::spawn(move || {
-        let body = br#"{"from":"06021103@172.16.106.91:18022","to":"06020000@172.16.106.152:18022"}"#;
+        let body =
+            br#"{"from":"06021103@172.16.106.91:18022","to":"06020000@172.16.106.152:18022"}"#;
         http_request(a2, "POST", "/unlock", Some(body))
     });
 
@@ -868,7 +931,8 @@ fn t10_7_second_unlock_queues_while_worker_busy_http_responsive() {
     // 第二个 unlock：另起线程（应在 worker 队列里排队，worker 忙不会立即跑）。
     let a3 = addr;
     let second = thread::spawn(move || {
-        let body = br#"{"from":"06021103@172.16.106.91:18022","to":"06020000@172.16.106.152:18022"}"#;
+        let body =
+            br#"{"from":"06021103@172.16.106.91:18022","to":"06020000@172.16.106.152:18022"}"#;
         http_request(a3, "POST", "/unlock", Some(body))
     });
     thread::sleep(Duration::from_millis(100));
@@ -881,7 +945,10 @@ fn t10_7_second_unlock_queues_while_worker_busy_http_responsive() {
     assert!(String::from_utf8_lossy(&abody).contains("\"auto_unlock\":true"));
 
     // 第二个 unlock 此刻应仍未完成（被第一个阻在队列前）。
-    assert!(!second.is_finished(), "第二个 unlock 应排队等（worker 串行）");
+    assert!(
+        !second.is_finished(),
+        "第二个 unlock 应排队等（worker 串行）"
+    );
 
     // 放行 gate → 第一个 unlock 完成 → worker 接着跑第二个。
     gate.wait();
@@ -909,8 +976,11 @@ fn t10_8_shutdown_no_deadlock_and_worker_panic_unblocks() {
     // (a) 哨兵后 worker 退出（仍持 sender clone）。
     {
         let shutdown = never();
-        let (tx, worker) =
-            spawn_worker(Arc::new(FixedWire::new(AttemptOutcome::Ok)), None, shutdown.clone());
+        let (tx, worker) = spawn_worker(
+            Arc::new(FixedWire::new(AttemptOutcome::Ok)),
+            None,
+            shutdown.clone(),
+        );
         let _live_clone = tx.clone(); // HTTP/OnDetect 仍持 clone
         daemon::submit_job(&tx, Job::Shutdown).expect("send sentinel");
         // 有限时间内退出（不依赖 clone 全释放）。
@@ -921,7 +991,10 @@ fn t10_8_shutdown_no_deadlock_and_worker_panic_unblocks() {
             d2.store(true, Ordering::SeqCst);
         });
         thread::sleep(Duration::from_millis(200));
-        assert!(done.load(Ordering::SeqCst), "哨兵后 worker 应退出（即便 clone 存活）");
+        assert!(
+            done.load(Ordering::SeqCst),
+            "哨兵后 worker 应退出（即便 clone 存活）"
+        );
         jh.join().ok();
     }
 
@@ -1038,9 +1111,7 @@ fn start_capture_server() -> Option<(
                     Ok(0) => break,
                     Ok(n) => {
                         raw.extend_from_slice(&buf[..n]);
-                        if let Some(hdr_end) =
-                            raw.windows(4).position(|w| w == b"\r\n\r\n")
-                        {
+                        if let Some(hdr_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
                             let header = String::from_utf8_lossy(&raw[..hdr_end]).to_lowercase();
                             let clen = header
                                 .lines()
@@ -1057,9 +1128,8 @@ fn start_capture_server() -> Option<(
                     Err(_) => break,
                 }
             }
-            let _ = conn.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            );
+            let _ = conn
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         }
     });
     Some((addr.ip().to_string(), addr.port(), captured, t))
@@ -1115,11 +1185,21 @@ fn t10_9_doorbell_push_on_req704() {
         tracker.join_all();
         srv_thread.join().ok();
 
-        let body = captured.lock().unwrap().clone().expect("应收到 event=ring push");
+        let body = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("应收到 event=ring push");
         let s = String::from_utf8_lossy(&body);
         assert!(s.contains("\"event\":\"ring\""), "push body: {s}");
-        assert!(s.contains("\"from\":\"06020000@172.16.106.152:18022\""), "from: {s}");
-        assert!(s.contains("\"to\":\"06021103@172.16.106.91:18022\""), "to: {s}");
+        assert!(
+            s.contains("\"from\":\"06020000@172.16.106.152:18022\""),
+            "from: {s}"
+        );
+        assert!(
+            s.contains("\"to\":\"06021103@172.16.106.91:18022\""),
+            "to: {s}"
+        );
         assert!(s.contains("\"result\":\"0\""), "result: {s}");
     }
 
@@ -1141,7 +1221,13 @@ fn t10_9_doorbell_push_on_req704() {
         )
         .expect("Listener");
         // dst = .92（非室内机 .91）。
-        l.dispatch_for_test([172, 16, 106, 152], [172, 16, 106, 92], 50000, 18022, &wire_704());
+        l.dispatch_for_test(
+            [172, 16, 106, 152],
+            [172, 16, 106, 92],
+            50000,
+            18022,
+            &wire_704(),
+        );
         tracker.join_all();
         srv_thread.join().ok();
 
@@ -1227,8 +1313,11 @@ fn t10_10_push_does_not_block_unlock() {
 
     // 此刻 detached push 正挂 STALL；worker 上跑 unlock 应不受影响（off-worker）。
     let shutdown = never();
-    let (tx, worker) =
-        spawn_worker(Arc::new(FixedWire::new(AttemptOutcome::Ok)), None, shutdown.clone());
+    let (tx, worker) = spawn_worker(
+        Arc::new(FixedWire::new(AttemptOutcome::Ok)),
+        None,
+        shutdown.clone(),
+    );
     let t0 = Instant::now();
     let o = dispatch_unlock(&tx);
     let unlock_elapsed = t0.elapsed();

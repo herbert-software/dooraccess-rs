@@ -529,13 +529,14 @@ impl UnlockDispatch for SenderDispatch {
         target_port: u16,
     ) -> UnlockOutcome {
         let cancel = AtomicBool::new(false);
-        let result = match self
-            .0
-            .execute_unlock(caller_bcd, callee_bcd, target_ip, target_port, &cancel)
-        {
-            Ok(code) => code,
-            Err(_) => result::ERR,
-        };
+        let result =
+            match self
+                .0
+                .execute_unlock(caller_bcd, callee_bcd, target_ip, target_port, &cancel)
+            {
+                Ok(code) => code,
+                Err(_) => result::ERR,
+            };
         UnlockOutcome {
             result,
             retries: 0,
@@ -1371,7 +1372,10 @@ mod tests {
         // 锚 Go classifyWireErr(nil)=ResultOK：cancel/cap 在首次 wire 尝试前命中（wire_kind=None）
         // 须映射 OK(0) 非 ERR(-1)，否则 503 体 result 与 Go 不一致。
         assert_eq!(classify_wire_kind(None), result::OK);
-        assert_eq!(classify_wire_kind(Some(WireKind::SilentFin)), result::NO_RING);
+        assert_eq!(
+            classify_wire_kind(Some(WireKind::SilentFin)),
+            result::NO_RING
+        );
         assert_eq!(classify_wire_kind(Some(WireKind::Timeout)), result::TIMEOUT);
         assert_eq!(classify_wire_kind(Some(WireKind::Other)), result::ERR);
         assert_eq!(classify_wire_kind(Some(WireKind::Retryable)), result::ERR);

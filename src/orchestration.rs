@@ -73,7 +73,11 @@ pub fn load_automation_flags(
     {
         logf("DOORACCESS_EXPERIMENTAL_AUTO_* set but ignored (config.ini present; flags from [automation])");
     }
-    (cfg.automation.auto_unlock, cfg.automation.auto_hangup, "config")
+    (
+        cfg.automation.auto_unlock,
+        cfg.automation.auto_hangup,
+        "config",
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -121,10 +125,7 @@ pub fn build_listen18022(
 
     // 外机 IP → SIP 反查 + daemon/outdoor IPs（InferDirection 用）。
     let outdoor_by_ip = parse_stations_to_ip_map(cfg);
-    let outdoor_ips: Vec<[u8; 4]> = outdoor_by_ip
-        .keys()
-        .filter_map(|s| parse_ipv4(s))
-        .collect();
+    let outdoor_ips: Vec<[u8; 4]> = outdoor_by_ip.keys().filter_map(|s| parse_ipv4(s)).collect();
     // daemon IP：从 iface 读（与 wire_sender::get_iface_ip 同源）。
     let daemon_ip: Option<[u8; 4]> = if cfg.iface.is_empty() {
         None
@@ -137,13 +138,8 @@ pub fn build_listen18022(
     let cfg_sip = cfg.sip.clone();
     let on_detect: listen18022::OnDetect = Box::new(move |d: &DetectedFrame| {
         // ① 每帧 FormatLog syslog。
-        let dir = listen18022::infer_direction(
-            d.src_ip,
-            d.dst_ip,
-            daemon_ip,
-            indoor_ip,
-            &outdoor_ips,
-        );
+        let dir =
+            listen18022::infer_direction(d.src_ip, d.dst_ip, daemon_ip, indoor_ip, &outdoor_ips);
         eprintln!(
             "dooraccess-rs: {}",
             listen18022::format_log(d.req, d.src_ip, d.dst_ip, &d.body, dir)
@@ -217,33 +213,37 @@ pub fn build_number_query_callback(cfg: &Config) -> Option<listen6672::FrameCall
     let our_ip: Option<[u8; 4]> = if cfg.iface.is_empty() {
         None
     } else {
-        wire_sender::get_iface_ip(&cfg.iface).ok().map(|v4| v4.octets())
+        wire_sender::get_iface_ip(&cfg.iface)
+            .ok()
+            .map(|v4| v4.octets())
     };
     let iface = cfg.iface.clone();
 
-    Some(Box::new(move |src_ip: [u8; 4], frame: &listen6672::Frame| {
-        // ① 是否查本机号码。
-        if codec::decode_bcd(frame.target_bcd) != my_num {
-            return; // 不是查我，drop（其它邻居各自响应自己的号码）。
-        }
-        // ② 本机门禁网 IPv4。
-        let Some(ip) = our_ip else {
-            eprintln!(
-                "dooraccess-rs: number_query: cannot determine local IPv4 (iface={iface:?})"
-            );
-            return;
-        };
-        // ③ 构帧 + 单播回 srcIP。
-        let resp = listen6672::build_number_query_response(frame, ip);
-        match listen6672::send_udp_response(src_ip, &resp) {
-            Ok(()) => eprintln!(
-                "dooraccess-rs: number_query: replied to {} with our IP {}",
-                ipv4_str(src_ip),
-                ipv4_str(ip),
-            ),
-            Err(e) => eprintln!("dooraccess-rs: number_query: send: {e}"),
-        }
-    }))
+    Some(Box::new(
+        move |src_ip: [u8; 4], frame: &listen6672::Frame| {
+            // ① 是否查本机号码。
+            if codec::decode_bcd(frame.target_bcd) != my_num {
+                return; // 不是查我，drop（其它邻居各自响应自己的号码）。
+            }
+            // ② 本机门禁网 IPv4。
+            let Some(ip) = our_ip else {
+                eprintln!(
+                    "dooraccess-rs: number_query: cannot determine local IPv4 (iface={iface:?})"
+                );
+                return;
+            };
+            // ③ 构帧 + 单播回 srcIP。
+            let resp = listen6672::build_number_query_response(frame, ip);
+            match listen6672::send_udp_response(src_ip, &resp) {
+                Ok(()) => eprintln!(
+                    "dooraccess-rs: number_query: replied to {} with our IP {}",
+                    ipv4_str(src_ip),
+                    ipv4_str(ip),
+                ),
+                Err(e) => eprintln!("dooraccess-rs: number_query: send: {e}"),
+            }
+        },
+    ))
 }
 
 // ---------------------------------------------------------------------------

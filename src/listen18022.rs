@@ -226,7 +226,13 @@ fn req_note(req: i64) -> &'static str {
 ///
 /// 关键 req 编号附协议语义注释（如 req=708 → "bye"，req=710 → "unlock-A"）。
 /// req=518 额外含 byte0（区分门禁卡通知 0x1b / unlock-B 标准 0x22 / appoint 变体 0xed）。
-pub fn format_log(req: i64, src_ip: [u8; 4], dst_ip: [u8; 4], body: &[u8], dir: Direction) -> String {
+pub fn format_log(
+    req: i64,
+    src_ip: [u8; 4],
+    dst_ip: [u8; 4],
+    body: &[u8],
+    dir: Direction,
+) -> String {
     let note = req_note(req);
     let direction_str = dir.as_str();
     let src = fmt_ip(src_ip);
@@ -952,7 +958,13 @@ mod tests {
         let daemon = [172, 16, 106, 202];
         let indoor = [172, 16, 106, 91];
         let outdoors = [[172, 16, 106, 152]];
-        let got = infer_direction(daemon, [172, 16, 106, 152], Some(daemon), Some(indoor), &outdoors);
+        let got = infer_direction(
+            daemon,
+            [172, 16, 106, 152],
+            Some(daemon),
+            Some(indoor),
+            &outdoors,
+        );
         assert_eq!(got, Direction::DaemonToOutdoor);
     }
 
@@ -1071,7 +1083,10 @@ mod tests {
     fn format_log_no_note_no_parens() {
         // 无语义注释的 req（如 999）+ 非 518 → 不带括号尾。
         let got = format_log(999, [1, 2, 3, 4], [5, 6, 7, 8], &[], Direction::Unknown);
-        assert_eq!(got, "listen18022: detected req=999 unknown 1.2.3.4 → 5.6.7.8");
+        assert_eq!(
+            got,
+            "listen18022: detected req=999 unknown 1.2.3.4 → 5.6.7.8"
+        );
     }
 
     // --- extract_tcp_payload ---
