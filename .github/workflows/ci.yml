@@ -26,8 +26,11 @@ jobs:
         run: cargo build --release
       - name: test (host)
         run: cargo test
-      - name: run host probe
-        run: ./target/release/dooraccess-rs-probe
+      - name: build host probe (smoke)
+        # daemon bin (dooraccess-rs) bind 8080 + 阻塞，裸跑会挂住 CI；探针迁到 examples/probe.rs。
+        # probe 的 passive-shadow 开 PF_PACKET socket 需 CAP_NET_RAW/root（默认 CI host 无）→
+        # 降级为 build-only smoke，只验探针 example 编译通过。
+        run: cargo build --release --example probe
 
   mips-build:
     name: cross-build MIPS BE soft-float
@@ -47,15 +50,15 @@ jobs:
           key: openwrt-sdk-${{ env.OPENWRT_SDK_VER }}-ath79-mips_24kc
       - name: Fetch SDK sysroot
         run: make fetch-sdk
-      - name: Cross-build static MIPS probe
+      - name: Cross-build static MIPS daemon
         run: make build-mips
       - name: Verify MIPS BE + soft-float + static
         run: make verify-mips
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: dooraccess-rs-probe-mips
-          path: target/mips-unknown-linux-musl/release/dooraccess-rs-probe
+          name: dooraccess-rs-mips
+          path: target/mips-unknown-linux-musl/release/dooraccess-rs
 
   # ── BE 第二层防御：编译期 #[cfg(target_endian="big")] const 断言（port-rust-listeners-unlock, task 9.1）─
   # 认证 BE 寄存器/端序行为 + struct 字段宽度（htons no-op、from_be_bytes、mips32

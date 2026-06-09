@@ -19,11 +19,16 @@
 // --- Phase 1/2 既有模块 ---
 pub mod automation_state;
 pub mod codec;
+/// Phase 4 M1.5 并发骨架：Job 队列 / 单 wire-worker / shutdown / detached push 排空。
+pub mod daemon;
 pub mod config;
 pub mod control;
 pub mod ha_push;
 pub mod httpx;
 pub mod info;
+/// daemon 编排接线 helper（automation flag 加载 / OnDetect 门铃 builder / 号码查询 callback /
+/// 手动 unlock → wire-worker 派发缝）；从 main.rs 上移以便 e2e 测真生产函数。
+pub mod orchestration;
 pub mod sender;
 pub mod wire18022;
 

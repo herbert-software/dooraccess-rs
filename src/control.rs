@@ -18,9 +18,14 @@ use crate::httpx::{
 };
 use crate::info;
 use crate::sender::Sender;
+use crate::unlock::{UnlockOutcome, WireKind};
 
 /// Go `httpx.StatusUnsupportedMedia`（`types.go`）；`httpx/mod.rs` 未导出，本模块自用。
 const STATUS_UNSUPPORTED_MEDIA: u16 = 415;
+
+/// Go `httpx.StatusServiceUnavailable`（503）；wire-failure 默认分支（Timeout/其它下游故障）
+/// 用之（锚 Go `respondWireFailure` handlers.go:708）。`httpx/mod.rs` 未导出，本模块自用。
+const STATUS_SERVICE_UNAVAILABLE: u16 = 503;
 
 /// handler 层 JSON body 读取上限（Go `parseJSONBody` `LimitReader(1MB)`）。
 pub const MAX_JSON_BODY_BYTES: u64 = 1024 * 1024;
@@ -409,16 +414,33 @@ pub fn chain_control_post<H: Handler>(inner: H) -> MethodGuard<RequireJsonConten
 // ---------------------------------------------------------------------------
 
 /// daemon 自开锁/挂断两个运行时可变 flag（对齐 Go `AutomationState`）。
+///
+/// 内部两 flag 用 `Arc<AtomicBool>` 持有，故 [`AutomationState::share`] 可派生**共享同一组
+/// 原子真值**的第二个 handle——daemon 同一份 state 既注入 HTTP server（handler 拨动）又供
+/// Persister value_source 读运行时真值（Phase 4 G3a 接线 §5.4/§6.4：单一 state 不分叉）。
 pub struct AutomationState {
-    auto_unlock: AtomicBool,
-    auto_hangup: AtomicBool,
+    auto_unlock: Arc<AtomicBool>,
+    auto_hangup: Arc<AtomicBool>,
 }
 
 impl AutomationState {
     pub fn new(auto_unlock: bool, auto_hangup: bool) -> Self {
         Self {
-            auto_unlock: AtomicBool::new(auto_unlock),
-            auto_hangup: AtomicBool::new(auto_hangup),
+            auto_unlock: Arc::new(AtomicBool::new(auto_unlock)),
+            auto_hangup: Arc::new(AtomicBool::new(auto_hangup)),
+        }
+    }
+
+    /// 派生一个**共享同一组原子真值**的 handle（拨动 / 读取互相可见）。
+    ///
+    /// daemon 用它把同一份 automation state 既给 HTTP server（handler `store_*` 拨动）又给
+    /// Persister value_source（`load_*` 读运行时真值）——两 handle 背后是同一对
+    /// `Arc<AtomicBool>`，endpoint 拨动后 persister 立即读到翻转值（不分叉，对齐 Go 单一
+    /// `automationState` 注入两处）。
+    pub fn share(&self) -> Self {
+        Self {
+            auto_unlock: Arc::clone(&self.auto_unlock),
+            auto_hangup: Arc::clone(&self.auto_hangup),
         }
     }
 
@@ -464,13 +486,72 @@ pub trait Pusher: Send + Sync {
     fn push(&self, event: &str, fields: &[(&str, &str)]);
 }
 
+/// 手动 `/unlock` 经 wire-worker 的派发缝（G3b 决策 5）。
+///
+/// `handle_unlock` 不再 handler 局部直调 `Sender`，而是经此 trait 把 unlock 参数投到
+/// **单 wire-worker 队列**（[`crate::daemon::Job::Unlock`]）并阻塞等 worker 经一次性 reply
+/// channel 回灌 [`UnlockOutcome`]——结果含 `terminated_by_bye` / `wire_kind`，足以做 Go
+/// `handleUnlock` 的 4 分支 HTTP 映射（OK / 业务错 / bye→silent-FIN→-103 / wire-failure 503）。
+///
+/// 与 [`Sender`] 的区别（决策 5）：`Sender::execute_unlock` 只返 `Result<i32>`（无 bye/wire_kind
+/// 出参，做不出 4 分支）；本 trait 返完整 `UnlockOutcome`。daemon 生产用 worker-backed 实现
+/// （main.rs），Phase 2 测试用 [`dispatch_from_sender`] 把既有 `Sender` 退化包装（无 bye/wire_kind）。
+pub trait UnlockDispatch: Send + Sync {
+    /// 派发一次 unlock（投 worker + 等 reply）；worker 已退 / panic → 退化 wire-failure
+    /// `UnlockOutcome`（result=-1，禁永等、禁 panic，决策 8）。
+    fn dispatch(
+        &self,
+        caller_bcd: [u8; 4],
+        callee_bcd: [u8; 4],
+        target_ip: &str,
+        target_port: u16,
+    ) -> UnlockOutcome;
+}
+
+/// 把既有 [`Sender`] 退化包装成 [`UnlockDispatch`]（Phase 2 测试 / 兼容路径）。
+///
+/// `Sender::execute_unlock` 只返 `Result<i32>` → 退化 `UnlockOutcome`：`Ok(code)` →
+/// `{result:code, terminated_by_bye:false, wire_kind:None}`；`Err` → `{result:-1, ...None}`。
+/// 故经此适配的 `/unlock` 永不命中 4 分支里的 bye/wire-failure（503）分支——与 Phase 2
+/// 既有行为（wire_err → 200 + result=-1）逐字一致，不引入 503 回归。
+pub fn dispatch_from_sender(sender: Arc<dyn Sender>) -> Arc<dyn UnlockDispatch> {
+    Arc::new(SenderDispatch(sender))
+}
+
+struct SenderDispatch(Arc<dyn Sender>);
+
+impl UnlockDispatch for SenderDispatch {
+    fn dispatch(
+        &self,
+        caller_bcd: [u8; 4],
+        callee_bcd: [u8; 4],
+        target_ip: &str,
+        target_port: u16,
+    ) -> UnlockOutcome {
+        let cancel = AtomicBool::new(false);
+        let result = match self
+            .0
+            .execute_unlock(caller_bcd, callee_bcd, target_ip, target_port, &cancel)
+        {
+            Ok(code) => code,
+            Err(_) => result::ERR,
+        };
+        UnlockOutcome {
+            result,
+            retries: 0,
+            terminated_by_bye: false,
+            wire_kind: None,
+        }
+    }
+}
+
 struct ServerInner {
     cfg: Config,
     version: String,
     automation: Option<AutomationState>,
     persist: Option<Arc<dyn PersistHook>>,
     pusher: Option<Arc<dyn Pusher>>,
-    sender: Arc<dyn Sender>,
+    dispatch: Arc<dyn UnlockDispatch>,
 }
 
 /// 控制面 HTTP server 依赖（cfg / automation / persist / pusher）。
@@ -479,6 +560,10 @@ pub struct Server {
 }
 
 impl Server {
+    /// 用既有 [`Sender`] 构造（Phase 2 兼容路径；内部经 [`dispatch_from_sender`] 退化包装）。
+    ///
+    /// daemon 生产路径用 [`Server::with_dispatch`] 注入 worker-backed [`UnlockDispatch`]
+    /// （决策 5：手动 unlock 经 wire-worker）。
     pub fn new(
         cfg: Config,
         version: impl Into<String>,
@@ -487,6 +572,26 @@ impl Server {
         pusher: Option<Arc<dyn Pusher>>,
         sender: Arc<dyn Sender>,
     ) -> Self {
+        Self::with_dispatch(
+            cfg,
+            version,
+            automation,
+            persist,
+            pusher,
+            dispatch_from_sender(sender),
+        )
+    }
+
+    /// 用 worker-backed [`UnlockDispatch`] 构造（决策 5：`/unlock` 投 wire-worker 队列、
+    /// 经 reply channel 等 [`UnlockOutcome`]、做 4 分支 HTTP 映射）。
+    pub fn with_dispatch(
+        cfg: Config,
+        version: impl Into<String>,
+        automation: Option<AutomationState>,
+        persist: Option<Arc<dyn PersistHook>>,
+        pusher: Option<Arc<dyn Pusher>>,
+        dispatch: Arc<dyn UnlockDispatch>,
+    ) -> Self {
         Self {
             inner: Arc::new(ServerInner {
                 cfg,
@@ -494,7 +599,7 @@ impl Server {
                 automation,
                 persist,
                 pusher,
-                sender,
+                dispatch,
             }),
         }
     }
@@ -718,16 +823,89 @@ fn handle_unlock(st: &ServerInner, w: &mut dyn ResponseWriter, r: &Request) {
         }
     };
 
-    let cancel = AtomicBool::new(false);
-    let res =
-        match st
-            .sender
-            .execute_unlock(caller_bcd, callee_bcd, &target_ip, target_port, &cancel)
-        {
-            Ok(code) => code,
-            Err(_) => result::ERR,
-        };
-    respond_business_result(st, w, "unlock", res, &from, &to);
+    // 决策 5：投 wire-worker 队列、阻塞等 worker 经 reply channel 回灌 UnlockOutcome
+    // （worker 已退/panic 时 dispatch 返退化 wire-failure outcome，不永等不 panic，决策 8）。
+    let outcome = st
+        .dispatch
+        .dispatch(caller_bcd, callee_bcd, &target_ip, target_port);
+    respond_unlock_outcome(st, w, "unlock", &outcome, &from, &to);
+}
+
+/// 把 [`UnlockOutcome`] 映射成 4 分支 HTTP 响应（锚 Go `handleUnlock` handlers.go:195-209）：
+///   ① `result==OK` → 200（OK 不 push：`respond_business_result` 仅 result≠OK 时 push）。
+///   ② `result==ERR && wire_kind==None`（genuine 业务错：外机响应但 body 校验失败，不重试）
+///      → 200 + business push。wire 失败折叠成 ERR 但 wire_kind=Some 的落分支④ → 503。
+///   ③ `terminated_by_bye`（ring session 已结束）→ silent-FIN 语义 → 200 + result=-103 push。
+///   ④ 默认（重试耗尽）→ 据 `wire_kind` 分类（锚 Go `respondWireFailure`）：
+///        SilentFin → 200 + result=-103（业务，daemon 健康）；
+///        Timeout/其它 → 503 + result（下游故障，daemon 健康）。
+fn respond_unlock_outcome(
+    st: &ServerInner,
+    w: &mut dyn ResponseWriter,
+    event: &str,
+    outcome: &UnlockOutcome,
+    from: &str,
+    to: &str,
+) {
+    if outcome.result == result::OK {
+        // ① 成功（OK 不 push：respond_business_result 仅 result≠OK 时 push）。
+        respond_business_result(st, w, event, result::OK, from, to);
+        return;
+    }
+    if outcome.result == result::ERR && outcome.wire_kind.is_none() {
+        // ② genuine 业务错（外机响应但 body 校验失败，wire_kind==None），不重试 → 200。
+        //    wire 失败折叠成 ERR 但带 wire_kind=Some 的（含 worker-dead 退化 outcome）落分支④ → 503。
+        respond_business_result(st, w, event, result::ERR, from, to);
+        return;
+    }
+    if outcome.terminated_by_bye {
+        // ③ bye → ring session 已结束 → 业务级 no-ring（-103）最合适（传 lastWireErr 可能是
+        //    timeout，会误导成 503/-104，锚 Go handlers.go:201-204）。
+        respond_wire_failure(st, w, event, Some(WireKind::SilentFin), from, to);
+        return;
+    }
+    // ④ 重试耗尽：保留真实 wire_kind 让 respond_wire_failure 正确分类。
+    respond_wire_failure(st, w, event, outcome.wire_kind, from, to);
+}
+
+/// wire-failure 翻译成 HTTP status + result（锚 Go `respondWireFailure` handlers.go:691）：
+///   - SilentFin → 200 + result=-103（业务：外机 ring 状态机拒绝，daemon 健康，走 push）。
+///   - Timeout → 503 + result=-5（下游失败，daemon 健康）。
+///   - None（无 wire 错，cancel/cap 在首次尝试前命中）→ 503 + result=0（锚 Go classifyWireErr(nil)=OK）。
+///   - 其它 → 503 + result=-1。
+fn respond_wire_failure(
+    st: &ServerInner,
+    w: &mut dyn ResponseWriter,
+    event: &str,
+    wire_kind: Option<WireKind>,
+    from: &str,
+    to: &str,
+) {
+    let result_code = classify_wire_kind(wire_kind);
+    if result_code == result::NO_RING {
+        // SilentFin 是业务结果（外机协议层拒绝）→ 200 + push（锚 Go handlers.go:693-696）。
+        respond_business_result(st, w, event, result_code, from, to);
+        return;
+    }
+    // Timeout / 其它 → 503 + push（HTTP 状态反映下游故障，锚 Go handlers.go:698-708）。
+    push_business_fields(st, event, result_code, from, to);
+    write_json(
+        w,
+        STATUS_SERVICE_UNAVAILABLE,
+        Some(&[("result", JsonValue::Number(result_code as i64))]),
+    );
+}
+
+/// wire 分类 → result code（锚 Go `classifyWireErr` handlers.go:714）。
+fn classify_wire_kind(wire_kind: Option<WireKind>) -> i32 {
+    match wire_kind {
+        Some(WireKind::SilentFin) => result::NO_RING,
+        Some(WireKind::Timeout) => result::TIMEOUT,
+        // 无 wire 错（cancel/cap 在首次尝试前命中）→ OK(0)，锚 Go classifyWireErr(nil)=ResultOK。
+        None => result::OK,
+        // Retryable（耗尽后）/ Other → -1（下游故障，锚 Go classifyWireErr 末 ResultErr）。
+        Some(WireKind::Retryable) | Some(WireKind::Other) => result::ERR,
+    }
 }
 
 fn respond_business_result(
@@ -739,27 +917,34 @@ fn respond_business_result(
     to: &str,
 ) {
     if result_code != result::OK {
-        let code = result_code.to_string();
-        match (from.is_empty(), to.is_empty()) {
-            (false, false) => {
-                maybe_push_inner(st, event, &[("result", &code), ("from", from), ("to", to)]);
-            }
-            (false, true) => {
-                maybe_push_inner(st, event, &[("result", &code), ("from", from)]);
-            }
-            (true, false) => {
-                maybe_push_inner(st, event, &[("result", &code), ("to", to)]);
-            }
-            (true, true) => {
-                maybe_push_inner(st, event, &[("result", &code)]);
-            }
-        }
+        push_business_fields(st, event, result_code, from, to);
     }
     write_json(
         w,
         STATUS_OK,
         Some(&[("result", JsonValue::Number(result_code as i64))]),
     );
+}
+
+/// business-result push（非 OK 时；锚 Go `respondBusinessResult`/`respondWireFailure` 的
+/// `asyncPush` from/to 取舍）。经注入的 [`Pusher`]（daemon 生产是 detached `spawn_push`，CR-M1）
+/// 发——本函数只组字段，detached 与否由 Pusher 实现决定（决策 3：business push 属骨架 IN、off worker）。
+fn push_business_fields(st: &ServerInner, event: &str, result_code: i32, from: &str, to: &str) {
+    let code = result_code.to_string();
+    match (from.is_empty(), to.is_empty()) {
+        (false, false) => {
+            maybe_push_inner(st, event, &[("result", &code), ("from", from), ("to", to)]);
+        }
+        (false, true) => {
+            maybe_push_inner(st, event, &[("result", &code), ("from", from)]);
+        }
+        (true, false) => {
+            maybe_push_inner(st, event, &[("result", &code), ("to", to)]);
+        }
+        (true, true) => {
+            maybe_push_inner(st, event, &[("result", &code)]);
+        }
+    }
 }
 
 fn maybe_push_inner(st: &ServerInner, event: &str, fields: &[(&str, &str)]) {
@@ -1177,6 +1362,19 @@ mod tests {
             rtsp_url: String::new(),
         });
         cfg
+    }
+
+    // --- classify_wire_kind Go-parity ---
+
+    #[test]
+    fn classify_wire_kind_none_is_ok_not_err() {
+        // 锚 Go classifyWireErr(nil)=ResultOK：cancel/cap 在首次 wire 尝试前命中（wire_kind=None）
+        // 须映射 OK(0) 非 ERR(-1)，否则 503 体 result 与 Go 不一致。
+        assert_eq!(classify_wire_kind(None), result::OK);
+        assert_eq!(classify_wire_kind(Some(WireKind::SilentFin)), result::NO_RING);
+        assert_eq!(classify_wire_kind(Some(WireKind::Timeout)), result::TIMEOUT);
+        assert_eq!(classify_wire_kind(Some(WireKind::Other)), result::ERR);
+        assert_eq!(classify_wire_kind(Some(WireKind::Retryable)), result::ERR);
     }
 
     // --- 7.1 method_guard 405 字节契约 ---

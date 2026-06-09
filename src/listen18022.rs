@@ -111,6 +111,148 @@ pub fn extract_tcp_payload(frame: &[u8]) -> Option<(Vec<u8>, [u8; 4], [u8; 4], u
 }
 
 // ===========================================================================
+// 诊断纯函数：InferDirection + FormatLog（锚 Go parser.go）
+// ===========================================================================
+
+/// wire 帧的协议层方向（锚 Go `Direction`）。
+///
+/// 判别值与 Go `iota` 顺序一致（`Unknown=0` 起），便于跨语言对照。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// 未能匹配任何已知设备对。
+    Unknown,
+    /// 外机 → 真实室内机。
+    OutdoorToIndoor,
+    /// 真实室内机 → 外机。
+    IndoorToOutdoor,
+    /// daemon 自身 → 外机（如 unlock-A）。
+    DaemonToOutdoor,
+    /// daemon 自身 → 真实室内机（如 bye 自指）。
+    DaemonToIndoor,
+    /// 外机 → daemon（如 711 ack）。
+    OutdoorToDaemon,
+    /// 真实室内机 → daemon。
+    IndoorToDaemon,
+}
+
+impl Direction {
+    /// 方向字符串（log 用），逐字对齐 Go `Direction.String`。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Direction::OutdoorToIndoor => "outdoor→indoor",
+            Direction::IndoorToOutdoor => "indoor→outdoor",
+            Direction::DaemonToOutdoor => "daemon→outdoor",
+            Direction::DaemonToIndoor => "daemon→indoor",
+            Direction::OutdoorToDaemon => "outdoor→daemon",
+            Direction::IndoorToDaemon => "indoor→daemon",
+            Direction::Unknown => "unknown",
+        }
+    }
+}
+
+impl core::fmt::Display for Direction {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// 根据 src/dst IP + 已知设备 IP 列表推断方向（锚 Go `InferDirection`）。
+///
+/// 已知 IP（任一为 `None` 则该方向不参与匹配，返 `Unknown`）：
+///   - `daemon_ip`: hAP daemon 自身 IP（如 .202）
+///   - `indoor_ip`: 真实室内机 IP（如 .91）
+///   - `outdoor_ips`: 外机 IP 列表（如 .151~.157）
+///
+/// IPv4-only：用 `[u8; 4]` 等值比较替代 Go `net.IP.To4().Equal`（Phase 3 listener
+/// 已把帧 IP 收敛为 `[u8; 4]`，无 v4-in-v6 歧义）。
+pub fn infer_direction(
+    src_ip: [u8; 4],
+    dst_ip: [u8; 4],
+    daemon_ip: Option<[u8; 4]>,
+    indoor_ip: Option<[u8; 4]>,
+    outdoor_ips: &[[u8; 4]],
+) -> Direction {
+    let src_is_daemon = daemon_ip == Some(src_ip);
+    let dst_is_daemon = daemon_ip == Some(dst_ip);
+    let src_is_indoor = indoor_ip == Some(src_ip);
+    let dst_is_indoor = indoor_ip == Some(dst_ip);
+    let src_is_outdoor = outdoor_ips.contains(&src_ip);
+    let dst_is_outdoor = outdoor_ips.contains(&dst_ip);
+
+    if src_is_outdoor && dst_is_indoor {
+        Direction::OutdoorToIndoor
+    } else if src_is_indoor && dst_is_outdoor {
+        Direction::IndoorToOutdoor
+    } else if src_is_daemon && dst_is_outdoor {
+        Direction::DaemonToOutdoor
+    } else if src_is_daemon && dst_is_indoor {
+        Direction::DaemonToIndoor
+    } else if src_is_outdoor && dst_is_daemon {
+        Direction::OutdoorToDaemon
+    } else if src_is_indoor && dst_is_daemon {
+        Direction::IndoorToDaemon
+    } else {
+        Direction::Unknown
+    }
+}
+
+/// 把 IPv4 字节渲染成点分十进制（等价 Go `net.IP.String()` 对 IPv4 的输出）。
+fn fmt_ip(ip: [u8; 4]) -> String {
+    format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
+}
+
+/// 已知 req= 编号的协议语义注释（锚 Go `reqNote`）。无注释返 `""`。
+fn req_note(req: i64) -> &'static str {
+    match req {
+        704 => "invite-query",
+        705 => "invite-ack",
+        708 => "bye",
+        709 => "bye-ack",
+        710 => "unlock-A",
+        711 => "ack-OK",
+        519 => "ack-OK",
+        564 | 565 | 840 | 841 | 888 | 889 => "ring-late-state",
+        _ => "",
+    }
+}
+
+/// 生成探针 syslog log 行（锚 Go `FormatLog`，逐字节对齐输出格式）。
+///
+/// 格式：
+///
+/// ```text
+/// listen18022: detected req=<NNN> <direction> <src> → <dst> [byte0=0x<hex>] [<note>]
+/// ```
+///
+/// 关键 req 编号附协议语义注释（如 req=708 → "bye"，req=710 → "unlock-A"）。
+/// req=518 额外含 byte0（区分门禁卡通知 0x1b / unlock-B 标准 0x22 / appoint 变体 0xed）。
+pub fn format_log(req: i64, src_ip: [u8; 4], dst_ip: [u8; 4], body: &[u8], dir: Direction) -> String {
+    let note = req_note(req);
+    let direction_str = dir.as_str();
+    let src = fmt_ip(src_ip);
+    let dst = fmt_ip(dst_ip);
+
+    if req == 518 && !body.is_empty() {
+        // req=518 byte0 区分变体。
+        let variant = match body[0] {
+            0x1b => "state-notify".to_string(),
+            0x22 => "unlock-B-standard".to_string(),
+            0xed => "appoint-variant".to_string(),
+            b => format!("unknown-variant-0x{b:02x}"),
+        };
+        return format!(
+            "listen18022: detected req={req} {direction_str} {src} → {dst} byte0=0x{:02x} ({variant})",
+            body[0]
+        );
+    }
+
+    if !note.is_empty() {
+        return format!("listen18022: detected req={req} {direction_str} {src} → {dst} ({note})");
+    }
+    format!("listen18022: detected req={req} {direction_str} {src} → {dst}")
+}
+
+// ===========================================================================
 // dedup ringbuffer（锚 Go dedup.go，时钟注入 seam — 与 listen6672 同风格）
 // ===========================================================================
 
@@ -771,6 +913,165 @@ mod tests {
         // 纯 TCP 控制帧残留（空 / 随机），ParseFrame 失败 → None。
         assert!(parse_frame(&[]).is_none());
         assert!(parse_frame(&[0x00; 4]).is_none());
+    }
+
+    // --- infer_direction / format_log（3.4a，golden 对照 Go parser_test.go）---
+
+    #[test]
+    fn infer_direction_outdoor_to_indoor() {
+        let daemon = [172, 16, 106, 202];
+        let indoor = [172, 16, 106, 91];
+        let outdoors = [[172, 16, 106, 152]];
+        let got = infer_direction(
+            [172, 16, 106, 152],
+            [172, 16, 106, 91],
+            Some(daemon),
+            Some(indoor),
+            &outdoors,
+        );
+        assert_eq!(got, Direction::OutdoorToIndoor);
+    }
+
+    #[test]
+    fn infer_direction_indoor_to_outdoor() {
+        let daemon = [172, 16, 106, 202];
+        let indoor = [172, 16, 106, 91];
+        let outdoors = [[172, 16, 106, 152]];
+        let got = infer_direction(
+            [172, 16, 106, 91],
+            [172, 16, 106, 152],
+            Some(daemon),
+            Some(indoor),
+            &outdoors,
+        );
+        assert_eq!(got, Direction::IndoorToOutdoor);
+    }
+
+    #[test]
+    fn infer_direction_daemon_to_outdoor() {
+        let daemon = [172, 16, 106, 202];
+        let indoor = [172, 16, 106, 91];
+        let outdoors = [[172, 16, 106, 152]];
+        let got = infer_direction(daemon, [172, 16, 106, 152], Some(daemon), Some(indoor), &outdoors);
+        assert_eq!(got, Direction::DaemonToOutdoor);
+    }
+
+    #[test]
+    fn infer_direction_unknown() {
+        let daemon = [172, 16, 106, 202];
+        let indoor = [172, 16, 106, 91];
+        let outdoors = [[172, 16, 106, 152]];
+        // 邻居单元 .92 → broadcast .255。
+        let got = infer_direction(
+            [172, 16, 106, 92],
+            [172, 16, 106, 255],
+            Some(daemon),
+            Some(indoor),
+            &outdoors,
+        );
+        assert_eq!(got, Direction::Unknown);
+    }
+
+    #[test]
+    fn infer_direction_none_ip_does_not_match() {
+        // daemon/indoor 未知（None）→ 仅靠 outdoor 列表，跨设备对返 Unknown。
+        let outdoors = [[172, 16, 106, 152]];
+        let got = infer_direction(
+            [172, 16, 106, 152],
+            [172, 16, 106, 91],
+            None,
+            None,
+            &outdoors,
+        );
+        // src 是 outdoor 但 dst .91 既非 indoor（None）也非 daemon（None）→ Unknown。
+        assert_eq!(got, Direction::Unknown);
+    }
+
+    #[test]
+    fn format_log_req704_outdoor_to_indoor() {
+        let body = [0x06, 0x02, 0x11, 0x03];
+        let got = format_log(
+            704,
+            [172, 16, 106, 152],
+            [172, 16, 106, 91],
+            &body,
+            Direction::OutdoorToIndoor,
+        );
+        assert_eq!(
+            got,
+            "listen18022: detected req=704 outdoor→indoor 172.16.106.152 → 172.16.106.91 (invite-query)"
+        );
+    }
+
+    #[test]
+    fn format_log_req518_byte0_1b() {
+        let body = [0x1b, 0x06, 0x02, 0x11, 0x03, 0x96];
+        let got = format_log(
+            518,
+            [172, 16, 106, 152],
+            [172, 16, 106, 91],
+            &body,
+            Direction::OutdoorToIndoor,
+        );
+        assert!(got.contains("byte0=0x1b"), "{got}");
+        assert!(got.contains("state-notify"), "{got}");
+    }
+
+    #[test]
+    fn format_log_req518_byte0_22() {
+        let body = [0x22, 0x06, 0x02, 0x11, 0x03];
+        let got = format_log(
+            518,
+            [172, 16, 106, 202],
+            [172, 16, 106, 152],
+            &body,
+            Direction::DaemonToOutdoor,
+        );
+        assert!(got.contains("unlock-B-standard"), "{got}");
+    }
+
+    #[test]
+    fn format_log_req518_byte0_ed() {
+        let body = [0xed, 0x00, 0x01, 0x00, 0x00];
+        let got = format_log(
+            518,
+            [172, 16, 106, 202],
+            [172, 16, 106, 152],
+            &body,
+            Direction::DaemonToOutdoor,
+        );
+        assert!(got.contains("appoint-variant"), "{got}");
+    }
+
+    #[test]
+    fn format_log_req518_byte0_unknown_variant() {
+        let body = [0x77];
+        let got = format_log(518, [1, 2, 3, 4], [5, 6, 7, 8], &body, Direction::Unknown);
+        assert!(got.contains("byte0=0x77"), "{got}");
+        assert!(got.contains("unknown-variant-0x77"), "{got}");
+    }
+
+    #[test]
+    fn format_log_req710_unlock_a() {
+        let body = [0x06, 0x02, 0x00, 0x00, 0x06, 0x02, 0x11, 0x03];
+        let got = format_log(
+            710,
+            [172, 16, 106, 202],
+            [172, 16, 106, 152],
+            &body,
+            Direction::DaemonToOutdoor,
+        );
+        assert_eq!(
+            got,
+            "listen18022: detected req=710 daemon→outdoor 172.16.106.202 → 172.16.106.152 (unlock-A)"
+        );
+    }
+
+    #[test]
+    fn format_log_no_note_no_parens() {
+        // 无语义注释的 req（如 999）+ 非 518 → 不带括号尾。
+        let got = format_log(999, [1, 2, 3, 4], [5, 6, 7, 8], &[], Direction::Unknown);
+        assert_eq!(got, "listen18022: detected req=999 unknown 1.2.3.4 → 5.6.7.8");
     }
 
     // --- extract_tcp_payload ---

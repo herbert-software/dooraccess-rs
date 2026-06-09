@@ -83,6 +83,24 @@ impl Server {
         listener: TcpListener,
         handler: Arc<dyn Handler>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // 非阻塞 accept + 短 poll 间隔：使 accept 不在持锁期不可中断地永阻——无新连接时
+        // accept 立即返 WouldBlock，accept 循环随之周期释放 listener 锁、sleep ~50ms 后重试。
+        // 否则阻塞 accept 持锁期永不返回 → 永持锁 → shutdown/close 的 take() 永等锁 = 死锁
+        // （closing flag 只在 accept 返回后才查，救不了）。**禁** busy-spin：WouldBlock 分支必
+        // sleep（见下），非空转 100% CPU。对真连接无新增延迟（有连接就绪 accept 立即返回）。
+        // 跨平台一致：SO_RCVTIMEO 在 macOS 对 listening socket 的 accept 不生效，故用 nonblocking
+        // + sleep（Linux/macOS 行为相同）。set_nonblocking 失败必须快速失败：阻塞 accept 会持锁
+        // 不可中断地永阻 → shutdown take() 死锁。Linux/macOS 有效 TCP listener fd 不触发此失败；
+        // 万一失败让 daemon fatal exit（procd respawn）优于静默跑进死锁模式。
+        const ACCEPT_POLL: Duration = Duration::from_millis(50);
+        listener.set_nonblocking(true).map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                Box::new(io::Error::new(
+                    e.kind(),
+                    format!("httpx: set listener nonblocking failed: {e}"),
+                ))
+            },
+        )?;
         *self.listener.lock().unwrap() = Some(listener);
         loop {
             let accept_result = {
@@ -100,6 +118,10 @@ impl Server {
 
             match accept_result {
                 Ok((stream, _)) => {
+                    // accepted socket 继承 listener 的 nonblocking 标志——connection 走阻塞
+                    // read/write（DeadlineReader/WriteDeadlineWriter 设 per-syscall deadline），
+                    // 故须复位为阻塞，否则 read 立即返 WouldBlock 误判 EOF。
+                    let _ = stream.set_nonblocking(false);
                     self.active.fetch_add(1, Ordering::SeqCst);
                     let server = ServerConnCtx {
                         handler: Arc::clone(&handler),
@@ -117,6 +139,9 @@ impl Server {
                     }
                     if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut
                     {
+                        // nonblocking accept 无就绪连接：锁已在上面块释放，sleep ~50ms 让出
+                        // shutdown/close 的 take() 抢锁窗口后重试（禁 busy-spin）。
+                        thread::sleep(ACCEPT_POLL);
                         continue;
                     }
                     return Err(Box::new(io::Error::new(
@@ -397,6 +422,49 @@ pub fn test_serve_one_connection(
 mod deadline_tests {
     use super::*;
     use std::io::Read;
+
+    /// graceful shutdown 无死锁回归（问题 A）：起 server（不戳任何连接）→ 另一线程
+    /// `shutdown()` → serve 线程必在 ~1s 内退出（nonblocking accept + 50ms ACCEPT_POLL 周期释放
+    /// listener 锁，shutdown 的 take() 在一个 poll 周期内抢到锁；不依赖外部戳连接）。修复前
+    /// accept 在持锁期永阻 → shutdown take() 永等锁 → 死锁。
+    #[test]
+    fn graceful_shutdown_without_poking_connection_no_deadlock() {
+        use super::super::{HandlerFunc, STATUS_OK};
+
+        let handler: Arc<dyn Handler> = Arc::new(HandlerFunc(
+            |w: &mut dyn crate::httpx::ResponseWriter, _r: &crate::httpx::Request| {
+                w.write_header(STATUS_OK);
+            },
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let srv = Arc::new(Server::new());
+        let s2 = Arc::clone(&srv);
+        let h = Arc::clone(&handler);
+        let serve_thread = thread::spawn(move || {
+            let _ = s2.serve(listener, h);
+        });
+
+        // 让 serve 进入 accept 循环。
+        thread::sleep(Duration::from_millis(100));
+
+        // 另一线程 shutdown（无任何连接被戳）。
+        let s3 = Arc::clone(&srv);
+        let shut = thread::spawn(move || {
+            let _ = s3.shutdown(Some(Duration::from_secs(2)));
+        });
+
+        // serve 线程必在 ~1s 内退出（一个 ACCEPT_POLL 周期 50ms + 余量）。
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !serve_thread.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            serve_thread.is_finished(),
+            "serve 线程应在 ~1s 内因 shutdown 退出（无死锁，无需外部戳连接）"
+        );
+        serve_thread.join().ok();
+        shut.join().ok();
+    }
 
     /// header timeout(100ms) 紧于 read timeout(2s)：慢 headers 被切断。
     #[test]

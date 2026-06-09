@@ -1,280 +1,603 @@
-//! `dooraccess-rs-probe`：hAP 真机 passive-shadow 只读探针
-//! （OpenSpec `verify-rust-listeners-on-hap` 组 A）。
+//! `dooraccess-rs` daemon 编排入口（Phase 4 骨架，`port-rust-daemon-skeleton` G2）。
 //!
-//! 复用 `listen6672::Listener` + `listen18022::Listener` 的 PF_PACKET/recv 路径
-//! （`ffi::open_packet_socket` / `bind_to_ifindex` / `set_promisc` / `attach_filter`
-//! / `recv` —— 本变更要在大端 hAP 内核认证的就是它俩），并发跑两个 `run()`（6672 +
-//! 18022，共 4 socket = 2 listener × 2 slave），**只 log detect，不发 wire、不 unlock、
-//! 不 HA push**。
+//! 对标 Go `cmd/dooraccess-go/main.go` 的 `mainImpl` + `run`。本文件交付 **M1.5 骨架主体**：
+//!   - `mainImpl(args, stderr) -> exitcode` 可测包装（锚 Go `main.go:62`）：解析 `--config`
+//!     flag、加载 config、缺失/废弃/解析告警逐条 log、退出码区分（flag 错=2 / config 错=1）。
+//!   - signal：SIGHUP 显式忽略 + SIGTERM/SIGINT 注册（锚 Go `signal.Ignore`/`signal.Notify`）。
+//!   - `run`：构造 M1.5 并发骨架（[`daemon`] 模块的 wire-worker + Job 队列 + 单 `Arc<AtomicBool>`
+//!     shutdown + [`PushTracker`] 排空），阻塞到 SIGTERM/SIGINT，执行钉死 shutdown 排序。
 //!
-//! 设计要点（spec / tasks 2.1）：
-//!   - slave 列表**显式给**（`--slaves eth1,eth0.2`，默认 `eth1,eth0.2`）——`config.rs`
-//!     不移植桥解析，探针不从 `iface=br-door` 解析（桥解析非本变更范围）。
-//!   - 回调与 `Listener.logf` **都**接 log-only sink：listen6672 用 `Callbacks`
-//!     （`on_ring` / `on_elevator_key` / `on_number_query` / `on_number_response`
-//!     仅 log；**`on_number_query` 只 log，不调 `build_number_query_response`、不发
-//!     wire**）；listen18022 用 `on_detect`（仅 log）；**`logf` 必接**：邻居 0x96 帧经
-//!     `classify`→`EventKind::Unknown` 臂只走 `self.logf`（listen6672.rs:516）、不触
-//!     callback，漏设则整管证据失效。KeepAlive(byte19=0x00) 是 silent drop 无 hook，
-//!     但 idle 本单元不自发流量，整管证据靠邻居 0x96（logf 可见），不靠 keepalive。
-//!   - orchestration **fail-stop**：两 listener 共享**同一** `shutdown` Arc + 错误经
-//!     channel 回传；主线程监到**首个** `run()` Err 即 `exit(1)`（不朴素顺序 join
-//!     两个独立 handle——健康 listener 永 loop 会阻塞主线程，做不到「任一即退」）。
-//!   - **自限 timeout**：`--duration <N>s`（默认 120s）到点自 `exit(0)`，即便 SSH 断 /
-//!     STA 抖断 / setsid 缺也有界自终止，不无限占 64MB RAM。
+//! **范围**（G2）：搭好 main 入口 + worker/job/shutdown/push 基础设施。listener/HTTP/手动
+//! unlock/banner/automation flag 加载/号码查询的**完整接线**是 G1/G3 组的事——本骨架的
+//! `run()` 是「最小但能编译」的编排，留出注入点（`#[allow(dead_code)]` 标占位依赖）。
+//!
+//! Phase 0-3 的 passive-shadow 探针迁至 `examples/probe.rs`（`cargo build --example probe`），
+//! 逻辑零回归（决策 7）。
 
+use std::io::Write;
 use std::process::exit;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::thread::JoinHandle;
 
-use dooraccess_rs::{listen18022, listen6672};
+use dooraccess_rs::config::{self, Config};
+use dooraccess_rs::control::{self, AutomationState, FnPersistHook, Pusher};
+use dooraccess_rs::daemon::{self, Job, PushTracker, WorkerDeps};
+use dooraccess_rs::ha_push::HaPushClient;
+use dooraccess_rs::listen18022;
+use dooraccess_rs::listen6672;
+use dooraccess_rs::orchestration::{
+    build_listen18022, build_number_query_callback, load_automation_flags, WorkerUnlockDispatch,
+};
+use dooraccess_rs::{automation_state, info, wire_sender};
 
-/// 探针默认采证窗口（秒）。邻居 6672 周期 ~61s，≥120s 给 ~2 周期窗口。
-const DEFAULT_DURATION_SECS: u64 = 120;
+/// 主配置默认路径（锚 Go `defaultConfigPath`）。
+const DEFAULT_CONFIG_PATH: &str = "/etc/dooraccess-go/config.ini";
 
-/// 默认 slave 列表（hAP `[eth1(ifindex 3), eth0.2(ifindex 6)]`，真机基线 2026-06-09）。
-const DEFAULT_SLAVES: &[&str] = &["eth1", "eth0.2"];
+/// automation flag 持久 state 文件路径（锚 Go `automationStatePath`）。必落 /etc
+/// （overlay→flash 持久；/tmp、/var 是 tmpfs 非真持久）。与 config.ini 同目录但独立。
+const AUTOMATION_STATE_PATH: &str = "/etc/dooraccess-go/automation.state";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let cfg = match Config::parse(&args) {
+    let code = main_impl(&args, &mut std::io::stderr());
+    exit(code);
+}
+
+/// `main` 的可测包装（锚 Go `mainImpl`）：参数化 args 与 stderr sink，返退出码。
+///
+/// 退出码（锚 Go `main.go:66-77`）：
+///   - flag 解析失败 → **2**（参数错误）
+///   - config 加载失败 → **1**（业务失败）
+///   - `run` 返 Err → **1**
+///   - 干净退出 → **0**
+///
+/// flag/config 失败均**不启动任何 listener/worker/HTTP 线程**（spec「flag vs config 退出码区分」）。
+pub fn main_impl<W: Write>(args: &[String], stderr: &mut W) -> i32 {
+    // ① flag 解析（手写，不引 clap：binary 体型是 OOM 红线）。
+    let config_path = match parse_flags(args) {
+        Ok(p) => p,
+        Err(msg) => {
+            let _ = writeln!(stderr, "dooraccess-rs: {msg}");
+            let _ = writeln!(
+                stderr,
+                "usage: dooraccess-rs [--config <path>]\n\tdefault config: {DEFAULT_CONFIG_PATH}"
+            );
+            return 2; // flag 解析失败 → 2。
+        }
+    };
+
+    logf(stderr, &format!(
+        "starting dooraccess-rs (anjubao replica), config={config_path}"
+    ));
+
+    // ② config 加载（锚 Go `config.LoadConfig`）。
+    let cfg = match config::load_config(&config_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("dooraccess-rs-probe: {e}");
-            eprintln!(
-                "usage: dooraccess-rs-probe [--slaves <if1,if2,...>] [--duration <N>s]\n\
-                 \tpassive-shadow read-only probe: logs detect only, never sends wire/unlock/HA push.\n\
-                 \tdefaults: --slaves {} --duration {}s",
-                DEFAULT_SLAVES.join(","),
-                DEFAULT_DURATION_SECS
-            );
-            exit(2);
+            let _ = writeln!(stderr, "load config: {e}");
+            return 1; // config 加载失败 → 1。
         }
     };
 
-    eprintln!(
-        "dooraccess-rs-probe: passive-shadow start (slaves={:?}, duration={}s) — \
-         read-only, no wire/unlock/HA push",
-        cfg.slaves, cfg.duration_secs
-    );
+    // ③ 缺失/废弃字段/解析告警逐条 log（锚 Go `main.go:73-86`）。
+    for m in cfg.missing_fields() {
+        logf(stderr, &format!("config: field {m} missing, using default"));
+    }
+    let dep = cfg.deprecated_fields();
+    if !dep.is_empty() {
+        logf(
+            stderr,
+            &format!(
+                "config: {dep:?} fields deprecated and ignored; safe to remove from config.ini \
+                 (brand/family/elev/notification removed in v0.1.6)"
+            ),
+        );
+    }
+    for w in cfg.parser_warnings() {
+        logf(stderr, w);
+    }
 
-    // ① 两 listener 共享同一 shutdown Arc（fail-stop 的根缝）。
+    // ④ hass.token 配但 hass.api 缺 → log 并继续（不退出，锚 Go `main.go:88-91`）。
+    if !cfg.hass.token.is_empty() && cfg.hass.api.is_empty() {
+        logf(
+            stderr,
+            "config: hass.token configured but hass.api missing; \
+             HA push disabled until cfg.hass.api is set",
+        );
+    }
+
+    // ⑤ signal：SIGHUP 显式忽略 + SIGTERM/SIGINT 注册（锚 Go `signal.Ignore`/`signal.Notify`）。
+    install_signal_handlers();
+
+    // ⑥ run：构造并发骨架、阻塞到信号、graceful shutdown。
+    match run(&cfg, &config_path, AUTOMATION_STATE_PATH, stderr) {
+        Ok(()) => {
+            logf(stderr, "dooraccess-rs exited cleanly");
+            0
+        }
+        Err(e) => {
+            let _ = writeln!(stderr, "run: {e}");
+            1
+        }
+    }
+}
+
+/// 手写 `--config <path>` 解析（默认 [`DEFAULT_CONFIG_PATH`]）。未知 flag / 缺值 → Err（退出码 2）。
+fn parse_flags(args: &[String]) -> Result<String, String> {
+    let mut config_path = DEFAULT_CONFIG_PATH.to_string();
+    let mut i = 1; // args[0] = bin path
+    while i < args.len() {
+        match args[i].as_str() {
+            "--config" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--config requires a value (path to config.ini)".to_string())?;
+                config_path = v.clone();
+                i += 2;
+            }
+            other if other.starts_with("--config=") => {
+                config_path = other["--config=".len()..].to_string();
+                i += 1;
+            }
+            other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+    Ok(config_path)
+}
+
+/// 极简 stderr 行日志（无 logger crate；banner/syslog 由 G3a 接）。
+fn logf<W: Write>(stderr: &mut W, msg: &str) {
+    let _ = writeln!(stderr, "dooraccess-rs: {msg}");
+}
+
+// ---------------------------------------------------------------------------
+// signal 处理（std + libc only；锚 Go signal.Ignore(SIGHUP) / Notify(SIGTERM,SIGINT)）
+// ---------------------------------------------------------------------------
+
+/// 进程级 shutdown 请求标志（SIGTERM/SIGINT handler 置位；主线程轮询）。
+///
+/// signal handler 内只允许 async-signal-safe 操作——仅 `store` 一个 atomic，不 log、不分配。
+static SIGNAL_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// 安装 signal 处置：SIGHUP → `SIG_IGN`（显式忽略，否则内核默认 terminate 杀 daemon，
+/// 不符合 spec「SIGHUP 不响应」）；SIGTERM/SIGINT → 置位 [`SIGNAL_SHUTDOWN`]。
+fn install_signal_handlers() {
+    extern "C" fn on_term(_sig: libc::c_int) {
+        SIGNAL_SHUTDOWN.store(true, Ordering::SeqCst);
+    }
+    unsafe {
+        // SIGHUP 显式忽略（锚 Go signal.Ignore(SIGHUP)）。
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        // SIGTERM / SIGINT → on_term（锚 Go signal.Notify）。
+        libc::signal(libc::SIGTERM, on_term as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, on_term as *const () as libc::sighandler_t);
+    }
+}
+
+/// 是否已收到 SIGTERM/SIGINT。
+fn shutdown_requested() -> bool {
+    SIGNAL_SHUTDOWN.load(Ordering::SeqCst)
+}
+
+// ---------------------------------------------------------------------------
+// run：M1.5 并发骨架编排（G2 最小骨架；listener/HTTP/unlock 完整接线属 G3）
+// ---------------------------------------------------------------------------
+
+/// run 构造 M1.5 并发骨架，阻塞到 SIGTERM/SIGINT，执行钉死 shutdown 排序。
+///
+/// **G3a 接线范围**：共享依赖构造（Sender/HaPushClient/slaves）+ listener（6672/18022）
+/// 线程 + OnDetect 安装（FormatLog + event=ring 门铃 push）+ HTTP 8080 server 线程 +
+/// automation flag 启动加载（优先级 state>config>env）+ Persister hook + banner + startup
+/// push（automation_state + diagnosis）。手动 unlock 经 worker 改写（§4，G3b）、号码查询
+/// handler（§8，G3b）、fatal 上报完整化（§9，G3b）**不**在本组——worker 仍用 G2 占位 wire。
+///
+/// 钉死 shutdown 排序（决策 8 / spec「graceful shutdown」）：
+///   ① 置位 `Arc<AtomicBool>` shutdown
+///   ② 先 join listener 线程（各于下个 SO_RCVTIMEO ~500ms wakeup 退出）
+///   ③ 投 `Job::Shutdown` 哨兵（容忍 worker 已死 SendError）→ worker 排空 Unlock 后 break → join worker
+///   ④ shutdown HTTP server + join HTTP 线程
+///   ⑤ join 残留 detached push 线程（[`PushTracker::join_all`]）
+fn run<W: Write>(
+    cfg: &Config,
+    _config_path: &str,
+    state_path: &str,
+    stderr: &mut W,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // 单 Arc<AtomicBool> shutdown：穿入 worker / listener recv / execute_unlock cancel /
+    // detached push（决策 4：仅取消；超时由 InstantDeadline 另行承载）。
     let shutdown = Arc::new(AtomicBool::new(false));
 
-    // ② 错误回传 channel：任一 run() 返回（Ok 或 Err）都把结果送回主线程。
-    let (err_tx, err_rx) = mpsc::channel::<(&'static str, RunOutcome)>();
+    // detached push 排空集（决策 3：std-native pushWG 等价）。
+    let push_tracker = PushTracker::new();
 
-    // ③ 起两个 listener 线程，各跑一个 run()，共享 shutdown。
-    let l6672 = build_6672(&cfg.slaves);
-    let l18022 = build_18022(&cfg.slaves);
+    // ── automation flag 启动加载优先级（state>config>env，§5.1/5.2/5.3）──
+    let (auto_unlock0, auto_hangup0, flag_source) =
+        load_automation_flags(state_path, cfg, &mut |m| logf(stderr, m));
 
-    let sd6 = shutdown.clone();
-    let tx6 = err_tx.clone();
-    let h6672 = thread::Builder::new()
-        .name("listen6672".into())
-        .spawn(move || {
-            let outcome = match l6672.run(sd6) {
-                Ok(()) => RunOutcome::Ok,
-                Err(e) => RunOutcome::Err(e.to_string()),
-            };
-            let _ = tx6.send(("listen6672", outcome));
-        })
-        .expect("spawn listen6672");
+    // 运行时可变两 flag（§5.4）。单一 state：HTTP server 拿一个 share() handle 拨动，
+    // Persister value_source 拿另一个 share() handle 读运行时真值——两 handle 背后同一对
+    // Arc<AtomicBool>，故 endpoint 拨动后 persister 立即读到翻转值（不分叉，对齐 Go 单一
+    // automationState 注入两处）。
+    let automation = AutomationState::new(auto_unlock0, auto_hangup0);
 
-    let sd18 = shutdown.clone();
-    let tx18 = err_tx.clone();
-    let h18022 = thread::Builder::new()
-        .name("listen18022".into())
-        .spawn(move || {
-            let outcome = match l18022.run(sd18) {
-                Ok(()) => RunOutcome::Ok,
-                Err(e) => RunOutcome::Err(e.to_string()),
-            };
-            let _ = tx18.send(("listen18022", outcome));
-        })
-        .expect("spawn listen18022");
-
-    // 丢掉主线程持有的 err_tx 原件，使 channel 仅靠两个线程克隆存活
-    // （所有线程退出后 recv_timeout 才会 Disconnected）。
-    drop(err_tx);
-
-    // ④ 主线程监控：到 deadline 自杀(exit 0)；任一 run() 提前返回则处理。
-    let deadline = Instant::now() + Duration::from_secs(cfg.duration_secs);
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            // 自限 timeout 到点：干净撤离，置 shutdown 让 listener 收尾，exit(0)。
-            eprintln!(
-                "dooraccess-rs-probe: duration {}s elapsed — shutting down, exit(0)",
-                cfg.duration_secs
-            );
-            shutdown.store(true, Ordering::SeqCst);
-            join_quietly(h6672);
-            join_quietly(h18022);
-            exit(0);
-        }
-        let remaining = deadline - now;
-        // 用短轮询等待，确保 deadline 到点能及时自杀（不被 run() 永久阻塞）。
-        match err_rx.recv_timeout(remaining.min(Duration::from_millis(500))) {
-            Ok((who, RunOutcome::Err(msg))) => {
-                // 首个 run() Err → fail-stop：置 shared shutdown 停另一 listener，exit(1)。
-                eprintln!("dooraccess-rs-probe: {who} run() failed: {msg} — fail-stop, exit(1)");
-                shutdown.store(true, Ordering::SeqCst);
-                exit(1);
-            }
-            Ok((who, RunOutcome::Ok)) => {
-                // 某 listener 在 shutdown 未置位时自行 Ok 返回是异常（健康 listener 应
-                // 永 loop 到 shutdown）；视作残态 → fail-stop exit(1)，避免 2/4 行残态漏网。
-                if !shutdown.load(Ordering::SeqCst) {
-                    eprintln!(
-                        "dooraccess-rs-probe: {who} run() returned Ok before shutdown — \
-                         残态, fail-stop, exit(1)"
-                    );
-                    shutdown.store(true, Ordering::SeqCst);
-                    exit(1);
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // 正常：继续等到 deadline 或下一个事件。
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                // 两个 listener 线程都已退出且未在上面被处理（理论不可达，因 Ok/Err
-                // 都会先到上面分支）；保守 fail-stop。
-                eprintln!(
-                    "dooraccess-rs-probe: both listeners exited unexpectedly — fail-stop, exit(1)"
-                );
-                shutdown.store(true, Ordering::SeqCst);
-                exit(1);
-            }
-        }
-    }
-}
-
-/// 单个 listener `run()` 的退出归类。
-enum RunOutcome {
-    Ok,
-    Err(String),
-}
-
-/// 探针运行参数。
-struct Config {
-    slaves: Vec<String>,
-    duration_secs: u64,
-}
-
-impl Config {
-    /// 手工解析 `--slaves <csv>` / `--duration <N>[s]`（不引 clap：binary 体型是 OOM 红线）。
-    fn parse(args: &[String]) -> Result<Config, String> {
-        let mut slaves: Vec<String> = DEFAULT_SLAVES.iter().map(|s| s.to_string()).collect();
-        let mut duration_secs = DEFAULT_DURATION_SECS;
-
-        let mut i = 1; // args[0] = bin path
-        while i < args.len() {
-            match args[i].as_str() {
-                "--slaves" => {
-                    let v = args.get(i + 1).ok_or_else(|| {
-                        "--slaves requires a value (e.g. eth1,eth0.2)".to_string()
-                    })?;
-                    slaves = v
-                        .split(',')
-                        .map(|s| s.trim())
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string())
-                        .collect();
-                    if slaves.is_empty() {
-                        return Err("--slaves value parsed to empty list".to_string());
-                    }
-                    i += 2;
-                }
-                "--duration" => {
-                    let v = args
-                        .get(i + 1)
-                        .ok_or_else(|| "--duration requires a value (e.g. 120s)".to_string())?;
-                    // 接受 "120" 或 "120s"。
-                    let trimmed = v.strip_suffix('s').unwrap_or(v);
-                    duration_secs = trimmed
-                        .parse::<u64>()
-                        .map_err(|_| format!("--duration not a number of seconds: {v}"))?;
-                    if duration_secs == 0 {
-                        return Err("--duration must be > 0".to_string());
-                    }
-                    i += 2;
-                }
-                other => return Err(format!("unknown argument: {other}")),
-            }
-        }
-        Ok(Config {
-            slaves,
-            duration_secs,
-        })
-    }
-}
-
-/// 构造 6672 listener：各回调仅 log（**on_number_query 不调
-/// build_number_query_response、不发 wire**），并接 logf。
-fn build_6672(slaves: &[String]) -> listen6672::Listener {
-    let callbacks = listen6672::Callbacks {
-        on_ring: Some(Box::new(|ip, f| {
-            eprintln!(
-                "[6672 recv] ring src={}.{}.{}.{} subtype=0x{:02x}",
-                ip[0], ip[1], ip[2], ip[3], f.subtype
-            );
-        })),
-        on_elevator_key: Some(Box::new(|ip, f| {
-            eprintln!(
-                "[6672 recv] elevator_key src={}.{}.{}.{} subtype=0x{:02x} (log-only)",
-                ip[0], ip[1], ip[2], ip[3], f.subtype
-            );
-        })),
-        // log-only：**不**调 build_number_query_response、**不**发 wire response。
-        on_number_query: Some(Box::new(|ip, f| {
-            eprintln!(
-                "[6672 recv] number_query src={}.{}.{}.{} target_bcd={:02x?} (log-only, no wire)",
-                ip[0], ip[1], ip[2], ip[3], f.target_bcd
-            );
-        })),
-        on_number_response: Some(Box::new(|ip, f| {
-            eprintln!(
-                "[6672 recv] number_response src={}.{}.{}.{} ip_field={:02x?}",
-                ip[0], ip[1], ip[2], ip[3], f.self_or_ip
-            );
-        })),
+    // Persister：endpoint 拨动后 best-effort 原子落盘（§6.4 接线 G1 的 Persister）。
+    // value_source 读运行时 atomic 当前真值（决策 6 / G1）。
+    let persister = {
+        let auto = automation.share();
+        Arc::new(automation_state::Persister::new(
+            std::path::PathBuf::from(state_path),
+            Box::new(move || (auto.load_auto_unlock(), auto.load_auto_hangup())),
+            None,
+        ))
     };
-    let mut l = listen6672::Listener::new(slaves.to_vec(), callbacks);
-    // ★ 必接 logf：邻居 0x96 走 classify→Unknown 臂只 logf（listen6672.rs:516），
-    // 不触任何 callback；机会性整管证据全靠它可见。
-    l.logf = Some(Box::new(|msg| eprintln!("[6672 log] {msg}")));
-    l
-}
 
-/// 构造 18022 listener：on_detect 仅 log，并接 logf。
-fn build_18022(slaves: &[String]) -> listen18022::Listener {
-    let on_detect: listen18022::OnDetect = Box::new(|f| {
-        eprintln!(
-            "[18022 recv] detect req={} src={}.{}.{}.{}:{} -> dst={}.{}.{}.{}:{} body_len={}",
-            f.req,
-            f.src_ip[0],
-            f.src_ip[1],
-            f.src_ip[2],
-            f.src_ip[3],
-            f.src_port,
-            f.dst_ip[0],
-            f.dst_ip[1],
-            f.dst_ip[2],
-            f.dst_ip[3],
-            f.dst_port,
-            f.body.len()
+    // ── 共享依赖构造（§3.1）──
+    // ha_push client（HTTP-to-HA 反向 push；hass.api 空时 push 内部静默跳过）。
+    let push_client = Arc::new(HaPushClient::new(cfg.clone(), None));
+
+    // slaves 解析：显式 iface_list 优先，否则桥成员枚举（§3.1，移植 resolve_iface_list）。
+    let slaves: Vec<String> = match cfg.resolve_iface_list() {
+        Ok(s) => {
+            logf(stderr, &format!("listeners: slaves={s:?} (resolved from iface={:?})", cfg.iface));
+            s
+        }
+        Err(e) => {
+            // 解析失败非致命（HTTP-only 模式继续，锚 Go main.go:170-174）。
+            logf(stderr, &format!("listeners: resolve iface list failed: {e} (listeners will not start)"));
+            Vec::new()
+        }
+    };
+
+    // ── listen18022 Listener 构造（§3.4：OnDetect 每帧 FormatLog + req=704 门铃 push）──
+    // 先构造（不起线程），以便把同一 Arc 既给 wire-worker 作 bye 早停订阅源（§4.2 listener
+    // 注入），又给 listen18022 线程跑 I/O。slaves 空时 None（不启动，与 Go 一致）。
+    let listener18022: Option<Arc<listen18022::Listener>> = build_listen18022(
+        cfg,
+        slaves.clone(),
+        Arc::clone(&push_client),
+        Arc::clone(&shutdown),
+        push_tracker.clone(),
+    )
+    .map(Arc::new);
+
+    // ── Job 队列 + 单 wire-worker 线程（决策 1/2/5）──
+    // worker 跑 wire-bound Job::Unlock（free fn unlock::execute_unlock，决策 5）；Job::Shutdown
+    // 哨兵 break（决策 8）。G3b：注入真 WireSenderAdapter（sender.rs，实现 UnlockWire）+
+    // listen18022 作 bye 早停订阅源（§4.2）。
+    let (job_tx, job_rx) = mpsc::channel::<Job>();
+    let worker_listener: Option<Arc<dyn dooraccess_rs::listen18022::Subscribable>> = listener18022
+        .as_ref()
+        .map(|l| Arc::clone(l) as Arc<dyn dooraccess_rs::listen18022::Subscribable>);
+    let worker_deps = WorkerDeps::new(worker_wire(cfg), worker_listener);
+    let worker_shutdown = Arc::clone(&shutdown);
+    let worker = std::thread::Builder::new()
+        .name("wire-worker".into())
+        .spawn(move || daemon::run_worker(worker_deps, job_rx, worker_shutdown))?;
+
+    // ── listener 线程接线（§3.2，复用已 hAP 真机认证的 listen6672/listen18022，I/O 零改动）──
+    let mut listener_threads: Vec<JoinHandle<()>> = Vec::new();
+
+    // listen18022 线程：跑上面已构造的 Listener Arc（OnDetect 已装）。
+    if let Some(l) = &listener18022 {
+        logf(stderr, &format!("listen18022: started on {:?} (PROMISC, BPF tcp:18022)", l.slaves));
+        let l = Arc::clone(l);
+        let sd = Arc::clone(&shutdown);
+        listener_threads.push(
+            std::thread::Builder::new()
+                .name("listen18022".into())
+                .spawn(move || {
+                    if let Err(e) = l.run(sd) {
+                        // listener 非致命：HTTP-only 模式继续（锚 Go main.go:268-271）。
+                        eprintln!("dooraccess-rs: listen18022 stopped: {e}");
+                    }
+                })?,
         );
+    } else {
+        logf(stderr, "listen18022: no slaves resolved, will not start");
+    }
+
+    // listen6672：号码查询 callback 安装（§8.1/8.2）+ 起线程（on_ring=None 与 Go 一致——
+    // ring 触发 self-unlock 属姊妹 change ②，骨架不消费 ring 帧产 Unlock job）。
+    if !slaves.is_empty() {
+        let callbacks = listen6672::Callbacks {
+            on_number_query: build_number_query_callback(cfg),
+            ..Default::default()
+        };
+        let l6672 = listen6672::Listener::new(slaves.clone(), callbacks);
+        logf(stderr, &format!("listen6672: started on {:?} (PROMISC, BPF udp:6672)", l6672.slaves));
+        let l = Arc::new(l6672);
+        let sd = Arc::clone(&shutdown);
+        listener_threads.push(
+            std::thread::Builder::new()
+                .name("listen6672".into())
+                .spawn(move || {
+                    if let Err(e) = l.run(sd) {
+                        eprintln!("dooraccess-rs: listen6672 stopped: {e}");
+                    }
+                })?,
+        );
+    }
+
+    // ── HTTP 8080 server 接线（§3.3，复用 Phase 2 httpx + control handlers）──
+    // 注入 Pusher（detached spawn_push）+ Persister hook + Automation + Sender。
+    // §6.4：control handler 拨动 flag 后调 persister.persist()（经 FnPersistHook 接线）。
+    // 手动 unlock 仍走 control.rs Phase 2 直调 Sender（G3b 再改写经 worker）。
+    let pusher: Arc<dyn Pusher> = Arc::new(DetachedPusher {
+        client: Arc::clone(&push_client),
+        shutdown: Arc::clone(&shutdown),
+        tracker: push_tracker.clone(),
     });
-    let mut l = listen18022::Listener::new(slaves.to_vec(), Some(on_detect));
-    l.logf = Some(Box::new(|msg| eprintln!("[18022 log] {msg}")));
-    l
+    let persist_hook = {
+        let p = Arc::clone(&persister);
+        Arc::new(FnPersistHook(Box::new(move || {
+            p.persist();
+            Ok(())
+        })))
+    };
+    // 手动 unlock 经 wire-worker 队列（决策 5）：HTTP /unlock handler 投 Job::Unlock + 等
+    // 一次性 reply channel 回灌 UnlockOutcome（worker 已退/panic → 退化 wire-failure，不永等）。
+    let unlock_dispatch: Arc<dyn control::UnlockDispatch> =
+        Arc::new(WorkerUnlockDispatch { job_tx: job_tx.clone() });
+    let ctrl_server = control::Server::with_dispatch(
+        cfg.clone(),
+        env!("CARGO_PKG_VERSION"),
+        Some(automation.share()), // handler 拨动这一 handle；与 persister/banner 读的同一组原子
+        Some(persist_hook),
+        Some(pusher),
+        unlock_dispatch,
+    );
+    let http_handler: Arc<dyn dooraccess_rs::httpx::Handler> = Arc::new(ctrl_server.handler());
+    let http_server = Arc::new(dooraccess_rs::httpx::server::Server::new());
+    let http_addr = format!("{}:{}", cfg.listen.addr, cfg.listen.port);
+    let http_thread = {
+        let srv = Arc::clone(&http_server);
+        let addr = http_addr.clone();
+        let handler = Arc::clone(&http_handler);
+        std::thread::Builder::new()
+            .name("http8080".into())
+            .spawn(move || -> Result<(), String> {
+                let listener = std::net::TcpListener::bind(&addr)
+                    .map_err(|e| format!("http8080: bind {addr}: {e}"))?;
+                match srv.serve(listener, handler) {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        // ServerClosedError 是 graceful shutdown 正常返回，非 fatal。
+                        if e.downcast_ref::<dooraccess_rs::httpx::server::ServerClosedError>().is_some() {
+                            Ok(())
+                        } else {
+                            Err(format!("http8080: {e}"))
+                        }
+                    }
+                }
+            })?
+    };
+    logf(stderr, &format!("http8080: listening on {http_addr}"));
+
+    // ── banner（§7.1：automation flag 加载之后渲染部署参数 + flag 最终值与来源）──
+    render_banner(cfg, env!("CARGO_PKG_VERSION"), &mut |m| logf(stderr, m));
+    logf(
+        stderr,
+        &format!(
+            "automation: auto_unlock={} auto_hangup={} (source={flag_source})",
+            on_off(automation.load_auto_unlock()),
+            on_off(automation.load_auto_hangup()),
+        ),
+    );
+
+    // ── startup push（§7.2 automation_state + §7.3 diagnosis；均 banner 之后、detached）──
+    // automation_state：两 flag 用字符串 "true"/"false" 编码（HACS 静默重启后收敛）。
+    daemon::spawn_push(
+        &push_tracker,
+        Arc::clone(&push_client),
+        Arc::clone(&shutdown),
+        "automation_state".into(),
+        vec![
+            ("auto_unlock".into(), bool_str(automation.load_auto_unlock())),
+            ("auto_hangup".into(), bool_str(automation.load_auto_hangup())),
+        ],
+    );
+    // diagnosis：detached 线程内先 sleep ~500ms 站稳再 push；延迟期 honor shutdown。
+    daemon::spawn_diagnosis_push(
+        &push_tracker,
+        Arc::clone(&push_client),
+        Arc::clone(&shutdown),
+        std::time::Duration::from_millis(500),
+    );
+
+    logf(stderr, "dooraccess-rs up (M1.5: listeners + http + worker + automation)");
+
+    // 阻塞到 SIGTERM/SIGINT，或 HTTP 线程提前结束（§9.3：bind 失败等 fatal——HTTP 是必备控制
+    // 面，其线程早退即视为 fatal，不等信号、走 shutdown 排序后非零退出码）。listener 线程提前
+    // 退出**不**进此条件（listener 失败非致命，HTTP-only 模式继续，锚 Go main.go:244-273）。
+    loop {
+        if shutdown_requested() {
+            logf(stderr, "shutdown signal received, draining");
+            break;
+        }
+        if http_thread.is_finished() {
+            logf(stderr, "http8080 thread exited (fatal: bind/serve failure), draining");
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    // ── 钉死 shutdown 排序（决策 8）──
+    // ① 置位 shutdown（listener recv / 在飞 unlock / push 线程观察）。
+    shutdown.store(true, Ordering::SeqCst);
+
+    // ② 先 join listener 线程（各于下个 SO_RCVTIMEO ~500ms wakeup 退出）。
+    //    join 完即无新 OnDetect → 无新门铃 push spawn（关 RC-F1 窗口）。
+    for t in listener_threads {
+        let _ = t.join();
+    }
+
+    // ③ 投 Job::Shutdown 哨兵（容忍 worker 已死 SendError，禁 unwrap）→ join worker。
+    let _ = daemon::submit_job(&job_tx, Job::Shutdown);
+    let _ = worker.join();
+
+    // ④ shutdown HTTP server（拒新连接 + 等在飞 handler）→ join HTTP 线程。
+    //    ④ 须先于 ⑤（spec：所有在飞 handler 结束后再 join push，否则晚到 handler push 越过 ⑤）。
+    let _ = http_server.shutdown(Some(std::time::Duration::from_secs(5)));
+    let http_result = http_thread.join();
+
+    // ⑤ join 残留 detached push 线程（排空）。
+    push_tracker.join_all();
+
+    // fatal 上报（§9.3）：HTTP 线程返 Err（bind 失败 / serve 非 graceful 错）→ run 返 Err →
+    // main_impl 映射非零退出码（1）。listener 失败不进 fatal（HTTP-only 继续，上面 join 即吞）。
+    // HTTP 线程 panic：已 join，best-effort 不阻塞退出（视为干净，避免 panic 掩盖 shutdown）。
+    match http_result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => Ok(()),
+    }
 }
 
-/// join 一个 listener 线程，忽略 panic（撤离阶段尽力收尾，不让收尾失败掩盖 exit code）。
-fn join_quietly(h: thread::JoinHandle<()>) {
-    let _ = h.join();
+/// 真 wire 注入（决策 5 / §4.2）：wire-worker 跑 unlock job 时单次三步握手用的
+/// [`dooraccess_rs::unlock::UnlockWire`] 实现 = [`sender::WireSenderAdapter`]（底层
+/// `wire_sender::Sender` 真发 18022 帧）。HTTP 路径 per-attempt cap=默认 5s、retry=1s×8、
+/// 总 cap=10s 由 worker 的 [`daemon::run_worker`] 注入。
+fn worker_wire(cfg: &Config) -> Arc<dyn dooraccess_rs::unlock::UnlockWire> {
+    Arc::new(dooraccess_rs::sender::WireSenderAdapter::new(
+        wire_sender::Sender {
+            iface: cfg.iface.clone(),
+            timeout: Some(std::time::Duration::from_secs(5)),
+            local_ip: None,
+        },
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// DetachedPusher：control.rs Pusher → daemon spawn_push（决策 3：业务 push off-worker）
+// ---------------------------------------------------------------------------
+
+/// 把 control.rs 的同步 `Pusher::push` 适配为 detached `spawn_push`（决策 3：手动 unlock 的
+/// business-result push 走 detached 线程，off wire-worker；锚 Go `asyncPush`）。
+struct DetachedPusher {
+    client: Arc<HaPushClient>,
+    shutdown: Arc<AtomicBool>,
+    tracker: PushTracker,
+}
+
+impl Pusher for DetachedPusher {
+    fn push(&self, event: &str, fields: &[(&str, &str)]) {
+        let owned: Vec<(String, String)> = fields
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        daemon::spawn_push(
+            &self.tracker,
+            Arc::clone(&self.client),
+            Arc::clone(&self.shutdown),
+            event.to_string(),
+            owned,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// banner + 小工具（§7.1）
+//
+// 注：automation flag 加载（load_automation_flags）、OnDetect 门铃 builder
+// （build_listen18022）、号码查询 callback（build_number_query_callback）、手动 unlock
+// → wire-worker 派发缝（WorkerUnlockDispatch）等纯逻辑编排 helper 已上移到
+// `dooraccess_rs::orchestration`，使 e2e 测真生产函数（G4 FIX 问题 B）。main.rs 只剩薄
+// 入口 + 线程编排。
+// ---------------------------------------------------------------------------
+
+/// 渲染启动 banner（部署参数）到 syslog（锚 Go `info.RenderBanner`；info.rs 仅 `build`，
+/// 故 banner 行在此组装——语义等价：一眼看完部署参数）。
+fn render_banner(cfg: &Config, version: &str, logf: &mut dyn FnMut(&str)) {
+    let sd = info::build(Some(cfg), version, true);
+    logf(&format!(
+        "banner: dooraccess-rs {} (brand={}, pid={})",
+        sd.version, sd.brand, sd.pid
+    ));
+    logf(&format!(
+        "banner: monitor={} stations={} iface={}",
+        sd.monitor,
+        sd.stations.len(),
+        cfg.iface
+    ));
+    logf(&format!(
+        "banner: listen={}:{} video.forward={}",
+        cfg.listen.addr, cfg.listen.port, cfg.video.forward
+    ));
+    if let Some(reachable) = sd.hass_reachable {
+        logf(&format!("banner: hass_reachable={reachable}"));
+    }
+}
+
+/// bool → "on"/"off"（banner 用；锚 Go `onOff`）。
+fn on_off(b: bool) -> &'static str {
+    if b {
+        "on"
+    } else {
+        "off"
+    }
+}
+
+/// bool → "true"/"false" String（automation_state push 字段编码；锚 Go `strconv.FormatBool`）。
+fn bool_str(b: bool) -> String {
+    if b {
+        "true".to_string()
+    } else {
+        "false".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// flag 解析：默认路径 / `--config <p>` / `--config=<p>`。
+    #[test]
+    fn parse_flags_default_and_explicit() {
+        assert_eq!(
+            parse_flags(&["bin".into()]).unwrap(),
+            DEFAULT_CONFIG_PATH.to_string()
+        );
+        assert_eq!(
+            parse_flags(&["bin".into(), "--config".into(), "/tmp/x.ini".into()]).unwrap(),
+            "/tmp/x.ini"
+        );
+        assert_eq!(
+            parse_flags(&["bin".into(), "--config=/tmp/y.ini".into()]).unwrap(),
+            "/tmp/y.ini"
+        );
+    }
+
+    /// flag 解析失败 → Err（main_impl 映射退出码 2）。
+    #[test]
+    fn parse_flags_errors() {
+        assert!(parse_flags(&["bin".into(), "--config".into()]).is_err()); // 缺值
+        assert!(parse_flags(&["bin".into(), "--bogus".into()]).is_err()); // 未知 flag
+    }
+
+    /// main_impl：flag 解析失败 → 退出码 2，不加载 config / 不启线程。
+    #[test]
+    fn main_impl_flag_error_returns_2() {
+        let mut sink = Vec::new();
+        let code = main_impl(&["bin".into(), "--unknown".into()], &mut sink);
+        assert_eq!(code, 2);
+    }
+
+    /// main_impl：config 不存在 → 退出码 1（区别于 flag 错的 2）。
+    #[test]
+    fn main_impl_config_missing_returns_1() {
+        let mut sink = Vec::new();
+        let code = main_impl(
+            &[
+                "bin".into(),
+                "--config".into(),
+                "/nonexistent/zzz_no_such_config.ini".into(),
+            ],
+            &mut sink,
+        );
+        assert_eq!(code, 1);
+        let out = String::from_utf8(sink).unwrap();
+        assert!(out.contains("load config"), "应 log config 加载失败: {out}");
+    }
 }

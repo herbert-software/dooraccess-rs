@@ -8,7 +8,7 @@ MIPS_TARGET  := mips-unknown-linux-musl
 WRAPPER      := $(CURDIR)/scripts/link-mips.sh
 MIPS_RUSTFLAGS := -C linker-flavor=ld -C linker=$(WRAPPER) -C relocation-model=static \
                   -Z unstable-options -C panic=immediate-abort
-MIPS_BIN := target/$(MIPS_TARGET)/release/dooraccess-rs-probe
+MIPS_BIN := target/$(MIPS_TARGET)/release/dooraccess-rs
 
 .PHONY: build test fmt fmt-check clippy fetch-sdk build-mips verify-mips clean
 

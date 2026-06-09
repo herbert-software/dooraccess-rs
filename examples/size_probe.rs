@@ -4,6 +4,11 @@
 // 阻止 dead-code elimination 剥除 lib，使交叉编译出的 MIPS binary 字节数反映
 // 「Phase1 模块真正链入时的体型」（probe binary 因 main 不 use lib 测不出增量）。
 // 仅用于 `cargo build --example size_probe`，不进生产路径。
+//
+// 体型探针里把线程/socket-spawn 的骨架入口（run_worker/spawn_push/build_listen18022 等）
+// 取**函数指针**经 black_box 防 DCE，故须显式写出其多参签名——这些签名复杂度是测量手段
+// 固有的（要精确指向那个函数项），非生产代码可简化的对象，故在本 example 放宽。
+#![allow(clippy::type_complexity)]
 use std::hint::black_box;
 
 fn main() {
@@ -119,6 +124,77 @@ fn main() {
         Some([10, 0, 0, 1]),
     )));
     black_box(&bye_filter);
+
+    // --- Phase4 骨架模块链入（daemon worker/job/push + orchestration + Persister）---
+    // 本 change 新增/移植的代表函数。线程/socket-spawn 的入口（run_worker/spawn_push 等）
+    // 取函数指针经 black_box 防 DCE（不在体型探针里真起线程）；纯函数直接调用。
+
+    // daemon: PushTracker 运行期回收 + 取消/排空骨架函数指针。
+    let tracker = black_box(dooraccess_rs::daemon::PushTracker::new());
+    black_box(tracker.len());
+    black_box(tracker.is_empty());
+    tracker.join_all();
+    black_box(&tracker);
+    let run_worker_fp: fn(
+        dooraccess_rs::daemon::WorkerDeps,
+        std::sync::mpsc::Receiver<dooraccess_rs::daemon::Job>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) = dooraccess_rs::daemon::run_worker;
+    black_box(run_worker_fp as usize);
+    let spawn_push_fp: fn(
+        &dooraccess_rs::daemon::PushTracker,
+        std::sync::Arc<dooraccess_rs::ha_push::HaPushClient>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        String,
+        Vec<(String, String)>,
+    ) = dooraccess_rs::daemon::spawn_push;
+    black_box(spawn_push_fp as usize);
+    let submit_job_fp: fn(
+        &std::sync::mpsc::Sender<dooraccess_rs::daemon::Job>,
+        dooraccess_rs::daemon::Job,
+    ) -> Result<(), &'static str> = dooraccess_rs::daemon::submit_job;
+    black_box(submit_job_fp as usize);
+
+    // orchestration: load_automation_flags（三级优先级）+ number-query callback + listen18022 builder。
+    let cfg = black_box(dooraccess_rs::config::Config::default());
+    let mut sink = |_s: &str| {};
+    let flags = black_box(dooraccess_rs::orchestration::load_automation_flags(
+        black_box("/nonexistent/automation.state"),
+        &cfg,
+        &mut sink,
+    ));
+    black_box(&flags);
+    let nq_cb = black_box(dooraccess_rs::orchestration::build_number_query_callback(
+        &cfg,
+    ));
+    black_box(nq_cb.is_some());
+    let unavail = black_box(dooraccess_rs::orchestration::worker_unavailable_outcome());
+    black_box(&unavail);
+    black_box(dooraccess_rs::orchestration::ipv4_str(black_box([10, 0, 0, 1])));
+    black_box(dooraccess_rs::orchestration::parse_ipv4(black_box("10.0.0.1")));
+    let build18022_fp: fn(
+        &dooraccess_rs::config::Config,
+        Vec<String>,
+        std::sync::Arc<dooraccess_rs::ha_push::HaPushClient>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        dooraccess_rs::daemon::PushTracker,
+    ) -> Option<dooraccess_rs::listen18022::Listener> =
+        dooraccess_rs::orchestration::build_listen18022;
+    black_box(build18022_fp as usize);
+
+    // automation_state Persister: 原子写 + 纯值去重（取构造/persist/write_atomic 防 DCE）。
+    let persister = black_box(dooraccess_rs::automation_state::Persister::new(
+        std::path::PathBuf::from("/nonexistent/automation.state"),
+        Box::new(|| (true, false)),
+        None,
+    ));
+    persister.persist();
+    black_box(&persister);
+    let write_atomic_fp: fn(
+        &std::path::Path,
+        dooraccess_rs::automation_state::State,
+    ) -> std::io::Result<()> = dooraccess_rs::automation_state::write_atomic;
+    black_box(write_atomic_fp as usize);
 
     println!("size_probe ok");
 }
