@@ -21,7 +21,7 @@ use crate::daemon::{self, Job, PushTracker, UnlockJob};
 use crate::ha_push::HaPushClient;
 use crate::listen18022::{self, DetectedFrame};
 use crate::listen6672;
-use crate::unlock::{UnlockOutcome, WireKind};
+use crate::unlock::{UnlockOutcome, WireKind, UNLOCK_RETRY_INTERVAL};
 use crate::wire_sender;
 
 // ---------------------------------------------------------------------------
@@ -278,6 +278,9 @@ impl UnlockDispatch for WorkerUnlockDispatch {
             target_ip: target_ip.to_string(),
             target_port,
             reply: reply_tx,
+            // 手动 `/unlock`：HTTP 计时（None + 1s 退避），行为不变。
+            per_attempt_timeout: None,
+            retry_interval: UNLOCK_RETRY_INTERVAL,
         });
         // 投 job：容忍 SendError（worker 已退 → 退化 wire-failure，禁 unwrap，决策 8）。
         if daemon::submit_job(&self.job_tx, job).is_err() {

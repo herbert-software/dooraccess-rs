@@ -28,8 +28,10 @@ use dooraccess_rs::ha_push::HaPushClient;
 use dooraccess_rs::listen18022;
 use dooraccess_rs::listen6672;
 use dooraccess_rs::orchestration::{
-    build_listen18022, build_number_query_callback, load_automation_flags, WorkerUnlockDispatch,
+    build_listen18022, build_number_query_callback, load_automation_flags,
+    parse_stations_to_ip_map, WorkerUnlockDispatch,
 };
+use dooraccess_rs::self_unlock;
 use dooraccess_rs::{automation_state, info, wire_sender};
 
 /// 主配置默认路径（锚 Go `defaultConfigPath`）。
@@ -280,7 +282,16 @@ fn run<W: Write>(
     let worker_listener: Option<Arc<dyn dooraccess_rs::listen18022::Subscribable>> = listener18022
         .as_ref()
         .map(|l| Arc::clone(l) as Arc<dyn dooraccess_rs::listen18022::Subscribable>);
-    let worker_deps = WorkerDeps::new(worker_wire(cfg), worker_listener);
+    // auto-hangup 单帧 wire 出站缝（② 决策 2：worker 发 req=708 preview-stop）。注入
+    // wire_sender::Sender（与 unlock 路径同款 iface，已认证 wire 出站，非新 socket/BE 面）；
+    // 否则 Job::Hangup 走 None 分支只 log skip 不发帧。
+    let worker_deps = WorkerDeps::new(worker_wire(cfg), worker_listener).with_hangup_wire(
+        Arc::new(wire_sender::Sender {
+            iface: cfg.iface.clone(),
+            timeout: Some(std::time::Duration::from_secs(5)),
+            local_ip: None,
+        }),
+    );
     let worker_shutdown = Arc::clone(&shutdown);
     let worker = std::thread::Builder::new()
         .name("wire-worker".into())
@@ -313,6 +324,25 @@ fn run<W: Write>(
     } else {
         logf(stderr, "listen18022: no slaves resolved, will not start");
     }
+
+    // ── self-unlock 消费者线程（②：ring→消费者→Job::Unlock，design 决策 1）──
+    // 经 listener18022.subscribe(filter) 注册 + 起独立单消费者线程 drain；debounce/flag-gate/
+    // 产 Job 全在消费者线程顺序完成（多 slave dispatch 由 bounded channel 汇成单流，无 TOCTOU）。
+    // 钉死 shutdown 排序里：listener-join 之后、Job::Shutdown 哨兵之前 join 本 handle。
+    let self_unlock_consumer: Option<JoinHandle<()>> = listener18022.as_ref().and_then(|l| {
+        let deps = self_unlock::SelfUnlockDeps::try_new(
+            cfg,
+            parse_stations_to_ip_map(cfg),
+            job_tx.clone(),
+            Arc::clone(&push_client),
+            push_tracker.clone(),
+            Arc::clone(&shutdown),
+            automation.share(),
+            |m| logf(stderr, m),
+        )?;
+        // spawn_consumer 返 Option（spawn 失败→None，self-unlock 静默禁用）；and_then 直接展平。
+        self_unlock::spawn_consumer(l.as_ref(), deps, |m| logf(stderr, m))
+    });
 
     // listen6672：号码查询 callback 安装（§8.1/8.2）+ 起线程（on_ring=None 与 Go 一致——
     // ring 触发 self-unlock 属姊妹 change ②，骨架不消费 ring 帧产 Unlock job）。
@@ -468,6 +498,14 @@ fn run<W: Write>(
     //    join 完即无新 OnDetect → 无新门铃 push spawn（关 RC-F1 窗口）。
     for t in listener_threads {
         let _ = t.join();
+    }
+
+    // ②.5 join self-unlock 消费者线程（钉死排序新增插步，design 决策 1）：listener-join
+    //    之后、Job::Shutdown 哨兵之前。先于哨兵 join 保证「哨兵后无新 Unlock job 入队」的
+    //    关窗不变量。消费者 recv_timeout(20ms) 轮询观察 shutdown 置位（①已 store），≤一个
+    //    poll + ε 退出（非裸 recv，不死锁）；退出调 sub.cancel() 清理。
+    if let Some(c) = self_unlock_consumer {
+        let _ = c.join();
     }
 
     // ③ 投 Job::Shutdown 哨兵（容忍 worker 已死 SendError，禁 unwrap）→ join worker。

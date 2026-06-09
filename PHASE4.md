@@ -178,6 +178,182 @@ httpx server graceful shutdown 死锁修（Phase 2 遗留）+ orchestration help
 剩余收尾：
 
 - `dooraccess-rs` 子仓 Phase 4 骨架 git commit + tag（git 写操作留人工，task 12.3）。
-- 姊妹 change ②：ring 触发的 self-unlock 消费者（同一 OnDetect 扩展 filter+debounce→`Job::Unlock`）/
-  `ExecuteUnlockFromRing` 测量 / 双触发消除 / auto-hangup 外机 req=708 延迟发送（`Job::Hangup`）。
+- 姊妹 change ② `port-rust-self-unlock-consumer`：见下文 §9-§14（已落地）。
 - `send_udp_response` / `resolve_iface_list` 的新 BE 面 Phase 7 真机验（与 BE-listener 一并）。
+
+---
+
+# Phase4 ② ring 触发 self-unlock 消费者移植记录
+
+> 变更：`port-rust-self-unlock-consumer`（OpenSpec，spec-driven，姊妹 change ②）
+> 日期：2026-06-09
+> 范围：在 ① 已交付的 daemon 骨架（listener 线程 + 单 wire-worker + job 队列 + 单 `Arc<AtomicBool>` +
+> detached push）之上，接 **ring → self-unlock 消费者**（filter+debounce→`Job::Unlock`）/
+> `ExecuteUnlockFromRing` 测量 + event=unlock 回灌 / 双触发消除（daemon 侧单边）/ auto-hangup 外机
+> req=708 延迟发送（`Job::Hangup`）。对标 Go `consumeSelfUnlock`（main.go:538）/
+> `scheduleOutdoorHangup`（:681）/ `ExecuteUnlockFromRing`（handlers.go:266）。
+> **不**接 video（Phase 5）；**不**部署 hAP（Gate = dev mock-e2e + 本地 MIPS 体型测量，Phase 7 才灰度）。
+
+## 9. 并发模型落地（Subscribable 消费者线程，决策 1）
+
+listen18022 dispatch 是 **per-slave 多线程**（`run_platform` `thread::scope`），`on_detect` 是
+`Fn + Send + Sync` 跨 slave 并发调用——把可变 debounce map 放其中既数据竞争又编译不过（`Fn` 不可改捕获）。
+故 self-unlock 走 `listener.subscribe(filter)`：
+
+| 关注点 | 落地 |
+|---|---|
+| filter（`req==704 && dst==本机室内机IP && src∈outdoorByIP`，锚 Go main.go:581-590） | 只读不可变捕获 indoor_ip / outdoor_ips 集合，在多线程 dispatch 路径同步跑、**无状态** |
+| N 个 per-slave dispatch 汇成单流 | bounded `sync_channel(8)`（满则 `try_send` silent drop，防慢消费者卡 dispatch 主路径） |
+| debounce / flag-gate / 产 Job | 全在**独立单消费者线程**顺序完成（真单线程、`HashMap<outdoorURI, Instant>` 无锁） |
+| drain + shutdown 观察 | `recv_timeout(20ms)`：`Ok` 处理 / `Timeout` 查 `shutdown` 置位则 break / `Disconnected` clean break（不 log 错误）；退出统一调一次 `sub.cancel()`（id-幂等）。**禁裸 `recv()`**——Listener `thread::scope` 借 `&self`，listener-join 后仍持 tx→不 Disconnected→主线程 join 死锁 |
+
+**构造期解析失败禁用**（`SelfUnlockDeps::try_new`，锚 Go main.go:555-576）：构造期解析 outdoor_by_ip /
+calleeBCD（cfg.SIP）/ 本机室内机 indoorIP 各一次；calleeBCD 或 indoorIP 失败 → 返 `None`（消费者不启动、
+self-unlock 禁用），log 一行、**不 panic、不部分启动**；daemon 其余模块（手动 unlock / 门铃 push）继续运行。
+
+## 10. debounce + flag gate + 失败隔离（决策 1 续）
+
+- **处理顺序钉死**（spec「flag gate」）：dequeue → 读运行时 `auto_unlock`（atomic，off 即 return **不写
+  debounce**）→ debounce 检查 → debounce 写（**起步即写**，在任何可失败操作之前，对齐 main.go:645）→
+  解析外机 URI（失败 log+跳过）→ 触发。flag off 不占 debounce 窗（否则污染窗口误 debounce 后续 flag-on ring）。
+- **debounce 窗** = `unlock::UNLOCK_TOTAL_CAP + margin`（不硬编 12s）。`UNLOCK_TOTAL_CAP` 是 const；
+  margin 用 test-tunable static（`set_debounce_margin_ms_for_test` 让 mock-e2e 缩 ms 级），生产 ~2s。
+  「在飞」= 已 dequeue 并过 gate 之后；拨 off 只影响后续 dequeue。
+- **per-ring 失败隔离 = 防御式编码（非 catch_unwind）**：release profile `panic="abort"` 下 `catch_unwind`
+  是 no-op，故 Go inner-closure `defer recover()` 不可直译。消费者用可失败操作返 `Result` → log + 跳过该
+  ring 继续 drain；ring 处理路径 + 计时线程**无** `unwrap`/`expect`/越界/`panic!`/整数溢出源。诚实边界：
+  test profile 默认 unwind，5.9 e2e 只证「Result 跳过逻辑正确」，**不证** release abort 不发生——后者靠
+  §13 静态 gate（模块级 clippy deny + grep）。
+- **channel-drop 对账**：`dequeueCount`/`triggeredCount`（dequeue−triggered=debounce_skips），stop 时 log
+  （锚 main.go:597/604）；向 worker 投 job 的 `SendError` 容忍禁 unwrap。丢帧只可能在 listener→consumer
+  的 bounded `sync_channel(8)`，**非** consumer→worker 的 Job mpsc。
+
+## 11. ExecuteUnlockFromRing + event=unlock + ring 路径 fail-fast probe 计时
+
+`execute_unlock_from_ring`（锚 Go handlers.go:266）：投 `Job::Unlock` 给骨架 worker（M1.5 wire 单点）+
+一次性 reply channel 等 `UnlockOutcome`（worker 已退/panic → SendError/RecvError → 退化 wire-failure，**不
+永等、不 panic**）+ t_ms 测量（起点 = 消费者从 sub channel **取帧的 `Instant`**，等价 Go `ringAt`
+main.go:621；`recv_timeout` 帧到达立即返回，t_ms 精度不受 poll 影响）。
+
+- **仅成功 push event=unlock**（result=0 时 from=外机URI / to=室内机URI / result=0，经骨架 detached push
+  线程 best-effort）；**非 OK 结果**（silent-FIN→-103 / wire-failure）**不 push**，5.8 e2e 双支断言（锚 Go
+  `TestExecuteUnlockFromRing_SuccessPushesUnlockEvent` + `_FailureNoPush`）。
+- **ring 路径 fail-fast probe 计时**（headline ground-truth「ring→开门 ~1.3s」成因）：`UnlockJob` 新增计时
+  字段 `per_attempt_timeout: Option<Duration>` + `retry_interval: Duration`；ring 路径投
+  `Some(SELF_UNLOCK_PROBE_TIMEOUT=800ms)` + `SELF_UNLOCK_PROBE_INTERVAL=200ms`（每步到点切断重探，揭穿
+  首帧阻塞 ~3.7s 假象——见 memory `retry_unlock_v0_8_1_baseline`），手动 `/unlock` 路径仍投 `None` +
+  `UNLOCK_RETRY_INTERVAL=1s`（HTTP 计时不变）。worker arm 用 job 携带值而非硬编。锚 Go handlers.go:283。
+
+## 12. auto-hangup 外机目标 bye（detached 计时 → 即时 Job::Hangup → worker，决策 2）
+
+result=0 + 运行时 `auto_hangup` on → `schedule_outdoor_hangup` 起 **detached 计时线程**：
+
+- **可中断分片轮询延迟**（~2s test-tunable）：`let start=Instant::now(); loop{ if shutdown {return} if
+  start.elapsed()>=delay {break} park_timeout(20ms) }`——到点判据用单调 `Instant::elapsed()` 累计（**非**
+  分片计数：park_timeout spurious 提前会让计数法误判早发；援引 unlock.rs:204 ThreadSleeper 先例）；
+  shutdown 置位即放弃（不投不发）。**禁单次 `sleep(2s)`**（拖慢 teardown 至 2s）。
+- **worker 唯一发 wire**：计时线程到点投**即时** `Job::Hangup{outdoor_bcd, monitor_bcd, outdoor_ip,
+  outdoor_port}`，由 **worker** 调新增 `wire18022::build_stop_frame(outdoorBCD, monitorBCD)` 发**外机目标**
+  req=708 preview-stop 帧（守 M1.5 wire 出站单点；计时线程不发 wire）。
+- **MUST 用 preview-stop 帧、禁自指 bye**：Go 实证（handlers.go:615-621）室内机自指 `build_bye_frame`
+  对推流外机**无终止作用**，用错帧 = auto-hangup 真机不工作。`build_stop_frame` 字节由 golden 单测逐字节
+  对齐 Go `video.BuildStopFrame`。
+- **best-effort 边界**：投 `Job::Hangup` 的 SendError 容忍禁 unwrap；若晚于 `Job::Shutdown` 哨兵到 worker
+  则丢弃，daemon **不**为它延迟 shutdown、**不**绕 worker 直发 wire（锚 Go main.go:680/691-694）。延迟在
+  detached 计时线程，**不** head-of-line 阻塞排队的 Unlock。不触碰 debounce（按值持 BCD/IP）。
+
+**双触发消除（daemon 侧单边契约）**：self-unlock 完全由 daemon 内部 ring→消费者→job 驱动，不依赖 HACS
+`/unlock` 回调；本 change 只保证 daemon 侧不引入第二触发源，端到端「ring 只开一次门」还依赖 HACS v0.4.0
+遥控器重写（删 `_on_ring`），**非本 change 单方达成**（与 Go 同构）。
+
+## 13. 范围红线核查 + 静态 gate + 新 BE 面登记
+
+### 13.1 范围红线（task 6.3，`git diff HEAD` 佐证）
+
+- **未改骨架核心机制**：并发模型 / 串行 / 钉死 shutdown 排序不变量 / Persister 原子写均未触碰。
+  `src/self_unlock.rs` 是**新文件**（untracked，不在 `git diff HEAD` 里），故对骨架的改动仅落在下列已 track 文件：
+- **(a) `Job::Hangup` match arm = 授权扩展**（骨架 spec:23 **显式命名**预留「未来 ② 的 `Hangup`」）：
+  `daemon.rs` 仅**新增** `Hangup` arm + `HangupWire` trait + `WorkerDeps::with_hangup_wire` 注入缝；worker
+  loop 核心（`for job in rx`，`Unlock => execute_unlock`，`Shutdown => break`）**未改**。
+- **(b) 消费者线程 join 插步 = spec:104 未命名新增步**：`main.rs` 在钉死排序里 listener-join **之后**、
+  `Job::Shutdown` 哨兵**之前** join 消费者 handle。正当性靠「不破坏 spec:104 既有 ①-⑤ 不变量（仍是
+  set-flag→关窗→哨兵→排空）+ 5.10 e2e 证消费者 join 不死锁」论证，**非**援引 spec:104 既有授权。
+- `wire18022.rs` diff = **86 insertions / 0 deletions**（纯加 `build_stop_frame` + golden，无既有 wire 代码触碰）。
+- `orchestration.rs`：手动 `/unlock` 路径保持 HTTP 计时（`None` + `UNLOCK_RETRY_INTERVAL`），行为不变。
+- **无 video**（Phase 5 OUT）；**无 hAP 部署**（认证止于 dev mock-e2e + 本地 MIPS 体型测量，真实物理门开
+  留 Phase 7：ground-truth = 外机播报 + 物理门开，非 daemon log）。
+
+### 13.2 静态 gate（task 6.5，scope 限 self_unlock.rs 新模块）
+
+`src/self_unlock.rs` 模块级 `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing,
+clippy::arithmetic_side_effects)]`（lines 28-31）。grep 核实**生产区（line 28-503，首个 `#[cfg(test)]`
+在 504）无** `panic!`/`unreachable!`/`.unwrap()`/`.expect(`/`.lock().unwrap()`——核 ring 处理路径
+（`handle_ring`）+ 计时线程（`schedule_outdoor_hangup`）无 abort 源。模块用 lock-free atomic + 单线程
+消费者状态，**无 internal-mutex `.lock().unwrap()`** 需窄 `#[allow]`。test mod（`mod tests` / `mod e2e`）
+有窄 `#[allow]` 四件套 + 理由注释（test profile unwind，可接受）。`cargo clippy --all-targets` 零警告。
+
+### 13.3 BE 面登记（task 6.4，对齐骨架 spec:178-180）
+
+req=708 hangup 经 worker 调**新增** `wire18022::build_stop_frame`（移植 Go `video.BuildStopFrame`：
+preview-shape req=708 / 分隔符 `=` / 尾 `80 00 00 00 02 00 00 01` / 36B）发出。该新增是 **wire-encode 代码**
+（纯 body 字节组装、无 socket/NBO，须 golden 单测逐字节对齐 Go——`wire18022.rs` `build_stop_frame_golden`
+已守），但**发送经 worker 已认证 wire 出站路径**（`wire_sender::Sender::send_context`），**非新 socket/字节序
+BE-socket 面**。故 ② 的 BE 风险面**仍零**，defer-Phase-7 结论不变。**不**把 `build_stop_frame` 误称
+「骨架已交付/复用既有」——它是 ② 新增的 wire-encode 代码，BE-socket 面才是「零新增」。
+
+## 14. mock-e2e + 构建 gate 结果（dev 认证，行为锚 Go selfunlock 测试集）
+
+`cargo test`（非沙箱）全通过：
+
+- **lib 单测 200 passed**（① 180 + ② self_unlock：debounce 窗派生 / hangup_delay tunable / parse_outdoor_uri）
+- **`tests/daemon_e2e.rs` 19 passed**（① 16 + ② 3 整合）；self_unlock 模块内 18 个 mock-e2e（5.1-5.11）：
+  - `t5_1` ring 触发自开锁经 subscribe→消费者→worker（wire 恰调一次）
+  - `t5_2` debounce 窗内重复 ring 仅触发首次 / `t5_3` flag off 跳过不写 debounce + 在飞那次跑完
+  - `t5_4` 无 HACS 回调仍单次自开锁（daemon 单边，不声称端到端）
+  - `t5_5` auto-hangup 发 req=708 preview-stop 帧逐字节对齐 `build_stop_frame` + shutdown 期间计时线程
+    放弃不投 + hangup 延迟不阻塞新 Unlock；`t5_5b` build_stop_frame golden
+  - `t5_6` dst/src 收紧（非本机室内机 dst / 未配置 src 不触发）
+  - `t5_7` 多 slave 并发 debounce（≥2 thread 并发 dispatch 共享 Listener → 仅一个 Job::Unlock，无 TOCTOU）
+  - `t5_8` 包装层 × 失败分支（成功 push event=unlock / 非 OK 不 push，双支断言；push 断言须沙箱外 loopback）
+  - `t5_9` per-ring 失败隔离（malformed URI → Result 跳过、后续 ring 仍处理）
+  - `t5_10` **shutdown 不死锁**（消费者 park 在 recv_timeout 时 shutdown → ≤poll+ε join 完成）
+  - `t5_11` Job::Hangup 晚于哨兵 → SendError 容忍、不 panic / 不延迟 shutdown
+- **跨语言 golden + Phase 1/2/3 集成 36 passed**（含 wire `build_stop_frame_golden`），全不回归
+- **`cargo clippy --all-targets` 零警告**
+
+**构建 gate**：
+
+- **crate gate（task 6.1）**：`cargo tree -e normal --prefix none | sort -u` → 外部 crate **仅 `libc` v0.2.186**
+  （dev-dep 不算）；拒 tokio/crossbeam/mio/nix/pnet/socket2。
+- **MIPS 交叉编译（task 6.2）**：`make build-mips` + `make verify-mips` 通过——ELF 32-bit **MSB** MIPS /
+  **statically linked** / **FP ABI Soft float (0x3)**。**MIPS 可移植性修**：self_unlock 的 test-tunable
+  static 从 `AtomicU64` 改 **`AtomicU32`**（32-bit MIPS 无原生 64-bit 原子，`AtomicU64` 在该 target 不存在 →
+  E0432；ms 值 ~2s 远 < u32::MAX，公开 setter 仍收 u64 边界 `as` 折宽窄）——这正是 build-gate 该抓的可移植性坑。
+
+| 产物 | ① 骨架基线 | **② self-unlock 链入** | `file` / FP ABI |
+|---|---|---|---|
+| size_probe（代表函数链入体型测量载体） | 312,028 | **341,292**（+29,264） | ELF 32-bit MSB MIPS, static, stripped, **Soft float (0x3)** |
+| 真 daemon bin `dooraccess-rs`（实际 ship 物） | 457,004 | **492,284**（+35,280） | ELF 32-bit MSB MIPS, static, stripped, **Soft float (0x3)** |
+
+② size_probe 扩链 `build_stop_frame`（新 wire-encode）/ `spawn_consumer`（消费者线程入口函数指针）/
+`Job::Hangup` 构造，`black_box` 防 DCE。daemon bin 492KB 仍远在 `< 4.0MB` 优先目标内（Go v0.10.0 MIPS
+daemon = 3,997,853 字节，含全部网络/HTTP/video，非同类对比）。
+
+## 15. 结论（②）
+
+`port-rust-self-unlock-consumer`（②）**通过**：Subscribable 消费者线程（filter+debounce+flag-gate+产
+`Job::Unlock`，真单线程无锁）+ 构造期解析失败禁用 + per-ring 防御式失败隔离 + `ExecuteUnlockFromRing`
+（worker 跑 + t_ms 测量 + 仅成功 push event=unlock）+ ring 路径 fail-fast probe 计时（800ms/200ms，
+headline ~1.3s 成因）+ auto-hangup（detached 可中断计时线程 → 即时 `Job::Hangup` → worker 发外机目标
+req=708 preview-stop 帧）+ 双触发消除（daemon 单边）。**cargo test 全过（200 lib + 4 main + 19 daemon_e2e +
+36 golden/集成，0 失败）+ clippy --all-targets 零警告 + crate gate 守住（仅 libc）+ MIPS 交叉编译
+（daemon bin 492KB / size_probe 341KB，均 BE/softfloat/静态）+ 范围红线守住（骨架核心机制未改 / Job::Hangup
+授权扩展 + join 插步 spec:104 新增 / wire18022 纯加 86-0 / 无 video / 无 hAP 部署）+ 新 wire-encode
+`build_stop_frame` 登记为非新 BE-socket 面（BE 风险面仍零，defer Phase 7）+ self_unlock 模块静态 gate
+（模块级 deny + grep 净）**。
+
+剩余收尾：
+
+- `dooraccess-rs` 子仓 ② git commit + tag（git 写操作留人工，task 7.3）。
+- auto-hangup 物理 teardown（req=708 对推流外机的真实终止作用）+ ring→物理门开 ground-truth 留 Phase 7
+  真机验（与 BE-listener / `send_udp_response` 一并；认证 = 外机播报 + 物理门开，非 daemon log）。

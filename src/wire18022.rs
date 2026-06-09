@@ -166,6 +166,35 @@ pub fn build_bye_frame(from_bcd: [u8; 4], to_bcd: [u8; 4]) -> Vec<u8> {
     assemble_frame(&body)
 }
 
+/// 构造 req=708 preview-stop 帧（36B，移植 Go `video.BuildStopFrame`）。
+///
+/// **与自指 [`build_bye_frame`] 的本质区别**：preview-stop 帧用 **preview-shape** body
+/// （分隔符 `=`、尾常量 `80 00 00 00 02 00 00 01`），发到**外机**目标终止其响铃/推流
+/// session。室内机自指 bye 帧（[`build_bye_frame`]，尾 `01 00 00 00 03 00 00 00`，
+/// from==to 室内机自指）对正在推流的外机**无终止作用**（Go `handlers.go:615-621` +
+/// spec `req-708-bye.md` 实证），auto-hangup 用错帧 = 真机不工作。
+///
+/// arg 序对齐 Go `BuildStopFrame(calleeBCD=外机BCD, callerBCD=室内机BCD)`：
+///   - `outdoor_bcd`：首参（calleeBCD 槽）= 外机 BCD
+///   - `monitor_bcd`：次参（callerBCD 槽）= 室内机 BCD
+///
+/// 字节布局（整帧 offset，逐字节锚 Go `video.preview.go` BuildStopFrame）：
+///   - 0-1:   `07 b8`（magic）
+///   - 2-3:   `1e 00`（length = 30 = body.len()，小端）
+///   - 4-5:   `00 00`（reserved）
+///   - 6-19:  `"req=708&query="`（14 ascii，sep = `=` 0x3d）
+///   - 20-23: callee BCD = `outdoor_bcd`
+///   - 24-27: caller BCD = `monitor_bcd`
+///   - 28-35: 固定尾 `80 00 00 00 02 00 00 01`（preview const body）
+pub fn build_stop_frame(outdoor_bcd: [u8; 4], monitor_bcd: [u8; 4]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(30);
+    body.extend_from_slice(b"req=708&query=");
+    body.extend_from_slice(&outdoor_bcd);
+    body.extend_from_slice(&monitor_bcd);
+    body.extend_from_slice(&[0x80, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x01]);
+    assemble_frame(&body)
+}
+
 /// 构造 req=518 变体 appoint 帧（29B）。
 ///
 /// 字节布局（整帧 offset）：
@@ -302,5 +331,74 @@ pub fn validate_response(resp: &[u8], want_req: i64) -> bool {
         519 => body.len() == RESP_519_BODY.len() && body == RESP_519_BODY,
         // 其它 req 编号未在 spec 中规定 body 模板，仅 req 校验。
         _ => true,
+    }
+}
+
+// ── 单测 ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// build_stop_frame golden：逐字节对齐 Go `video.BuildStopFrame(outdoorBCD, monitorBCD)`。
+    ///
+    /// 期望字节由 Go `internal/video/preview.go` BuildStopFrame 布局推导（非猜测）：
+    ///   - 0-1   magic        07 b8
+    ///   - 2-3   length       1e 00  (= 30 = body.len()，小端)
+    ///   - 4-5   reserved     00 00
+    ///   - 6-19  text         "req=708&query="  (sep = 0x3d `=`)
+    ///   - 20-23 callee BCD   外机 BCD (outdoor)
+    ///   - 24-27 caller BCD   室内机 BCD (monitor)
+    ///   - 28-35 const body   80 00 00 00 02 00 00 01
+    #[test]
+    fn build_stop_frame_golden() {
+        let outdoor: [u8; 4] = [0x06, 0x02, 0x00, 0x00];
+        let monitor: [u8; 4] = [0x06, 0x02, 0x11, 0x03];
+        let got = build_stop_frame(outdoor, monitor);
+
+        let want: [u8; 36] = [
+            0x07, 0xb8, // magic
+            0x1e, 0x00, // length = 30 (LE)
+            0x00, 0x00, // reserved
+            b'r', b'e', b'q', b'=', b'7', b'0', b'8', b'&', b'q', b'u', b'e', b'r', b'y',
+            b'=', // "req=708&query=" (sep '=')
+            0x06, 0x02, 0x00, 0x00, // callee BCD = outdoor
+            0x06, 0x02, 0x11, 0x03, // caller BCD = monitor
+            0x80, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x01, // preview const tail
+        ];
+        assert_eq!(
+            got.as_slice(),
+            &want[..],
+            "build_stop_frame 逐字节须等于 Go BuildStopFrame"
+        );
+
+        // 显式断言关键不变量（防回归漂移）。
+        assert_eq!(got.len(), 36, "preview-stop 帧总长须 36B");
+        assert_eq!(
+            &got[28..36],
+            &[0x80, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x01],
+            "preview-shape 尾 8B 须为 80 00 00 00 02 00 00 01（非自指 bye 尾 01 00 00 00 03 00 00 00）"
+        );
+        // 分隔符是 '='（preview-stop，对照 req=704 start 用 '*'）。
+        assert_eq!(got[19], b'=', "分隔符须为 '='（0x3d）");
+        // BCD 落在正确偏移。
+        assert_eq!(
+            &got[20..24],
+            &outdoor[..],
+            "callee BCD 槽 = 外机 BCD（首参）"
+        );
+        assert_eq!(
+            &got[24..28],
+            &monitor[..],
+            "caller BCD 槽 = 室内机 BCD（次参）"
+        );
+
+        // 与自指 bye 帧的尾必须不同（用错帧 auto-hangup 真机不工作）。
+        let bye = build_bye_frame(monitor, monitor);
+        assert_ne!(
+            &got[28..36],
+            &bye[bye.len() - 8..],
+            "preview-stop 尾须区别于自指 bye 尾"
+        );
     }
 }

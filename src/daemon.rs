@@ -33,8 +33,10 @@ use crate::ha_push::HaPushClient;
 use crate::listen18022::Subscribable;
 use crate::unlock::{
     self, Deadline, InstantDeadline, Sleeper, ThreadSleeper, UnlockOutcome, UnlockWire,
-    UNLOCK_RETRY_INTERVAL, UNLOCK_TOTAL_CAP,
+    UNLOCK_TOTAL_CAP,
 };
+use crate::wire18022;
+use crate::wire_sender;
 
 // ---------------------------------------------------------------------------
 // Job enum（决策 3：只含 wire-bound + Shutdown 哨兵；无 Push 变体）
@@ -52,17 +54,86 @@ pub struct UnlockJob {
     pub target_port: u16,
     /// 一次性回灌 channel（`SyncSender(1)`）。
     pub reply: SyncSender<UnlockOutcome>,
+    /// 计时 profile：fail-fast probe per-attempt 超时（ring 路径 `Some(800ms)`，每步切断；
+    /// 手动 `/unlock` 路径 `None`）。穿给 `execute_unlock` 的 `per_attempt_timeout`。
+    pub per_attempt_timeout: Option<Duration>,
+    /// 计时 profile：退避间隔（ring 路径 `SELF_UNLOCK_PROBE_INTERVAL=200ms` 重探；手动
+    /// `/unlock` 路径 `UNLOCK_RETRY_INTERVAL=1s` HTTP 计时）。穿给 `execute_unlock` 的
+    /// `retry_interval`。
+    pub retry_interval: Duration,
+}
+
+/// 一次 auto-hangup 请求的参数（② 决策 2：detached 计时线程到点投，worker 即时发 req=708）。
+///
+/// 按值持 BCD/IP（计时线程不触碰消费者线程的 debounce 状态，锚 Go `main.go:680/691`）。
+/// `outdoor_bcd` 作 [`wire18022::build_stop_frame`] 首参（calleeBCD 槽 = 外机 BCD）；
+/// `monitor_bcd`（= calleeBCD 即室内机 BCD）作次参（callerBCD 槽）。
+pub struct HangupJob {
+    /// 外机 BCD（BuildStopFrame 首参 / calleeBCD 槽）。
+    pub outdoor_bcd: [u8; 4],
+    /// 室内机 BCD（BuildStopFrame 次参 / callerBCD 槽，锚 Go `main.go:563/697`）。
+    pub monitor_bcd: [u8; 4],
+    /// 外机目标 IP（req=708 发往此处，**非**室内机自指）。
+    pub outdoor_ip: String,
+    /// 外机目标端口（通常 18022）。
+    pub outdoor_port: u16,
 }
 
 /// wire-worker 队列里的工作项。
 ///
-/// **决策 3**：只含 **wire-bound** 变体——`Unlock`（+ 未来 ② 的 `Hangup`，本骨架不实现）
-/// + `Shutdown` 哨兵。**无 `Push` 变体**：push 走 detached 线程（见 [`spawn_push`]）。
+/// **决策 3**：只含 **wire-bound** 变体——`Unlock` / `Hangup`（② 的 auto-hangup，骨架 spec:23
+/// 显式命名预留）+ `Shutdown` 哨兵。**无 `Push` 变体**：push 走 detached 线程（见 [`spawn_push`]）。
 pub enum Job {
-    /// 手动 / （未来 ring 触发）开锁——worker 跑 [`unlock::execute_unlock`]。
+    /// 手动 / ring 触发开锁——worker 跑 [`unlock::execute_unlock`]。
     Unlock(UnlockJob),
+    /// auto-hangup（② 决策 2）：worker 发**外机目标** req=708 preview-stop 帧
+    /// （[`wire18022::build_stop_frame`]，**非**自指 [`wire18022::build_bye_frame`]），
+    /// `want_recv=false` 不等 req=709 ack。计时线程到点投此即时 job（延迟在 detached 计时
+    /// 线程，**不**占 worker，不 head-of-line 阻塞排队的 Unlock）。
+    Hangup(HangupJob),
     /// 优雅退出哨兵（决策 8）：worker 排空已入队 Unlock 后读到它 → break。
     Shutdown,
+}
+
+/// 单帧 fire-and-forget wire 出站缝（auto-hangup req=708 用）。
+///
+/// 决策 2 / spec:73：req=708 **仅由 worker 发出**（守 M1.5「wire 出站单点」）。worker 经此
+/// trait 把 [`wire18022::build_stop_frame`] 帧发到外机 `ip:port`，`want_recv=false`
+/// （挂断判据靠物理观察非 req=709 ack，锚 Go `SendOutdoorHangup` handlers.go:622-634）。
+///
+/// 与 [`UnlockWire`] 分开：`UnlockWire::try_once` 是完整 710→711→518→519 握手，hangup 是
+/// 单帧无 ack 出站，语义不同。生产实现是 [`wire_sender::Sender`]（已 hAP 真机认证的 wire
+/// 出站路径，**非新 socket/BE 面**）；测试可注 mock 捕获帧字节。
+pub trait HangupWire: Send + Sync {
+    /// 朝 `target_ip:target_port` 发 `frame`，`want_recv=false` 不读响应。
+    ///
+    /// `cancel` 透传给底层 sender，使 shutdown 期间在飞发送可早退。失败 MUST 由调用方
+    /// log 不 panic（best-effort）。
+    fn send_fire_and_forget(
+        &self,
+        cancel: &AtomicBool,
+        target_ip: &str,
+        target_port: u16,
+        frame: &[u8],
+    ) -> Result<(), String>;
+}
+
+/// 生产 [`HangupWire`]：用 [`wire_sender::Sender`] 已认证 wire 出站路径发单帧。
+///
+/// 复用与 unlock 同款 `send_context`（SO_BINDTODEVICE / 源 IP 绑定 / cancel-aware），
+/// `want_recv=false`。**非新 socket/字节序面**——BE 风险面仍零（对齐骨架 spec:178-180）。
+impl HangupWire for wire_sender::Sender {
+    fn send_fire_and_forget(
+        &self,
+        cancel: &AtomicBool,
+        target_ip: &str,
+        target_port: u16,
+        frame: &[u8],
+    ) -> Result<(), String> {
+        self.send_context(cancel, target_ip, target_port, frame, false)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -207,17 +278,28 @@ pub struct WorkerDeps {
     pub listener: Option<Arc<dyn Subscribable>>,
     pub post_wire_mu: Mutex<()>,
     pub sleeper: Box<dyn Sleeper>,
+    /// auto-hangup 单帧 wire 出站缝（② 决策 2）。`None` → `Job::Hangup` log+skip（不发帧）。
+    /// 生产由 orchestration 注入 [`wire_sender::Sender`]（见 [`WorkerDeps::with_hangup_wire`]）。
+    pub hangup_wire: Option<Arc<dyn HangupWire>>,
 }
 
 impl WorkerDeps {
-    /// 生产 worker 依赖（真 sleeper）。
+    /// 生产 worker 依赖（真 sleeper）。`hangup_wire` 默认 `None`——auto-hangup 由
+    /// orchestration 经 [`WorkerDeps::with_hangup_wire`] 注入（保留本签名不破坏既有调用方）。
     pub fn new(wire: Arc<dyn UnlockWire>, listener: Option<Arc<dyn Subscribable>>) -> Self {
         Self {
             wire,
             listener,
             post_wire_mu: Mutex::new(()),
             sleeper: Box::new(ThreadSleeper),
+            hangup_wire: None,
         }
+    }
+
+    /// 注入 auto-hangup 单帧 wire 出站缝（② 决策 2：worker 发 req=708 preview-stop）。
+    pub fn with_hangup_wire(mut self, hangup_wire: Arc<dyn HangupWire>) -> Self {
+        self.hangup_wire = Some(hangup_wire);
+        self
     }
 }
 
@@ -243,6 +325,35 @@ pub fn run_worker(deps: WorkerDeps, rx: Receiver<Job>, shutdown: Arc<AtomicBool>
                 // SyncSender(1) send：handler 仍在等 → Ok；handler 已走（极少）→ Err 忽略。
                 let _ = j.reply.send(outcome);
             }
+            Job::Hangup(j) => {
+                // ② 决策 2：worker 发**外机目标** req=708 preview-stop 帧
+                // （build_stop_frame，**非**自指 build_bye_frame——后者对推流外机无终止作用，
+                // Go handlers.go:615-621 实证）。want_recv=false（不等 req=709 ack）。
+                // req=708 仅此处（worker）发出，守 M1.5「wire 出站单点」。
+                let frame = wire18022::build_stop_frame(j.outdoor_bcd, j.monitor_bcd);
+                match &deps.hangup_wire {
+                    Some(hw) => {
+                        // 发送失败 log 不 panic（best-effort；外机不收挂断则自超时）。
+                        if let Err(e) = hw.send_fire_and_forget(
+                            &shutdown,
+                            &j.outdoor_ip,
+                            j.outdoor_port,
+                            &frame,
+                        ) {
+                            eprintln!(
+                                "dooraccess-rs: auto-hangup (req=708 -> {}): {e}",
+                                j.outdoor_ip
+                            );
+                        }
+                    }
+                    None => {
+                        eprintln!(
+                            "dooraccess-rs: auto-hangup skipped (no hangup wire injected, -> {})",
+                            j.outdoor_ip
+                        );
+                    }
+                }
+            }
         }
     }
 }
@@ -250,8 +361,9 @@ pub fn run_worker(deps: WorkerDeps, rx: Receiver<Job>, shutdown: Arc<AtomicBool>
 /// 跑一次 [`unlock::execute_unlock`]（free fn，返 [`UnlockOutcome`]，决策 5）。
 ///
 /// 注入 `deps.post_wire_mu`（占位锁）/ `deadline`（总 cap）/ `shutdown`（cancel）/
-/// `deps.sleeper`（退避）/ `deps.listener`（bye 早停）。HTTP 路径：`per_attempt_timeout=None`
-/// + `retry_interval=1s`。
+/// `deps.sleeper`（退避）/ `deps.listener`（bye 早停）。计时 profile 由 job 携带（决策：ring
+/// 路径 `per_attempt_timeout=Some(800ms)`+`retry_interval=200ms` fail-fast probe；手动
+/// `/unlock` 路径 `None`+`1s` HTTP 计时）——**非硬编**，使 ring 路径复现 headline ~1.3s。
 fn execute_unlock_job(
     deps: &WorkerDeps,
     j: &UnlockJob,
@@ -270,8 +382,8 @@ fn execute_unlock_job(
         shutdown,
         deps.sleeper.as_ref(),
         deadline,
-        None,
-        UNLOCK_RETRY_INTERVAL,
+        j.per_attempt_timeout,
+        j.retry_interval,
     )
 }
 
@@ -287,7 +399,9 @@ pub fn submit_job(tx: &Sender<Job>, job: Job) -> Result<(), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::unlock::{AttemptOutcome, Deadline, UnlockStage, UnlockWire, WireKind};
+    use crate::unlock::{
+        AttemptOutcome, Deadline, UnlockStage, UnlockWire, WireKind, UNLOCK_RETRY_INTERVAL,
+    };
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -321,6 +435,9 @@ mod tests {
             target_ip: "172.16.106.201".into(),
             target_port: 18022,
             reply,
+            // 手动 unlock 语义：HTTP 计时（None + 1s 退避）。
+            per_attempt_timeout: None,
+            retry_interval: UNLOCK_RETRY_INTERVAL,
         }
     }
 

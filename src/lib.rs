@@ -29,6 +29,9 @@ pub mod info;
 /// daemon 编排接线 helper（automation flag 加载 / OnDetect 门铃 builder / 号码查询 callback /
 /// 手动 unlock → wire-worker 派发缝）；从 main.rs 上移以便 e2e 测真生产函数。
 pub mod orchestration;
+/// ring 触发 self-unlock 消费者主体（Subscribable 消费者线程 + debounce + flag gate +
+/// ExecuteUnlockFromRing + auto-hangup detached 计时线程；Phase 4 ②）。
+pub mod self_unlock;
 pub mod sender;
 pub mod wire18022;
 

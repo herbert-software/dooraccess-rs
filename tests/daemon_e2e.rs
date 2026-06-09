@@ -50,6 +50,7 @@ use dooraccess_rs::orchestration::{
 };
 use dooraccess_rs::unlock::{
     AttemptOutcome, Deadline, UnlockOutcome, UnlockStage, UnlockWire, WireKind,
+    UNLOCK_RETRY_INTERVAL,
 };
 
 // ===========================================================================
@@ -1019,6 +1020,8 @@ fn t10_8_shutdown_no_deadlock_and_worker_panic_unblocks() {
                 target_ip: "172.16.106.152".into(),
                 target_port: 18022,
                 reply: rtx,
+                per_attempt_timeout: None,
+                retry_interval: UNLOCK_RETRY_INTERVAL,
             }),
         )
         .unwrap();
@@ -1059,6 +1062,8 @@ fn t10_8_shutdown_no_deadlock_and_worker_panic_unblocks() {
                 target_ip: "172.16.106.152".into(),
                 target_port: 18022,
                 reply: rtx,
+                per_attempt_timeout: None,
+                retry_interval: UNLOCK_RETRY_INTERVAL,
             }),
         )
         .unwrap();

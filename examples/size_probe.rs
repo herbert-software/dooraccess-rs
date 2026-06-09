@@ -200,5 +200,37 @@ fn main() {
     ) -> std::io::Result<()> = dooraccess_rs::automation_state::write_atomic;
     black_box(write_atomic_fp as usize);
 
+    // --- Phase4 ② self-unlock 模块链入（port-rust-self-unlock-consumer 组 D / task 6.2）---
+    // 链入本 change 新增/移植的代表函数，使 MIPS binary 反映 ② 真正链入时的体型增量。
+    // 纯函数（build_stop_frame）直接调用；线程/socket-spawn 入口（spawn_consumer）取函数指针。
+
+    // wire18022::build_stop_frame —— ② 唯一新增 wire-encode 代码（preview-stop req=708 帧，
+    // 移植 Go video.BuildStopFrame）。须确实链入体型基线（其字节正确性另由 golden 单测守）。
+    let stop = black_box(dooraccess_rs::wire18022::build_stop_frame(
+        black_box([0x06, 0x02, 0x00, 0x00]),
+        black_box([0x06, 0x02, 0x11, 0x03]),
+    ));
+    black_box(&stop);
+
+    // self_unlock::spawn_consumer —— ring 消费者线程入口（filter/debounce/产 Job 主体经此链入）。
+    // 取单态化函数指针（concrete logf 闭包类型）经 black_box 防 DCE，不真起线程。
+    let spawn_consumer_fp: fn(
+        &dyn dooraccess_rs::listen18022::Subscribable,
+        dooraccess_rs::self_unlock::SelfUnlockDeps,
+        fn(&str),
+    ) -> Option<std::thread::JoinHandle<()>> = dooraccess_rs::self_unlock::spawn_consumer;
+    black_box(spawn_consumer_fp as usize);
+
+    // daemon::HangupJob 构造 + 生产 HangupWire（worker Job::Hangup arm 经 wire_sender 发 req=708）。
+    let hangup_job = black_box(dooraccess_rs::daemon::Job::Hangup(
+        dooraccess_rs::daemon::HangupJob {
+            outdoor_bcd: black_box([0x06, 0x02, 0x00, 0x00]),
+            monitor_bcd: black_box([0x06, 0x02, 0x11, 0x03]),
+            outdoor_ip: black_box(String::from("10.0.0.1")),
+            outdoor_port: black_box(18022),
+        },
+    ));
+    black_box(&hangup_job);
+
     println!("size_probe ok");
 }
