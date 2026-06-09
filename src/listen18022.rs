@@ -413,9 +413,11 @@ pub type SubFilter = Box<dyn Fn(&DetectedFrame) -> bool + Send + Sync>;
 /// listener 主循环）。`cancel()` 释放订阅；cancel 后再投递被 silent drop，再次
 /// cancel 是 no-op。
 ///
-/// **不实现 `Drop`-on-drop 自动 cancel**：cancel 由调用方显式调用（对齐 Go 闭包
-/// 语义 + design.md「倾向显式 + 可选 Drop guard」的显式分支；组 F unlock 在 bye-watch
-/// 结束时显式 `cancel()`）。
+/// 调用方仍可在 bye-watch / 消费者退出时显式 `cancel()`（清晰表意）；此外 `Subscription`
+/// 实现 **`Drop`-on-drop 自动 cancel** 作安全网（design.md「可选 Drop guard」分支）：
+/// 当 `Subscription` 被 drop 而**未**显式 cancel 时（如 `spawn_consumer` 把 sub move 进
+/// 失败的线程闭包、闭包随即 drop），Drop 兜底 cancel，避免 listener 残留 orphan SubEntry
+/// 持续跑 filter/try_send。cancel 幂等（id 找不到即 no-op），故显式 + Drop 双触发安全。
 pub struct Subscription {
     /// filter 通过的 frame 投递目的 channel（buffered 8）。
     pub ch: Receiver<DetectedFrame>,
@@ -426,6 +428,14 @@ pub struct Subscription {
 impl Subscription {
     /// 取消订阅：从 listener 移除 + 后续投递 silent drop。多次调用 no-op。
     pub fn cancel(&self) {
+        (self.cancel)();
+    }
+}
+
+impl Drop for Subscription {
+    /// 安全网：drop 时兜底 cancel（幂等）——保证任何 `Subscription` 离开作用域都不留
+    /// orphan SubEntry，即便调用方未显式 `cancel()`（如 spawn 失败路径）。
+    fn drop(&mut self) {
         (self.cancel)();
     }
 }

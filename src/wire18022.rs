@@ -366,7 +366,11 @@ mod tests {
             0x06, 0x02, 0x11, 0x03, // caller BCD = monitor
             0x80, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x01, // preview const tail
         ];
-        assert_eq!(got.as_slice(), &want[..], "build_stop_frame 逐字节须等于 Go BuildStopFrame");
+        assert_eq!(
+            got.as_slice(),
+            &want[..],
+            "build_stop_frame 逐字节须等于 Go BuildStopFrame"
+        );
 
         // 显式断言关键不变量（防回归漂移）。
         assert_eq!(got.len(), 36, "preview-stop 帧总长须 36B");
@@ -378,8 +382,16 @@ mod tests {
         // 分隔符是 '='（preview-stop，对照 req=704 start 用 '*'）。
         assert_eq!(got[19], b'=', "分隔符须为 '='（0x3d）");
         // BCD 落在正确偏移。
-        assert_eq!(&got[20..24], &outdoor[..], "callee BCD 槽 = 外机 BCD（首参）");
-        assert_eq!(&got[24..28], &monitor[..], "caller BCD 槽 = 室内机 BCD（次参）");
+        assert_eq!(
+            &got[20..24],
+            &outdoor[..],
+            "callee BCD 槽 = 外机 BCD（首参）"
+        );
+        assert_eq!(
+            &got[24..28],
+            &monitor[..],
+            "caller BCD 槽 = 室内机 BCD（次参）"
+        );
 
         // 与自指 bye 帧的尾必须不同（用错帧 auto-hangup 真机不工作）。
         let bye = build_bye_frame(monitor, monitor);

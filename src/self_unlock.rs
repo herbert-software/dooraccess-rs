@@ -72,8 +72,9 @@ const CONSUMER_POLL: Duration = Duration::from_millis(20);
 
 /// debounce 窗（`UNLOCK_TOTAL_CAP + margin`，不硬编 12s）。
 fn debounce_window() -> Duration {
-    UNLOCK_TOTAL_CAP
-        .saturating_add(Duration::from_millis(u64::from(DEBOUNCE_MARGIN_MS.load(Ordering::SeqCst))))
+    UNLOCK_TOTAL_CAP.saturating_add(Duration::from_millis(u64::from(
+        DEBOUNCE_MARGIN_MS.load(Ordering::SeqCst),
+    )))
 }
 
 /// auto-hangup 延迟（test-tunable）。
@@ -219,20 +220,24 @@ pub fn spawn_consumer(
     let filter = deps.make_filter();
     let sub = listener.subscribe(Some(filter));
     let window = debounce_window();
-    logf(&format!(
-        "[auto_unlock] self-unlock consumer started (debounce={window:?}, stations={})",
-        deps.outdoor_by_ip.len()
-    ));
+    let stations = deps.outdoor_by_ip.len(); // 在 deps move 进闭包前取，供成功后 log
     match std::thread::Builder::new()
         .name("self-unlock".into())
         .spawn(move || run_consumer(sub, &deps))
     {
-        Ok(h) => Some(h),
+        Ok(h) => {
+            // 「started」日志只在 spawn 真成功后打（否则失败时误报已启动）。
+            logf(&format!(
+                "[auto_unlock] self-unlock consumer started (debounce={window:?}, stations={stations})"
+            ));
+            Some(h)
+        }
         Err(e) => {
             // spawn 失败极罕见（线程资源耗尽）；按骨架 best-effort 纪律不 panic。返 `None`
             // 而非裸 `std::thread::spawn` 占位——后者在同一资源耗尽下也会失败并**panic**
             // （`panic=abort` 即 abort daemon），违背本模块 no-panic 防御纪律。此时 sub 随
-            // 失败闭包 drop（tx drop → channel Disconnected，listener 后续投递 silent）。
+            // 失败闭包 drop → `Subscription` 的 `Drop` guard 兜底 cancel（清 orphan SubEntry，
+            // 不留空转 filter），channel Disconnected，listener 后续投递 silent。
             eprintln!("dooraccess-rs: [auto_unlock] failed to spawn consumer thread: {e} (self-unlock disabled)");
             None
         }
@@ -255,7 +260,14 @@ fn run_consumer(sub: crate::listen18022::Subscription, deps: &SelfUnlockDeps) {
                 // 立即返回，t_ms 精度不受 poll 影响。
                 let ring_at = Instant::now();
                 dequeue_count = dequeue_count.saturating_add(1);
-                handle_ring(deps, &frame, ring_at, window, &mut last_triggered, &mut triggered_count);
+                handle_ring(
+                    deps,
+                    &frame,
+                    ring_at,
+                    window,
+                    &mut last_triggered,
+                    &mut triggered_count,
+                );
             }
             Err(RecvTimeoutError::Timeout) => {
                 // 查 shutdown 置位则 break（裸 recv 听不到 AtomicBool，故必须 recv_timeout）。
@@ -318,7 +330,9 @@ fn handle_ring(
     let (caller_bcd, target_ip, target_port) = match parse_outdoor_uri(&outdoor_uri) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("dooraccess-rs: [auto_unlock] parse outdoor uri {outdoor_uri:?} failed: {e} (skip)");
+            eprintln!(
+                "dooraccess-rs: [auto_unlock] parse outdoor uri {outdoor_uri:?} failed: {e} (skip)"
+            );
             return;
         }
     };
@@ -344,8 +358,8 @@ fn handle_ring(
         schedule_outdoor_hangup(
             deps.job_tx.clone(),
             Arc::clone(&deps.shutdown),
-            caller_bcd,          // outdoor_bcd（BuildStopFrame 首参 / calleeBCD 槽）
-            deps.callee_bcd,     // monitor_bcd（= 室内机 BCD，callerBCD 槽，锚 Go main.go:563/697）
+            caller_bcd,      // outdoor_bcd（BuildStopFrame 首参 / calleeBCD 槽）
+            deps.callee_bcd, // monitor_bcd（= 室内机 BCD，callerBCD 槽，锚 Go main.go:563/697）
             target_ip,
             target_port,
         );
@@ -740,8 +754,7 @@ mod e2e {
 
         // 等 worker 被调一次（自开锁触发）。
         assert!(
-            wait_until(Duration::from_secs(2), || wire_calls
-                .load(Ordering::SeqCst)
+            wait_until(Duration::from_secs(2), || wire_calls.load(Ordering::SeqCst)
                 >= 1),
             "ring 应触发一次自开锁（worker wire 被调）"
         );
@@ -776,8 +789,7 @@ mod e2e {
         }
         // 等消费者处理完（首次触发 + 后两次 debounce skip）。
         assert!(
-            wait_until(Duration::from_secs(2), || wire_calls
-                .load(Ordering::SeqCst)
+            wait_until(Duration::from_secs(2), || wire_calls.load(Ordering::SeqCst)
                 >= 1),
             "首次 ring 应触发"
         );
@@ -821,8 +833,7 @@ mod e2e {
         auto_handle.store_auto_unlock(true);
         listener.dispatch_for_test(OUTDOOR_IP, INDOOR_IP, 50000, 18022, &wire_704_payload());
         assert!(
-            wait_until(Duration::from_secs(2), || wire_calls
-                .load(Ordering::SeqCst)
+            wait_until(Duration::from_secs(2), || wire_calls.load(Ordering::SeqCst)
                 >= 1),
             "拨 on 后同外机应触发（off 未占 debounce 窗口）"
         );
@@ -918,8 +929,7 @@ mod e2e {
         // 单次 ring（无任何模拟 HACS /unlock 投递）→ 恰一次自开锁。
         listener.dispatch_for_test(OUTDOOR_IP, INDOOR_IP, 50000, 18022, &wire_704_payload());
         assert!(
-            wait_until(Duration::from_secs(2), || wire_calls
-                .load(Ordering::SeqCst)
+            wait_until(Duration::from_secs(2), || wire_calls.load(Ordering::SeqCst)
                 >= 1),
             "ring 应触发自开锁"
         );
@@ -1066,9 +1076,9 @@ mod e2e {
         )
         .unwrap();
         let t0 = Instant::now();
-        let outcome = rrx.recv_timeout(Duration::from_millis(500)).expect(
-            "Unlock 应即时完成不被 hangup 延迟阻塞（detached 计时线程）",
-        );
+        let outcome = rrx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("Unlock 应即时完成不被 hangup 延迟阻塞（detached 计时线程）");
         assert_eq!(outcome.result, codec::result::OK);
         assert!(
             t0.elapsed() < Duration::from_millis(500),
@@ -1098,9 +1108,21 @@ mod e2e {
         let consumer = spawn_consumer_thread(&listener, deps);
 
         // (a) dst != 本机室内机（.92，PROMISC 看到的其他室内机呼叫）→ filter 挡，不触发。
-        listener.dispatch_for_test(OUTDOOR_IP, [172, 16, 106, 92], 50000, 18022, &wire_704_payload());
+        listener.dispatch_for_test(
+            OUTDOOR_IP,
+            [172, 16, 106, 92],
+            50000,
+            18022,
+            &wire_704_payload(),
+        );
         // (b) src 不在 cfg.Stations（.199 邻居/未配置外机）→ filter 挡，不触发。
-        listener.dispatch_for_test([172, 16, 106, 199], INDOOR_IP, 50000, 18022, &wire_704_payload());
+        listener.dispatch_for_test(
+            [172, 16, 106, 199],
+            INDOOR_IP,
+            50000,
+            18022,
+            &wire_704_payload(),
+        );
         std::thread::sleep(Duration::from_millis(150));
         assert_eq!(
             wire_calls.load(Ordering::SeqCst),
@@ -1111,8 +1133,7 @@ mod e2e {
         // 对照：命中（src∈Stations dst==室内机）确应触发。
         listener.dispatch_for_test(OUTDOOR_IP, INDOOR_IP, 50000, 18022, &wire_704_payload());
         assert!(
-            wait_until(Duration::from_secs(2), || wire_calls
-                .load(Ordering::SeqCst)
+            wait_until(Duration::from_secs(2), || wire_calls.load(Ordering::SeqCst)
                 >= 1),
             "命中帧应触发（对照）"
         );
@@ -1159,8 +1180,7 @@ mod e2e {
         t2.join().unwrap();
 
         assert!(
-            wait_until(Duration::from_secs(2), || wire_calls
-                .load(Ordering::SeqCst)
+            wait_until(Duration::from_secs(2), || wire_calls.load(Ordering::SeqCst)
                 >= 1),
             "并发 ring 应至少触发一次"
         );
@@ -1183,8 +1203,12 @@ mod e2e {
     /// loopback HTTP capture server：accept 一个连接、读 body、回 200，记 body。bind 失败
     /// （沙箱）返 None。仿 daemon_e2e `start_capture_server`。
     #[allow(clippy::type_complexity)]
-    fn start_capture_server() -> Option<(String, u16, Arc<Mutex<Option<Vec<u8>>>>, std::thread::JoinHandle<()>)>
-    {
+    fn start_capture_server() -> Option<(
+        String,
+        u16,
+        Arc<Mutex<Option<Vec<u8>>>>,
+        std::thread::JoinHandle<()>,
+    )> {
         let listener = match TcpListener::bind("127.0.0.1:0") {
             Ok(l) => l,
             Err(e) => {
@@ -1269,7 +1293,10 @@ mod e2e {
             .expect("成功应 push event=unlock");
         let s = String::from_utf8_lossy(&body);
         assert!(s.contains("\"event\":\"unlock\""), "event=unlock: {s}");
-        assert!(s.contains(&format!("\"from\":\"{OUTDOOR_URI}\"")), "from: {s}");
+        assert!(
+            s.contains(&format!("\"from\":\"{OUTDOOR_URI}\"")),
+            "from: {s}"
+        );
         assert!(s.contains(&format!("\"to\":\"{INDOOR_URI}\"")), "to: {s}");
         assert!(s.contains("\"result\":\"0\""), "result: {s}");
 
@@ -1387,14 +1414,25 @@ mod e2e {
         // 把两帧直接投进 sub channel 的 tx——经 dispatch_for_test 需 src∈outdoor_ips；
         // .152/.153 均在 outdoor_by_ip → filter 通过。构造对应 wire payload。
         let consumer = std::thread::spawn(move || run_consumer(sub, &deps));
-        listener.dispatch_for_test(f1.src_ip, f1.dst_ip, f1.src_port, f1.dst_port, &wire_704_payload());
+        listener.dispatch_for_test(
+            f1.src_ip,
+            f1.dst_ip,
+            f1.src_port,
+            f1.dst_port,
+            &wire_704_payload(),
+        );
         std::thread::sleep(Duration::from_millis(50));
-        listener.dispatch_for_test(f2.src_ip, f2.dst_ip, f2.src_port, f2.dst_port, &wire_704_payload());
+        listener.dispatch_for_test(
+            f2.src_ip,
+            f2.dst_ip,
+            f2.src_port,
+            f2.dst_port,
+            &wire_704_payload(),
+        );
 
         // 仅第二个 ring（合法 URI）触发 worker；第一个 malformed 被跳过、消费者未死。
         assert!(
-            wait_until(Duration::from_secs(2), || wire_calls
-                .load(Ordering::SeqCst)
+            wait_until(Duration::from_secs(2), || wire_calls.load(Ordering::SeqCst)
                 >= 1),
             "malformed ring 被跳过后，后续合法 ring 仍处理"
         );
@@ -1421,7 +1459,12 @@ mod e2e {
         let cfg = e2e_cfg();
         let shutdown = never();
         let (job_tx, _worker_rx) = mpsc::channel::<Job>();
-        let deps = make_deps(&cfg, job_tx, shutdown.clone(), AutomationState::new(true, false));
+        let deps = make_deps(
+            &cfg,
+            job_tx,
+            shutdown.clone(),
+            AutomationState::new(true, false),
+        );
 
         // listener 持 tx（subscribe 在其内）；消费者 park 在 recv_timeout（无帧到达）。
         let listener = Arc::new(Listener::new(vec!["eth0".into()], None));

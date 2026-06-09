@@ -28,8 +28,8 @@ use dooraccess_rs::ha_push::HaPushClient;
 use dooraccess_rs::listen18022;
 use dooraccess_rs::listen6672;
 use dooraccess_rs::orchestration::{
-    build_listen18022, build_number_query_callback, load_automation_flags, parse_stations_to_ip_map,
-    WorkerUnlockDispatch,
+    build_listen18022, build_number_query_callback, load_automation_flags,
+    parse_stations_to_ip_map, WorkerUnlockDispatch,
 };
 use dooraccess_rs::self_unlock;
 use dooraccess_rs::{automation_state, info, wire_sender};
