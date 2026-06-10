@@ -10,7 +10,7 @@ MIPS_RUSTFLAGS := -C linker-flavor=ld -C linker=$(WRAPPER) -C relocation-model=s
                   -Z unstable-options -C panic=immediate-abort
 MIPS_BIN := target/$(MIPS_TARGET)/release/dooraccess-rs
 
-.PHONY: build test fmt fmt-check clippy fetch-sdk build-mips verify-mips clean
+.PHONY: build test fmt fmt-check clippy fetch-sdk build-mips verify-mips dist clean
 
 ## host build (stable)
 build:
@@ -50,5 +50,13 @@ verify-mips:
 	  || { echo "verify-mips: FP ABI is not Soft float"; exit 1; }
 	@echo "verify-mips: OK (MIPS BE, soft-float, static) — $$(ls -l $(MIPS_BIN) | awk '{print $$5}') bytes"
 
+## copy the verified MIPS binary to a stable dist/ path for scp
+## (used by the hAP verification SOP — see openspec verify-rust-self-unlock-on-hap)
+dist: verify-mips
+	@mkdir -p dist
+	@cp $(MIPS_BIN) dist/dooraccess-rs-mips
+	@echo "dist: dist/dooraccess-rs-mips — $$(ls -l dist/dooraccess-rs-mips | awk '{print $$5}') bytes"
+
 clean:
 	cargo clean
+	rm -rf dist

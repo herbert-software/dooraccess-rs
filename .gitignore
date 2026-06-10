@@ -12,3 +12,6 @@
 *.swo
 .DS_Store
 Thumbs.db
+
+# MIPS dist artifacts (make dist, for hAP scp)
+/dist/
