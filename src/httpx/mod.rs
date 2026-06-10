@@ -36,18 +36,29 @@ pub const STATUS_INTERNAL_SERVER_ERROR: u16 = 500;
 pub const STATUS_BAD_GATEWAY: u16 = 502;
 
 /// 返回 status reason phrase；未知码返空串（与 Go `StatusText` 一致）。
+///
+/// 表项对齐 Go `httpx/types.go` statusText 全集（409 在 Go 表中同样缺席 →
+/// response.rs 的 "Status" fallback 与 Go 行为一致，golden `409 Status` 为证）。
 pub fn status_text(code: u16) -> &'static str {
     match code {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        408 => "Request Timeout",
         413 => "Payload Too Large",
         414 => "URI Too Long",
+        415 => "Unsupported Media Type",
+        417 => "Expectation Failed",
         426 => "Upgrade Required",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
+        501 => "Not Implemented",
         502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
         _ => "",
     }
 }

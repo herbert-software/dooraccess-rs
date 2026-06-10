@@ -4,10 +4,16 @@ Rust port exploration of [`dooraccess-go`](https://github.com/HerbertGao/dooracc
 anjubao-only door-access daemon that runs on a **MikroTik hAP ac lite (QCA9533, MIPS 24Kc
 big-endian, no FPU, OpenWrt musl, 64 MB RAM)**.
 
-> **Status: Phase 0 (toolchain feasibility) — ✅ PASSED (2026-06-08).**
-> Rust can produce a runnable MIPS big-endian soft-float static binary for the hAP. This repo
-> currently contains only the Phase 0 probe; no protocol / HTTP / video / automation logic yet.
-> Full evidence: [`PHASE0.md`](PHASE0.md). Roadmap: umbrella `rust_port_roadmap.md`.
+> **Status: Phase 5 (video forward) — ✅ PASSED (2026-06-10).**
+> A full-feature Rust daemon now exists: protocol core (Phase 1), bare HTTP + HA push (Phase 2),
+> PF_PACKET listeners + wire sender **hAP-authenticated** (Phase 3), daemon orchestration +
+> ring self-unlock + auto-hangup (Phase 4), and the **video forward stack** (Phase 5: preview
+> signalling / RTP receiver + proprietary H.264 reassembler / RTCP / FLV transmux / session
+> TTL + fan-out / 3 HTTP routes). MIPS BE soft-float static daemon bin = **563,228 bytes**
+> (≈ 1/7.1 of Go v0.10.0's 3,997,853). crate gate held at `libc` only.
+> Per-phase evidence: [`PHASE0.md`](PHASE0.md) … [`PHASE5.md`](PHASE5.md);
+> hAP self-unlock verification: [`HAP_VERIFY.md`](HAP_VERIFY.md). Roadmap: umbrella `rust_port_roadmap.md`.
+> Gate so far = dev mock-e2e + local MIPS size measurement; hAP grey-rollout is Phase 7.
 
 ## Phase 0 result
 
@@ -37,7 +43,7 @@ make test
 rustup toolchain install nightly --profile minimal
 rustup component add rust-src llvm-tools-preview --toolchain nightly
 make fetch-sdk        # downloads + extracts the OpenWrt mips_24kc musl sysroot to .openwrt-sdk/
-make build-mips       # → target/mips-unknown-linux-musl/release/dooraccess-rs-probe
+make build-mips       # → target/mips-unknown-linux-musl/release/dooraccess-rs (the daemon bin)
 make verify-mips      # asserts MIPS BE + soft-float + statically linked
 ```
 
@@ -47,8 +53,10 @@ make verify-mips      # asserts MIPS BE + soft-float + statically linked
 
 ```
 dooraccess-rs/
-├── Cargo.toml          # binary crate, empty [dependencies], size-tuned release profile
-├── src/main.rs         # minimal hello + /proc/self/status RSS self-report
+├── Cargo.toml          # binary crate, [dependencies] = libc only, size-tuned release profile
+├── src/main.rs         # daemon orchestration (config / threads / shutdown); src/ = full daemon
+│                       #   (codec / wire18022 / listen{6672,18022} / control / video/ / daemon …)
+├── examples/probe.rs   # Phase 0-3 passive-shadow probe (hAP BE-auth reproduction tool)
 ├── Makefile            # build / test / fmt / clippy / fetch-sdk / build-mips / verify-mips
 ├── scripts/
 │   ├── link-mips.sh    # rust-lld + OpenWrt musl sysroot linker wrapper (committed)

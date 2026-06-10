@@ -166,6 +166,34 @@ pub fn build_bye_frame(from_bcd: [u8; 4], to_bcd: [u8; 4]) -> Vec<u8> {
     assemble_frame(&body)
 }
 
+/// 构造 req=704 preview-start 帧（36B，移植 Go `video.BuildStartFrame`）。
+///
+/// **与 [`build_preview_frame`]（req=705 fail-fast 探针帧）无关**：start 帧带
+/// callee/caller BCD，发到外机触发其向 daemon UDP 9880 推 RTP 流。
+///
+/// 与 [`build_stop_frame`] 恰差 2 字节（observations §2.2）：
+///   - offset 12：req 数字 `'4'` ↔ `'8'`（704 ↔ 708）
+///   - offset 19：分隔符 `'*'`（0x2a）↔ `'='`（0x3d）
+///
+/// arg 序对齐 Go `BuildStartFrame(calleeBCD=外机BCD, callerBCD=室内机BCD)`。
+///
+/// 字节布局（整帧 offset，逐字节锚 Go `video/preview.go` BuildStartFrame）：
+///   - 0-1:   `07 b8`（magic）
+///   - 2-3:   `1e 00`（length = 30 = body.len()，小端）
+///   - 4-5:   `00 00`（reserved）
+///   - 6-19:  `"req=704&query*"`（14 ascii，sep = `*` 0x2a）
+///   - 20-23: callee BCD = `callee_bcd`（外机）
+///   - 24-27: caller BCD = `caller_bcd`（室内机）
+///   - 28-35: 固定尾 `80 00 00 00 02 00 00 01`（preview const body）
+pub fn build_start_frame(callee_bcd: [u8; 4], caller_bcd: [u8; 4]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(30);
+    body.extend_from_slice(b"req=704&query*");
+    body.extend_from_slice(&callee_bcd);
+    body.extend_from_slice(&caller_bcd);
+    body.extend_from_slice(&[0x80, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x01]);
+    assemble_frame(&body)
+}
+
 /// 构造 req=708 preview-stop 帧（36B，移植 Go `video.BuildStopFrame`）。
 ///
 /// **与自指 [`build_bye_frame`] 的本质区别**：preview-stop 帧用 **preview-shape** body
@@ -400,5 +428,58 @@ mod tests {
             &bye[bye.len() - 8..],
             "preview-stop 尾须区别于自指 bye 尾"
         );
+    }
+
+    /// build_start_frame golden：逐字节对齐 Go `video.BuildStartFrame`（移植
+    /// Go `TestBuildStartFrame_ByteLevel`，实测 hex 来自 spec
+    /// messages/tcp18022-preview/req-704-start.md）。
+    #[test]
+    fn build_start_frame_golden() {
+        let callee: [u8; 4] = [0x06, 0x02, 0x00, 0x00];
+        let caller: [u8; 4] = [0x06, 0x02, 0x11, 0x03];
+        let got = build_start_frame(callee, caller);
+
+        let want: [u8; 36] = [
+            0x07, 0xb8, // magic
+            0x1e, 0x00, // length = 30 (LE)
+            0x00, 0x00, // reserved
+            b'r', b'e', b'q', b'=', b'7', b'0', b'4', b'&', b'q', b'u', b'e', b'r', b'y',
+            b'*', // "req=704&query*" (sep '*')
+            0x06, 0x02, 0x00, 0x00, // callee BCD = outdoor
+            0x06, 0x02, 0x11, 0x03, // caller BCD = monitor
+            0x80, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x01, // preview const tail
+        ];
+        assert_eq!(
+            got.as_slice(),
+            &want[..],
+            "build_start_frame 逐字节须等于 Go BuildStartFrame"
+        );
+        assert_eq!(got.len(), 36, "preview-start 帧总长须 36B");
+        // length 字段小端 = 30。
+        assert_eq!(u16::from_le_bytes([got[2], got[3]]), 30);
+        // 分隔符是 '*'（start，对照 req=708 stop 用 '='）。
+        assert_eq!(got[19], b'*', "分隔符须为 '*'（0x2a）");
+    }
+
+    /// start vs stop 恰差 2 处断言（移植 Go `TestBuildStopFrame_ByteLevelDiffFromStart`）：
+    /// offset 12（req 数字 '4'↔'8'）+ offset 19（sep '*'↔'='）。
+    #[test]
+    fn start_stop_frames_differ_exactly_two_bytes() {
+        let callee: [u8; 4] = [0x06, 0x02, 0x00, 0x00];
+        let caller: [u8; 4] = [0x06, 0x02, 0x11, 0x03];
+        let start = build_start_frame(callee, caller);
+        let stop = build_stop_frame(callee, caller);
+
+        assert_eq!(start.len(), stop.len(), "start/stop 总长须一致");
+        let diffs: Vec<usize> = (0..start.len()).filter(|&i| start[i] != stop[i]).collect();
+        assert_eq!(
+            diffs,
+            vec![12, 19],
+            "start/stop 须恰差 2 处：offset 12（704→708）+ offset 19（'*'→'='）"
+        );
+        assert_eq!(start[12], b'4');
+        assert_eq!(stop[12], b'8');
+        assert_eq!(start[19], b'*');
+        assert_eq!(stop[19], b'=');
     }
 }

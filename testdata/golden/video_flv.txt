@@ -1,0 +1,14 @@
+# video FLV transmux golden — SoT: Go internal/video FLVHeader/PackAVCDecoderConfig/BuildAVCSequenceHeaderTag/BuildAVCNALUTag
+# flv_header||<hex>                                  （9B header + 4B PreviousTagSize0 = 13B）
+# avc_config|<spshex>|<ppshex>|<cfghex 或 NIL>       （SPS<4B 或 PPS<1B → NIL）
+# seq_header_tag|<spshex>|<ppshex>|<ts>|<taghex>
+# nalu_tag|<name>|<ts>|<nal data hex, 多 NAL 逗号分隔>|<taghex>
+flv_header||464c5601010000000900000000
+avc_config|6764c016ac1b1aa0|68ee31b21b|0164c016ffe100086764c016ac1b1aa001000568ee31b21b
+avc_config|6764c0|68ee31b21b|NIL
+avc_config|6764c016ac1b1aa0||NIL
+seq_header_tag|6764c016ac1b1aa0|68ee31b21b|0|0900001d0000000000000017000000000164c016ffe100086764c016ac1b1aa001000568ee31b21b00000028
+nalu_tag|keyframe|0|65b8000400007ff7|090000110000000000000017010000000000000865b8000400007ff70000001c
+nalu_tag|inter|33|61010203|0900000d000021000000002701000000000000046101020300000018
+nalu_tag|inter-ext-ts|19088743|61010203|0900000d234567010000002701000000000000046101020300000018
+nalu_tag|inter-multi-nal|66|61010203,61aabb|0900001400004200000000270100000000000004610102030000000361aabb0000001f

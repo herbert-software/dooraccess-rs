@@ -3,9 +3,10 @@
 //! 复刻 Go `internal/http8080/json_helpers.go` 中间件字节契约；endpoint handler 由 G5/G6 填充。
 
 #[allow(unused_imports)]
-use std::io::{self, Read};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::codec::{self, result};
 use crate::config::Config;
@@ -14,11 +15,17 @@ use crate::httpx::mux::ServeMux;
 #[allow(unused_imports)]
 use crate::httpx::{
     Handler, HandlerFunc, Header, Request, ResponseWriter, METHOD_GET, METHOD_POST,
-    STATUS_BAD_REQUEST, STATUS_METHOD_NOT_ALLOWED, STATUS_OK,
+    STATUS_BAD_REQUEST, STATUS_METHOD_NOT_ALLOWED, STATUS_NOT_FOUND, STATUS_OK,
 };
 use crate::info;
 use crate::sender::Sender;
 use crate::unlock::{UnlockOutcome, WireKind};
+use crate::video::frame_buffer::WaitIdrError;
+use crate::video::session::{
+    is_valid_uuid, parse_outdoor, Manager as VideoManager, ParseError as VideoParseError, Session,
+};
+use crate::video::transmux::StreamWriter;
+use crate::video::SharedLogFn;
 
 /// Go `httpx.StatusUnsupportedMedia`（`types.go`）；`httpx/mod.rs` 未导出，本模块自用。
 const STATUS_UNSUPPORTED_MEDIA: u16 = 415;
@@ -26,6 +33,12 @@ const STATUS_UNSUPPORTED_MEDIA: u16 = 415;
 /// Go `httpx.StatusServiceUnavailable`（503）；wire-failure 默认分支（Timeout/其它下游故障）
 /// 用之（锚 Go `respondWireFailure` handlers.go:708）。`httpx/mod.rs` 未导出，本模块自用。
 const STATUS_SERVICE_UNAVAILABLE: u16 = 503;
+
+/// Go `httpx.StatusConflict`（409）；/video/start 单 active session 冲突分支用。
+const STATUS_CONFLICT: u16 = 409;
+
+/// Go `httpx.StatusGatewayTimeout`（504）；stream.flv no-keyframe / missing-SPS-PPS 分支用。
+const STATUS_GATEWAY_TIMEOUT: u16 = 504;
 
 /// handler 层 JSON body 读取上限（Go `parseJSONBody` `LimitReader(1MB)`）。
 pub const MAX_JSON_BODY_BYTES: u64 = 1024 * 1024;
@@ -555,9 +568,15 @@ struct ServerInner {
     dispatch: Arc<dyn UnlockDispatch>,
 }
 
-/// 控制面 HTTP server 依赖（cfg / automation / persist / pusher）。
+/// 控制面 HTTP server 依赖（cfg / automation / persist / pusher / video）。
 pub struct Server {
     inner: Arc<ServerInner>,
+    /// `/video/*` 三入口共用的 video Manager（锚 Go `Server.VideoMgr`）。
+    /// `None` = `cfg.video.forward=false` → 三入口 503 nil-guard（**先于一切 body
+    /// 解析**，spec「daemon 编排接入」需求）。路由本身**无条件注册**（不随其增减）。
+    video: Option<Arc<VideoManager>>,
+    /// video 路径专用 log hook（`video: stream writer exited: ...` 行；锚 Go `s.logf`）。
+    video_logf: Option<SharedLogFn>,
 }
 
 impl Server {
@@ -602,7 +621,16 @@ impl Server {
                 pusher,
                 dispatch,
             }),
+            video: None,
+            video_logf: None,
         }
+    }
+
+    /// 注入 video Manager + log hook（main.rs 在 `cfg.video.forward=true` 时调用；
+    /// 须在 [`Server::handler`] 之前）。`mgr=None` 保持 nil-guard 503 行为。
+    pub fn set_video(&mut self, mgr: Option<Arc<VideoManager>>, logf: Option<SharedLogFn>) {
+        self.video = mgr;
+        self.video_logf = logf;
     }
 
     /// 同步触发 push；`pusher` 为 `None` 时 no-op（无 WG 跟踪，Phase 4 再补）。
@@ -680,6 +708,39 @@ impl Server {
                 }),
             );
             mux.handle("/unlock", Some(Box::new(h)));
+        }
+
+        // 视频转发 endpoints（锚 Go server.go:202-206）：**无条件注册**——不随
+        // cfg.video.forward 增减；forward=false 时 Manager 缺位 → handler 首判
+        // nil-guard 503（先于一切 body 解析）。start/stop 走与 Go 等价的中间件链
+        // methodGuardPOST + requireJSONContentType（405/415）；动态路径用前缀匹配派发。
+        {
+            let st = Arc::clone(&inner);
+            let mgr = self.video.clone();
+            let h = chain_control_post(HandlerFunc(
+                move |w: &mut dyn ResponseWriter, r: &Request| {
+                    handle_video_start(&st, mgr.as_ref(), w, r);
+                },
+            ));
+            mux.handle("/video/start", Some(Box::new(h)));
+        }
+        {
+            let st = Arc::clone(&inner);
+            let mgr = self.video.clone();
+            let h = chain_control_post(HandlerFunc(
+                move |w: &mut dyn ResponseWriter, r: &Request| {
+                    handle_video_stop(&st, mgr.as_ref(), w, r);
+                },
+            ));
+            mux.handle("/video/stop", Some(Box::new(h)));
+        }
+        {
+            let mgr = self.video.clone();
+            let logf = self.video_logf.clone();
+            let h = HandlerFunc(move |w: &mut dyn ResponseWriter, r: &Request| {
+                handle_video_dynamic(mgr.as_ref(), logf.as_ref(), w, r);
+            });
+            mux.handle("/video/", Some(Box::new(h)));
         }
 
         MuxHandler { mux }
@@ -1277,6 +1338,670 @@ fn expect_json_literal(bytes: &[u8], pos: &mut usize, lit: &str) -> Result<(), &
             return Err("invalid literal");
         }
         *pos += 1;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// /video/* endpoint（组 F，锚 Go `video_handlers.go` 全部 + `server.go:202-206`）
+// ---------------------------------------------------------------------------
+
+/// stream.flv 等首 IDR 的超时上限（毫秒）。锚 Go `streamStartupTimeoutNs`（5s）。
+///
+/// test-tunable：D8 套路但 **`AtomicU32` 毫秒**（MIPS32 禁 64-bit 原子）；
+/// 跨测试切换值经 atomic（多测试并行下无 data race）。
+static STREAM_STARTUP_TIMEOUT_MS: AtomicU32 = AtomicU32::new(5_000);
+
+/// 长连接 stream consumer 的 TTL 心跳间隔（毫秒）。锚 Go `ttlRefreshPeriodNs`（30s）。
+static TTL_REFRESH_PERIOD_MS: AtomicU32 = AtomicU32::new(30_000);
+
+/// 改写 stream 首 IDR 等待超时（返旧值；测试压缩用，锚 Go `setTestStartupTimeout`）。
+pub fn set_stream_startup_timeout_ms(ms: u32) -> u32 {
+    STREAM_STARTUP_TIMEOUT_MS.swap(ms, Ordering::SeqCst)
+}
+
+/// 改写 TTL refresh 心跳周期（返旧值；测试压缩用）。
+pub fn set_ttl_refresh_period_ms(ms: u32) -> u32 {
+    TTL_REFRESH_PERIOD_MS.swap(ms, Ordering::SeqCst)
+}
+
+fn stream_startup_timeout() -> Duration {
+    Duration::from_millis(u64::from(STREAM_STARTUP_TIMEOUT_MS.load(Ordering::SeqCst)))
+}
+
+fn ttl_refresh_period() -> Duration {
+    Duration::from_millis(u64::from(TTL_REFRESH_PERIOD_MS.load(Ordering::SeqCst)))
+}
+
+/// nil-guard 503 body 字面（锚 Go `video_handlers.go` 三处入口 + `server.go:50`）。
+const VIDEO_NOT_ENABLED: &str = "video forward not enabled";
+
+/// outdoor URI 必须精确匹配 `cfg.Stations[*].SIP` 之一（SSRF 防护 allowlist，
+/// 锚 Go `isOutdoorAllowed`；stations 空集时恒 false = 安全失败）。
+fn is_outdoor_allowed(st: &ServerInner, uri: &str) -> bool {
+    st.cfg.stations.iter().any(|s| s.sip == uri)
+}
+
+/// [`VideoParseError`] → Go `ParseOutdoor` 错误字面（handler 400 body 嵌入用；
+/// `session::ParseError` 自身 Display 是诊断格式，HTTP 字面走本路径）。
+fn video_parse_err_msg(e: &VideoParseError, uri: &str) -> String {
+    match e {
+        VideoParseError::Uri(ue) => format_uri_err(ue, uri),
+        VideoParseError::Bcd(be) => format_bcd_err(be, uri),
+    }
+}
+
+/// 解析 `/video/start`・`/video/stop` 请求 body，提取 `outdoor` 字段。
+///
+/// 锚 Go `parseJSONBody` + `json.Unmarshal(videoStartBody)`：
+///   - raw 空（0 字节）→ 零值（outdoor=""，调用方落 missing-outdoor 400）
+///   - 语法非法 → `parse JSON body: <Go scanner 字面>`（错误字面即契约，golden 逐字）
+///   - 字段缺失 / 非 string 值 → 零值（缺失对齐 Go；非 string 值 Go 会报 unmarshal
+///     type error，本实现退化为零值——超出 golden 集的已知差异，登记于组 F 报告）
+fn parse_video_body(raw: &[u8]) -> Result<String, String> {
+    if raw.is_empty() {
+        return Ok(String::new());
+    }
+    if let Err(e) = go_json_syntax_check(raw) {
+        return Err(format!("parse JSON body: {e}"));
+    }
+    let trimmed = trim_ascii_whitespace(raw);
+    Ok(extract_json_string_field(trimmed, "outdoor").unwrap_or_default())
+}
+
+/// 处理 `POST /video/start`。锚 Go `handleVideoStart`。
+///
+/// 判定顺序（spec「HTTP video endpoint 字节契约等价」）：nil-guard 503 **先于一切
+/// body 解析**（坏 JSON + forward=false 返 503 非 400）→ 400×4（bad JSON / 缺
+/// outdoor / URI 非法 / allowlist）→ Manager.start → 409 conflict / 503（preview
+/// 超时与其它失败同走 `err.to_string()` body）/ 200 struct 声明序。
+///
+/// 超时语义：Go 以 10s ctx 包 `VideoMgr.Start`；Rust `Manager::start` 内部各段
+/// 自带 deadline（bind 即时 + preview dial 5s + 连接 5s ≈ 最坏 ~10s），无 handler
+/// 级总闸——最接近形态，差异登记于组 F 报告。
+fn handle_video_start(
+    st: &ServerInner,
+    video: Option<&Arc<VideoManager>>,
+    w: &mut dyn ResponseWriter,
+    r: &Request,
+) {
+    let Some(mgr) = video else {
+        error_json(w, STATUS_SERVICE_UNAVAILABLE, VIDEO_NOT_ENABLED);
+        return;
+    };
+    let outdoor_uri = match parse_video_body(&r.body) {
+        Ok(v) => v,
+        Err(msg) => {
+            error_json(w, STATUS_BAD_REQUEST, &msg);
+            return;
+        }
+    };
+    if outdoor_uri.is_empty() {
+        error_json(w, STATUS_BAD_REQUEST, "missing 'outdoor' field");
+        return;
+    }
+    let outdoor = match parse_outdoor(&outdoor_uri) {
+        Ok(o) => o,
+        Err(e) => {
+            error_json(
+                w,
+                STATUS_BAD_REQUEST,
+                &format!(
+                    "invalid 'outdoor' URI: {}",
+                    video_parse_err_msg(&e, &outdoor_uri)
+                ),
+            );
+            return;
+        }
+    };
+    // allowlist：outdoor 必须在 cfg.stations 中（防 LAN 任意 IPv4:port dial）。
+    if !is_outdoor_allowed(st, &outdoor_uri) {
+        error_json(
+            w,
+            STATUS_BAD_REQUEST,
+            "outdoor not in cfg.stations allowlist",
+        );
+        return;
+    }
+
+    match mgr.start(outdoor) {
+        Ok(info) => write_json(
+            w,
+            STATUS_OK,
+            Some(&[
+                ("session_id", JsonValue::String(info.id)),
+                ("stream_url", JsonValue::String(info.stream_url)),
+                ("ttl", JsonValue::Number(info.ttl_secs as i64)),
+            ]),
+        ),
+        Err(e) if e.is_conflict() => error_json(w, STATUS_CONFLICT, &e.to_string()),
+        // preview 超时与其它失败同映射 503 + err 字面 body（锚 Go 两分支同写法；
+        // 分型保留显式以对齐 spec「start 503 三类」枚举）。
+        Err(e) if e.is_preview_timeout() => {
+            error_json(w, STATUS_SERVICE_UNAVAILABLE, &e.to_string())
+        }
+        Err(e) => error_json(w, STATUS_SERVICE_UNAVAILABLE, &e.to_string()),
+    }
+}
+
+/// 处理 `POST /video/stop`。锚 Go `handleVideoStop`。
+///
+/// idempotent：无 active session 也 200 + `{"result":0}`；`Manager::stop` 返 `()`
+/// （teardown 内部失败仅由 Manager 自身 log）——**503 仅 nil-guard 一种**，禁把
+/// Stop 失败映射 503。超时语义：Go 的 8s handler ctx 由 `Manager::stop` 自带的
+/// 8s teardown 总预算（`stop_budget`，session.rs）等价覆盖，handler 层无需再包。
+fn handle_video_stop(
+    st: &ServerInner,
+    video: Option<&Arc<VideoManager>>,
+    w: &mut dyn ResponseWriter,
+    r: &Request,
+) {
+    let Some(mgr) = video else {
+        error_json(w, STATUS_SERVICE_UNAVAILABLE, VIDEO_NOT_ENABLED);
+        return;
+    };
+    let outdoor_uri = match parse_video_body(&r.body) {
+        Ok(v) => v,
+        Err(msg) => {
+            error_json(w, STATUS_BAD_REQUEST, &msg);
+            return;
+        }
+    };
+    if outdoor_uri.is_empty() {
+        error_json(w, STATUS_BAD_REQUEST, "missing 'outdoor' field");
+        return;
+    }
+    if let Err(e) = parse_outdoor(&outdoor_uri) {
+        error_json(
+            w,
+            STATUS_BAD_REQUEST,
+            &format!(
+                "invalid 'outdoor' URI: {}",
+                video_parse_err_msg(&e, &outdoor_uri)
+            ),
+        );
+        return;
+    }
+    // allowlist：与 /video/start 同步对齐（防向任意主机 best-effort 发 stop wire）。
+    if !is_outdoor_allowed(st, &outdoor_uri) {
+        error_json(
+            w,
+            STATUS_BAD_REQUEST,
+            "outdoor not in cfg.stations allowlist",
+        );
+        return;
+    }
+    mgr.stop(&outdoor_uri);
+    write_json(w, STATUS_OK, Some(&[("result", JsonValue::Number(0))]));
+}
+
+/// 处理 `GET /video/<session_id>/{stream.flv,snapshot.jpg}` 动态路由。
+/// 锚 Go `handleVideoDynamic`。
+///
+/// 判定顺序（钉死，spec）：nil-guard 503 **最先** → malformed path（拆不出
+/// `<uuid>/<res>` 两段）404 → UUID 36 字符校验失败 400（**先于 method**：POST +
+/// 坏 UUID 得 400 非 405）→ 非 GET 405+Allow → session not found 404 → 资源派发
+/// （stream.flv / snapshot.jpg / 其它 404）。
+///
+/// 此处**不**刷 TTL：只有 stream.flv 且三件套齐（流真的活）才刷（锚 Go 注释——
+/// 否则空 session 的 client retry 会把唯一 active slot 钉死）。
+fn handle_video_dynamic(
+    video: Option<&Arc<VideoManager>>,
+    logf: Option<&SharedLogFn>,
+    w: &mut dyn ResponseWriter,
+    r: &Request,
+) {
+    let Some(mgr) = video else {
+        error_json(w, STATUS_SERVICE_UNAVAILABLE, VIDEO_NOT_ENABLED);
+        return;
+    };
+    // 拆 path: /video/<id>/<resource>（前缀路由保证 path 以 /video/ 开头）。
+    let rest = r.url.path.strip_prefix("/video/").unwrap_or("");
+    let mut parts = rest.splitn(2, '/');
+    let (session_id, resource) = match (parts.next(), parts.next()) {
+        (Some(id), Some(res)) => (id, res),
+        _ => {
+            error_json(w, STATUS_NOT_FOUND, "video: malformed path");
+            return;
+        }
+    };
+    if !is_valid_uuid(session_id) {
+        error_json(w, STATUS_BAD_REQUEST, "invalid session_id");
+        return;
+    }
+    if r.method != METHOD_GET {
+        w.header().set("Allow", METHOD_GET);
+        error_json(
+            w,
+            STATUS_METHOD_NOT_ALLOWED,
+            &format!("method {} not allowed; use {}", r.method, METHOD_GET),
+        );
+        return;
+    }
+
+    let Some(state) = mgr.current_by_id(session_id) else {
+        error_json(w, STATUS_NOT_FOUND, "video: session not found");
+        return;
+    };
+    match resource {
+        "stream.flv" => serve_video_stream(mgr, logf, w, &state),
+        "snapshot.jpg" => serve_video_snapshot(w),
+        _ => error_json(w, STATUS_NOT_FOUND, "video: unknown resource"),
+    }
+}
+
+/// 把 `&mut dyn ResponseWriter` 适配为 `std::io::Write`（StreamWriter 输出端）。
+///
+/// per-tag flush：[`StreamWriter`] 每 tag 写后调 `flush()` → 经此适配落到
+/// `ResponseWriter::flush` → chunk 边界即出（锚 Go flushAdapter；flush 错误吞，
+/// 下一次 write 自然失败退出）。
+struct ResponseBodyWriter<'a> {
+    w: &'a mut dyn ResponseWriter,
+}
+
+impl Write for ResponseBodyWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.w.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.w.flush()
+    }
+}
+
+/// 写 chunked FLV stream 直到 client 断开（write Err）或 session close。
+/// 锚 Go `serveVideoStream`。
+///
+/// 启动顺序（重要，锚 Go 注释编号）：
+///  1. 先等首个 IDR（[`stream_startup_timeout`] 上限）：超时 → 504 + 不刷 TTL；
+///     等待中 buffer 被 close → 503「session closed」（[`WaitIdrError`] 分型）
+///  2. 二次竞态闸：wait 返回与写头之间被 close → 同 503
+///  3. 二次健康闸：`latest_idr` 三件套（SPS+PPS+IDR）不齐 → 504 + 不刷 TTL
+///  4. 三件套齐 → **handler 路径唯一合法的单次刷 TTL**（失败分支全部不续命）
+///  5. 写 200 + `Content-Type: video/x-flv` + `Cache-Control: no-store`（无
+///     Content-Length → httpx 自动 chunked；连接 write_timeout=None 已预留）
+///  6. 起 TTL refresh 线程（30s tunable 周期；`refresh_ttl` 返 false——session
+///     消失——即停；stream 结束经 done flag 收口）
+///  7. `StreamWriter::run`：client 断开 = write Err 退出（不写响应体），打
+///     `video: stream writer exited: ...` 行（对齐 spec stream bullet）
+fn serve_video_stream(
+    mgr: &Arc<VideoManager>,
+    logf: Option<&SharedLogFn>,
+    w: &mut dyn ResponseWriter,
+    state: &Arc<Session>,
+) {
+    match state.frame_buf.wait_idr(stream_startup_timeout()) {
+        Err(WaitIdrError::Timeout) => {
+            error_json(
+                w,
+                STATUS_GATEWAY_TIMEOUT,
+                "video: no keyframe within startup timeout; outdoor not pushing RTP",
+            );
+            return;
+        }
+        Err(WaitIdrError::Closed) => {
+            error_json(w, STATUS_SERVICE_UNAVAILABLE, "video: session closed");
+            return;
+        }
+        Ok(()) => {}
+    }
+    // 二次确认 buffer 没有在 wait_idr 返回与写头之间被 close（race 极小但保护）。
+    if state.frame_buf.closed() {
+        error_json(w, STATUS_SERVICE_UNAVAILABLE, "video: session closed");
+        return;
+    }
+    // 二次健康闸：起播需要 SPS+PPS+IDR 三者皆缓存；缺 → 504 + 不刷 TTL，
+    // 让 60s TTL 自然 GC 死 session（锚 Go GET 路径 regression 修复）。
+    if state.frame_buf.latest_idr().is_none() {
+        error_json(
+            w,
+            STATUS_GATEWAY_TIMEOUT,
+            "video: stream not ready (missing SPS/PPS)",
+        );
+        return;
+    }
+
+    // 三件套已齐 → 流真的活：现在才刷 TTL（handler 路径唯一合法刷点）。
+    mgr.refresh_ttl(state.id());
+
+    w.header().set("Content-Type", "video/x-flv");
+    w.header().set("Cache-Control", "no-store");
+    w.write_header(STATUS_OK);
+
+    // 后台 TTL refresher：长时拉流期间 session 不被 60s TTL 清理。
+    let done = Arc::new(AtomicBool::new(false));
+    let refresher = {
+        let mgr = Arc::clone(mgr);
+        let sid = state.id().to_string();
+        let done = Arc::clone(&done);
+        std::thread::spawn(move || refresh_ttl_loop(&mgr, &sid, &done))
+    };
+
+    let mut sw = StreamWriter::new(ResponseBodyWriter { w });
+    let res = sw.run(&state.frame_buf);
+    done.store(true, Ordering::SeqCst);
+    refresher.thread().unpark();
+    let _ = refresher.join();
+    if let Err(e) = res {
+        if let Some(f) = logf {
+            f(&format!("video: stream writer exited: {e}"));
+        }
+    }
+}
+
+/// 每 [`ttl_refresh_period`] 刷一次 session TTL，直到 stream 结束（done 置位）
+/// 或 session 消失（`refresh_ttl` 返 false）。锚 Go `refreshTTLLoop`。
+///
+/// 分片 park_timeout 轮询 done（≤20ms 响应 stream 收口；daemon shutdown 时
+/// video teardown close FrameBuffer → stream handler 退出 → done 置位收口本线程）。
+fn refresh_ttl_loop(mgr: &VideoManager, session_id: &str, done: &AtomicBool) {
+    const POLL_SLICE: Duration = Duration::from_millis(20);
+    let period = ttl_refresh_period();
+    let mut next_tick = Instant::now() + period;
+    loop {
+        if done.load(Ordering::SeqCst) {
+            return;
+        }
+        let now = Instant::now();
+        if now >= next_tick {
+            next_tick = now + period;
+            if !mgr.refresh_ttl(session_id) {
+                // session 已不存在（显式 stop / TTL GC）→ 退出。
+                return;
+            }
+        }
+        std::thread::park_timeout(
+            POLL_SLICE.min(next_tick.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
+/// 处理 snapshot.jpg：503 stub（不实现 H.264 → JPEG，hAP CPU 不够；HACS 走
+/// stream-source ffmpeg fallback）。锚 Go `serveVideoSnapshot`（body 字面 golden）。
+fn serve_video_snapshot(w: &mut dyn ResponseWriter) {
+    error_json(
+        w,
+        STATUS_SERVICE_UNAVAILABLE,
+        "snapshot transcoding not supported on this hardware; HACS should fall back to stream-source ffmpeg",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Go encoding/json 风格语法校验（/video/* body 解析路径专用）
+//
+// 错误字面即契约（spec：errorJSON 内嵌 Go 错误字串逐字 golden）——既有最小
+// JSON 校验器（validate_json_syntax）的错误字面是 Rust 自有措辞，video golden
+// 的 bad-JSON 行要求 Go scanner 字面（如 "invalid character 'b' looking for
+// beginning of object key string"）。本节按 Go encoding/json scanner 的主要
+// 状态机消息逐字复刻；非 ASCII 字节的 quote 形态等极端差异登记于组 F 报告。
+// ---------------------------------------------------------------------------
+
+const GO_JSON_EOF: &str = "unexpected end of JSON input";
+
+/// Go `quoteChar`：错误消息中的字符引用形态。
+fn go_quote_char(c: u8) -> String {
+    match c {
+        b'\'' => r#"'\''"#.to_string(),
+        b'"' => "'\"'".to_string(),
+        b'\\' => r"'\\'".to_string(),
+        0x07 => r"'\a'".to_string(),
+        0x08 => r"'\b'".to_string(),
+        0x0c => r"'\f'".to_string(),
+        0x0a => r"'\n'".to_string(),
+        0x0d => r"'\r'".to_string(),
+        0x09 => r"'\t'".to_string(),
+        0x0b => r"'\v'".to_string(),
+        0x20..=0x7e => format!("'{}'", c as char),
+        _ => format!("'\\x{c:02x}'"),
+    }
+}
+
+struct GoJsonScan<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl<'a> GoJsonScan<'a> {
+    fn peek(&self) -> Option<u8> {
+        self.b.get(self.i).copied()
+    }
+
+    fn bump(&mut self) -> Option<u8> {
+        let c = self.peek()?;
+        self.i += 1;
+        Some(c)
+    }
+
+    fn skip_ws(&mut self) {
+        while matches!(
+            self.peek(),
+            Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
+        ) {
+            self.i += 1;
+        }
+    }
+
+    fn value(&mut self) -> Result<(), String> {
+        self.skip_ws();
+        match self.peek() {
+            None => Err(GO_JSON_EOF.to_string()),
+            Some(b'{') => self.object(),
+            Some(b'[') => self.array(),
+            Some(b'"') => self.string(),
+            Some(b't') => self.literal("true"),
+            Some(b'f') => self.literal("false"),
+            Some(b'n') => self.literal("null"),
+            Some(b'-') | Some(b'0'..=b'9') => self.number(),
+            Some(c) => Err(format!(
+                "invalid character {} looking for beginning of value",
+                go_quote_char(c)
+            )),
+        }
+    }
+
+    fn object(&mut self) -> Result<(), String> {
+        self.bump(); // '{'
+        self.skip_ws();
+        if self.peek() == Some(b'}') {
+            self.bump();
+            return Ok(());
+        }
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                None => return Err(GO_JSON_EOF.to_string()),
+                Some(b'"') => self.string()?,
+                Some(c) => {
+                    return Err(format!(
+                        "invalid character {} looking for beginning of object key string",
+                        go_quote_char(c)
+                    ))
+                }
+            }
+            self.skip_ws();
+            match self.bump() {
+                None => return Err(GO_JSON_EOF.to_string()),
+                Some(b':') => {}
+                Some(c) => {
+                    return Err(format!(
+                        "invalid character {} after object key",
+                        go_quote_char(c)
+                    ))
+                }
+            }
+            self.value()?;
+            self.skip_ws();
+            match self.bump() {
+                None => return Err(GO_JSON_EOF.to_string()),
+                Some(b',') => continue,
+                Some(b'}') => return Ok(()),
+                Some(c) => {
+                    return Err(format!(
+                        "invalid character {} after object key:value pair",
+                        go_quote_char(c)
+                    ))
+                }
+            }
+        }
+    }
+
+    fn array(&mut self) -> Result<(), String> {
+        self.bump(); // '['
+        self.skip_ws();
+        if self.peek() == Some(b']') {
+            self.bump();
+            return Ok(());
+        }
+        loop {
+            self.value()?;
+            self.skip_ws();
+            match self.bump() {
+                None => return Err(GO_JSON_EOF.to_string()),
+                Some(b',') => continue,
+                Some(b']') => return Ok(()),
+                Some(c) => {
+                    return Err(format!(
+                        "invalid character {} after array element",
+                        go_quote_char(c)
+                    ))
+                }
+            }
+        }
+    }
+
+    fn string(&mut self) -> Result<(), String> {
+        self.bump(); // opening '"'
+        loop {
+            match self.bump() {
+                None => return Err(GO_JSON_EOF.to_string()),
+                Some(b'"') => return Ok(()),
+                Some(b'\\') => match self.bump() {
+                    None => return Err(GO_JSON_EOF.to_string()),
+                    Some(b'"') | Some(b'\\') | Some(b'/') | Some(b'b') | Some(b'f')
+                    | Some(b'n') | Some(b'r') | Some(b't') => {}
+                    Some(b'u') => {
+                        for _ in 0..4 {
+                            match self.bump() {
+                                None => return Err(GO_JSON_EOF.to_string()),
+                                Some(h) if h.is_ascii_hexdigit() => {}
+                                Some(c) => {
+                                    return Err(format!(
+                                        "invalid character {} in \\u hexadecimal character escape",
+                                        go_quote_char(c)
+                                    ))
+                                }
+                            }
+                        }
+                    }
+                    Some(c) => {
+                        return Err(format!(
+                            "invalid character {} in string escape code",
+                            go_quote_char(c)
+                        ))
+                    }
+                },
+                Some(c) if c < 0x20 => {
+                    return Err(format!(
+                        "invalid character {} in string literal",
+                        go_quote_char(c)
+                    ))
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    fn literal(&mut self, lit: &str) -> Result<(), String> {
+        self.bump(); // 首字符已由 value() 判定
+        for want in lit.bytes().skip(1) {
+            match self.bump() {
+                None => return Err(GO_JSON_EOF.to_string()),
+                Some(c) if c == want => {}
+                Some(c) => {
+                    return Err(format!(
+                        "invalid character {} in literal {} (expecting {})",
+                        go_quote_char(c),
+                        lit,
+                        go_quote_char(want)
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn number(&mut self) -> Result<(), String> {
+        if self.peek() == Some(b'-') {
+            self.bump();
+        }
+        match self.peek() {
+            None => return Err(GO_JSON_EOF.to_string()),
+            Some(b'0') => {
+                self.bump();
+            }
+            Some(b'1'..=b'9') => {
+                while matches!(self.peek(), Some(b'0'..=b'9')) {
+                    self.bump();
+                }
+            }
+            Some(c) => {
+                return Err(format!(
+                    "invalid character {} in numeric literal",
+                    go_quote_char(c)
+                ))
+            }
+        }
+        if self.peek() == Some(b'.') {
+            self.bump();
+            match self.peek() {
+                None => return Err(GO_JSON_EOF.to_string()),
+                Some(b'0'..=b'9') => {
+                    while matches!(self.peek(), Some(b'0'..=b'9')) {
+                        self.bump();
+                    }
+                }
+                Some(c) => {
+                    return Err(format!(
+                        "invalid character {} after decimal point in numeric literal",
+                        go_quote_char(c)
+                    ))
+                }
+            }
+        }
+        if matches!(self.peek(), Some(b'e') | Some(b'E')) {
+            self.bump();
+            if matches!(self.peek(), Some(b'+') | Some(b'-')) {
+                self.bump();
+            }
+            match self.peek() {
+                None => return Err(GO_JSON_EOF.to_string()),
+                Some(b'0'..=b'9') => {
+                    while matches!(self.peek(), Some(b'0'..=b'9')) {
+                        self.bump();
+                    }
+                }
+                Some(c) => {
+                    return Err(format!(
+                        "invalid character {} in exponent of numeric literal",
+                        go_quote_char(c)
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// JSON 语法校验，错误字面对齐 Go `encoding/json` scanner（video body 解析专用）。
+fn go_json_syntax_check(raw: &[u8]) -> Result<(), String> {
+    let mut p = GoJsonScan { b: raw, i: 0 };
+    p.value()?;
+    p.skip_ws();
+    if let Some(c) = p.peek() {
+        return Err(format!(
+            "invalid character {} after top-level value",
+            go_quote_char(c)
+        ));
     }
     Ok(())
 }
@@ -2015,5 +2740,407 @@ mod tests {
         let (status, _, body) = Recorder::new().pipe(|w| h.serve_http(w, &req));
         assert_eq!(status, STATUS_OK);
         assert_eq!(String::from_utf8(body).unwrap(), r#"{"result":-100}"#);
+    }
+
+    // --- 组 F /video/* handler（6.1-6.3）---
+
+    use crate::video::preview::PreviewError;
+    use crate::video::rtp::{NalUnit, NAL_TYPE_IDR, NAL_TYPE_PPS, NAL_TYPE_SPS};
+    use crate::video::session::{parse_caller, Caller, Outdoor, PreviewPort, RtcpPort, RtpPort};
+    use std::net::UdpSocket;
+
+    const VIDEO_OUTDOOR_URI: &str = "06020000@172.16.106.152:18022";
+    const VIDEO_FIXED_UUID: &str = "11111111-2222-4333-8444-555555555555";
+
+    struct VideoFakePreview;
+
+    impl PreviewPort for VideoFakePreview {
+        fn start_preview(&self, _o: &Outdoor, _c: &Caller) -> Result<(), PreviewError> {
+            Ok(())
+        }
+
+        fn stop_preview(
+            &self,
+            _o: &Outdoor,
+            _c: &Caller,
+            _timeout: Option<Duration>,
+        ) -> Result<(), PreviewError> {
+            Ok(())
+        }
+    }
+
+    struct VideoFakeRtp;
+
+    impl RtpPort for VideoFakeRtp {
+        fn run_with_conn(
+            &self,
+            conn: UdpSocket,
+            _expect_src_ip: &str,
+            stop: &AtomicBool,
+        ) -> io::Result<()> {
+            drop(conn);
+            while !stop.load(Ordering::SeqCst) {
+                std::thread::park_timeout(Duration::from_millis(5));
+            }
+            Ok(())
+        }
+    }
+
+    struct VideoFakeRtcp;
+
+    impl RtcpPort for VideoFakeRtcp {
+        fn run(
+            &self,
+            _dst: &str,
+            _ssrc_source: &dyn Fn() -> Option<u32>,
+            _reporter_ssrc: u32,
+            stop: &AtomicBool,
+        ) -> io::Result<()> {
+            while !stop.load(Ordering::SeqCst) {
+                std::thread::park_timeout(Duration::from_millis(5));
+            }
+            Ok(())
+        }
+
+        fn send_bye(&self, _dst: &str, _reporter_ssrc: u32) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn video_test_manager() -> Arc<VideoManager> {
+        let caller = parse_caller("06021103@10.0.0.91:18022").expect("caller");
+        let mut m = VideoManager::new(caller, None);
+        m.rtp_listen_addr = "127.0.0.1:0".to_string();
+        m.preview = Arc::new(VideoFakePreview);
+        m.rtp = Some(Arc::new(VideoFakeRtp));
+        m.rtcp = Arc::new(VideoFakeRtcp);
+        Arc::new(m)
+    }
+
+    fn video_server(mgr: Option<Arc<VideoManager>>) -> Server {
+        let mut cfg = Config::default();
+        cfg.sip = "06021103@10.0.0.91:18022".into();
+        cfg.stations.push(crate::config::Station {
+            sip: VIDEO_OUTDOOR_URI.to_string(),
+            rtsp_url: String::new(),
+        });
+        let mut s = Server::new(cfg, "v-test", None, None, None, MockSender::success());
+        s.set_video(mgr, None);
+        s
+    }
+
+    fn video_outdoor() -> Outdoor {
+        parse_outdoor(VIDEO_OUTDOOR_URI).expect("outdoor")
+    }
+
+    fn video_nal(nal_type: u8, ts: u32) -> NalUnit {
+        NalUnit {
+            nal_type,
+            data: vec![nal_type | 0x60, 0x01, 0x02, 0x03],
+            timestamp: ts,
+        }
+    }
+
+    /// nil-guard 先于一切 body 解析：坏 JSON + forward=false → 503 非 400（三入口）。
+    #[test]
+    fn video_nilguard_precedes_body_parse() {
+        let s = video_server(None);
+        let h = s.handler();
+        for path in ["/video/start", "/video/stop"] {
+            let req = test_request_path("POST", path, Some("application/json"), b"{bad");
+            let (status, _, body) = Recorder::new().pipe(|w| h.serve_http(w, &req));
+            assert_eq!(status, STATUS_SERVICE_UNAVAILABLE, "{path}");
+            assert_eq!(
+                String::from_utf8(body).unwrap(),
+                r#"{"error":"video forward not enabled"}"#,
+                "{path}"
+            );
+        }
+        // 动态路由：nil-guard 最先（先于 malformed/UUID/method 判定）。
+        let req = test_request_path("POST", "/video/not-even-a-uuid", None, b"");
+        let (status, _, body) = Recorder::new().pipe(|w| h.serve_http(w, &req));
+        assert_eq!(status, STATUS_SERVICE_UNAVAILABLE);
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            r#"{"error":"video forward not enabled"}"#
+        );
+    }
+
+    /// 动态路由判定顺序：malformed 404 → UUID 400（先于 method，POST+坏 UUID 得
+    /// 400 非 405）→ 405+Allow → session not found 404；snapshot 503 stub 字面。
+    #[test]
+    fn video_dynamic_judge_order() {
+        let mgr = video_test_manager();
+        let s = video_server(Some(Arc::clone(&mgr)));
+        let h = s.handler();
+
+        let cases: &[(&str, &str, u16, &str)] = &[
+            (
+                "GET",
+                "/video/onlyoneseg",
+                STATUS_NOT_FOUND,
+                r#"{"error":"video: malformed path"}"#,
+            ),
+            (
+                "GET",
+                "/video/not-a-uuid/stream.flv",
+                STATUS_BAD_REQUEST,
+                r#"{"error":"invalid session_id"}"#,
+            ),
+            // UUID 检查先于 method：POST + 坏 UUID → 400 非 405。
+            (
+                "POST",
+                "/video/not-a-uuid/stream.flv",
+                STATUS_BAD_REQUEST,
+                r#"{"error":"invalid session_id"}"#,
+            ),
+            (
+                "POST",
+                &format!("/video/{VIDEO_FIXED_UUID}/stream.flv"),
+                STATUS_METHOD_NOT_ALLOWED,
+                r#"{"error":"method POST not allowed; use GET"}"#,
+            ),
+            (
+                "GET",
+                &format!("/video/{VIDEO_FIXED_UUID}/stream.flv"),
+                STATUS_NOT_FOUND,
+                r#"{"error":"video: session not found"}"#,
+            ),
+        ];
+        for (method, path, want_status, want_body) in cases {
+            let req = test_request_path(method, path, None, b"");
+            let (status, headers, body) = Recorder::new().pipe(|w| h.serve_http(w, &req));
+            assert_eq!(status, *want_status, "{method} {path}");
+            assert_eq!(
+                String::from_utf8(body).unwrap(),
+                *want_body,
+                "{method} {path}"
+            );
+            if *want_status == STATUS_METHOD_NOT_ALLOWED {
+                assert_eq!(headers.get("Allow"), Some("GET"), "{method} {path}");
+            }
+        }
+
+        // session 存在：未知资源 404 / snapshot.jpg 503 stub（body 字面）。
+        let info = mgr.start(video_outdoor()).expect("start");
+        let req = test_request_path(
+            "GET",
+            &format!("/video/{}/something.weird", info.id),
+            None,
+            b"",
+        );
+        let (status, _, body) = Recorder::new().pipe(|w| h.serve_http(w, &req));
+        assert_eq!(status, STATUS_NOT_FOUND);
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            r#"{"error":"video: unknown resource"}"#
+        );
+        let req = test_request_path(
+            "GET",
+            &format!("/video/{}/snapshot.jpg", info.id),
+            None,
+            b"",
+        );
+        let (status, _, body) = Recorder::new().pipe(|w| h.serve_http(w, &req));
+        assert_eq!(status, STATUS_SERVICE_UNAVAILABLE);
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            r#"{"error":"snapshot transcoding not supported on this hardware; HACS should fall back to stream-source ffmpeg"}"#
+        );
+        mgr.shutdown(Duration::from_secs(3));
+    }
+
+    /// allowlist：不在 cfg.stations 的 outdoor → 400（start 与 stop 同判），
+    /// 不触发任何 Manager 调用（无 session 被建）。
+    #[test]
+    fn video_start_stop_allowlist_reject() {
+        let mgr = video_test_manager();
+        let s = video_server(Some(Arc::clone(&mgr)));
+        let h = s.handler();
+        for path in ["/video/start", "/video/stop"] {
+            let req = test_request_path(
+                "POST",
+                path,
+                Some("application/json"),
+                br#"{"outdoor":"06020009@10.9.9.9:18022"}"#,
+            );
+            let (status, _, body) = Recorder::new().pipe(|w| h.serve_http(w, &req));
+            assert_eq!(status, STATUS_BAD_REQUEST, "{path}");
+            assert_eq!(
+                String::from_utf8(body).unwrap(),
+                r#"{"error":"outdoor not in cfg.stations allowlist"}"#,
+                "{path}"
+            );
+        }
+        assert!(mgr.current().is_none(), "allowlist 拒绝不得建 session");
+    }
+
+    /// stop 幂等：无 active session → 200 + {"result":0}。
+    #[test]
+    fn video_stop_idempotent_200() {
+        let mgr = video_test_manager();
+        let s = video_server(Some(mgr));
+        let h = s.handler();
+        let req = test_request_path(
+            "POST",
+            "/video/stop",
+            Some("application/json"),
+            format!(r#"{{"outdoor":"{VIDEO_OUTDOOR_URI}"}}"#).as_bytes(),
+        );
+        let (status, _, body) = Recorder::new().pipe(|w| h.serve_http(w, &req));
+        assert_eq!(status, STATUS_OK);
+        assert_eq!(String::from_utf8(body).unwrap(), r#"{"result":0}"#);
+    }
+
+    /// Go encoding/json scanner 错误字面（bad-JSON 400 body 是契约）。
+    #[test]
+    fn go_json_syntax_check_literals() {
+        assert_eq!(
+            go_json_syntax_check(b"{bad").unwrap_err(),
+            "invalid character 'b' looking for beginning of object key string"
+        );
+        assert_eq!(go_json_syntax_check(b"{\"a\":").unwrap_err(), GO_JSON_EOF);
+        assert_eq!(go_json_syntax_check(b"   ").unwrap_err(), GO_JSON_EOF);
+        assert_eq!(
+            go_json_syntax_check(b"{}x").unwrap_err(),
+            "invalid character 'x' after top-level value"
+        );
+        assert_eq!(
+            go_json_syntax_check(b"{\"a\" 1}").unwrap_err(),
+            "invalid character '1' after object key"
+        );
+        assert_eq!(
+            go_json_syntax_check(b"{\"a\":1 \"b\":2}").unwrap_err(),
+            "invalid character '\"' after object key:value pair"
+        );
+        assert_eq!(
+            go_json_syntax_check(b"[1 2]").unwrap_err(),
+            "invalid character '2' after array element"
+        );
+        assert_eq!(go_json_syntax_check(b"tru").unwrap_err(), GO_JSON_EOF);
+        assert_eq!(
+            go_json_syntax_check(b"trux").unwrap_err(),
+            "invalid character 'x' in literal true (expecting 'e')"
+        );
+        assert!(go_json_syntax_check(
+            "{\"outdoor\":\"a@b:1\",\"n\":-1.5e-3,\"arr\":[true,null,{}],\"s\":\"é\\n\"}"
+                .as_bytes()
+        )
+        .is_ok());
+    }
+
+    /// stream.flv 分型 + TTL 语义（单测试串行多 phase，避免 tunable 并行干扰）：
+    /// 504 no-keyframe / 504 missing-SPS-PPS 失败分支禁刷 TTL；等待中 close →
+    /// 503 session-closed；三件套齐 → 200 video/x-flv + no-store + FLV body +
+    /// 就绪单次刷 + 周期刷。
+    #[test]
+    fn video_stream_ttl_and_error_taxonomy() {
+        let old_to = set_stream_startup_timeout_ms(100);
+        let old_rp = set_ttl_refresh_period_ms(100);
+
+        // phase 1: 无 keyframe → 504 + TTL 不刷。
+        {
+            let mgr = video_test_manager();
+            let s = video_server(Some(Arc::clone(&mgr)));
+            let h = s.handler();
+            let info = mgr.start(video_outdoor()).expect("start");
+            std::thread::sleep(Duration::from_millis(150));
+            let r1 = mgr.ttl_remaining(&info.id).expect("alive");
+            let req =
+                test_request_path("GET", &format!("/video/{}/stream.flv", info.id), None, b"");
+            let (status, _, body) = Recorder::new().pipe(|w| h.serve_http(w, &req));
+            assert_eq!(status, STATUS_GATEWAY_TIMEOUT);
+            assert_eq!(
+                String::from_utf8(body).unwrap(),
+                r#"{"error":"video: no keyframe within startup timeout; outdoor not pushing RTP"}"#
+            );
+            let r2 = mgr.ttl_remaining(&info.id).expect("alive");
+            assert!(r2 < r1, "失败分支禁刷 TTL: r1={r1:?} r2={r2:?}");
+            mgr.shutdown(Duration::from_secs(3));
+        }
+
+        // phase 2: 仅 IDR（缺 SPS/PPS）→ 504 missing + TTL 不刷。
+        {
+            let mgr = video_test_manager();
+            let s = video_server(Some(Arc::clone(&mgr)));
+            let h = s.handler();
+            let info = mgr.start(video_outdoor()).expect("start");
+            let sess = mgr.current_by_id(&info.id).expect("session");
+            sess.frame_buf.push(video_nal(NAL_TYPE_IDR, 90_000));
+            std::thread::sleep(Duration::from_millis(150));
+            let r1 = mgr.ttl_remaining(&info.id).expect("alive");
+            let req =
+                test_request_path("GET", &format!("/video/{}/stream.flv", info.id), None, b"");
+            let (status, _, body) = Recorder::new().pipe(|w| h.serve_http(w, &req));
+            assert_eq!(status, STATUS_GATEWAY_TIMEOUT);
+            assert_eq!(
+                String::from_utf8(body).unwrap(),
+                r#"{"error":"video: stream not ready (missing SPS/PPS)"}"#
+            );
+            let r2 = mgr.ttl_remaining(&info.id).expect("alive");
+            assert!(r2 < r1, "失败分支禁刷 TTL: r1={r1:?} r2={r2:?}");
+            mgr.shutdown(Duration::from_secs(3));
+        }
+
+        // phase 3: 等首 IDR 期间 session 被 close → 503 session-closed（分型非 504）。
+        {
+            set_stream_startup_timeout_ms(2_000);
+            let mgr = video_test_manager();
+            let s = video_server(Some(Arc::clone(&mgr)));
+            let h = s.handler();
+            let info = mgr.start(video_outdoor()).expect("start");
+            let sess = mgr.current_by_id(&info.id).expect("session");
+            let sid = info.id.clone();
+            let worker = std::thread::spawn(move || {
+                let req = test_request_path("GET", &format!("/video/{sid}/stream.flv"), None, b"");
+                Recorder::new().pipe(|w| h.serve_http(w, &req))
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            sess.frame_buf.close();
+            let (status, _, body) = worker.join().expect("join");
+            assert_eq!(status, STATUS_SERVICE_UNAVAILABLE);
+            assert_eq!(
+                String::from_utf8(body).unwrap(),
+                r#"{"error":"video: session closed"}"#
+            );
+            set_stream_startup_timeout_ms(100);
+            mgr.shutdown(Duration::from_secs(3));
+        }
+
+        // phase 4: 三件套齐 → 200 + headers + FLV body；就绪单次刷 + 100ms 周期刷。
+        {
+            let mgr = video_test_manager();
+            let s = video_server(Some(Arc::clone(&mgr)));
+            let h = s.handler();
+            let info = mgr.start(video_outdoor()).expect("start");
+            let sess = mgr.current_by_id(&info.id).expect("session");
+            sess.frame_buf.push(video_nal(NAL_TYPE_SPS, 90_000));
+            sess.frame_buf.push(video_nal(NAL_TYPE_PPS, 90_000));
+            sess.frame_buf.push(video_nal(NAL_TYPE_IDR, 90_000));
+            std::thread::sleep(Duration::from_millis(500));
+            let r1 = mgr.ttl_remaining(&info.id).expect("alive");
+            let sid = info.id.clone();
+            let worker = std::thread::spawn(move || {
+                let req = test_request_path("GET", &format!("/video/{sid}/stream.flv"), None, b"");
+                Recorder::new().pipe(|w| h.serve_http(w, &req))
+            });
+            // 等 handler 就绪刷 + ≥2 个周期刷。
+            std::thread::sleep(Duration::from_millis(350));
+            let r_mid = mgr.ttl_remaining(&info.id).expect("alive");
+            assert!(
+                r_mid > r1,
+                "就绪刷 + 周期刷必须续命: r1={r1:?} r_mid={r_mid:?}"
+            );
+            sess.frame_buf.close(); // 结束 stream（consumer channel 断开 → run 返 Ok）
+            let (status, headers, body) = worker.join().expect("join");
+            assert_eq!(status, STATUS_OK);
+            assert_eq!(headers.get("Content-Type"), Some("video/x-flv"));
+            assert_eq!(headers.get("Cache-Control"), Some("no-store"));
+            assert_eq!(&body[0..3], b"FLV", "FLV header 前缀");
+            mgr.shutdown(Duration::from_secs(3));
+        }
+
+        set_stream_startup_timeout_ms(old_to);
+        set_ttl_refresh_period_ms(old_rp);
     }
 }
