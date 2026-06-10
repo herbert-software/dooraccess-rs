@@ -241,11 +241,9 @@ impl<W: Write> StreamWriter<W> {
         self.w.write_all(&flv_header()).map_err(StreamError::Io)?;
         self.flush();
 
-        // 等首 IDR 归调用方（见 struct 文档）；此处对齐 Go WaitIDR 返回后的判序：
-        // Closed → 正常退出 nil；三件套不齐 → ErrStreamClosed。
-        if buf.closed() {
-            return Ok(());
-        }
+        // 等首 IDR 归调用方（见 struct 文档）；此处对齐 Go LatestIDR 判序：
+        // close 保留三件套缓存 → closed 竞态下 latest_idr 仍返 Some → 照常写种子帧
+        // （退化为单帧可解码 FLV 而非零帧空流）；三件套缺失 → ErrStreamClosed。
         let Some((sps, pps, idr)) = buf.latest_idr() else {
             return Err(StreamError::Closed);
         };
@@ -638,16 +636,50 @@ mod stream_writer_tests {
         assert_eq!(tags[3].0, 100, "wrapped ts must be +100ms");
     }
 
-    /// 进入时 buffer 已 close → 写 header 后正常退出 Ok（锚 Go Closed→nil 分支）。
+    /// 启动 close 竞态：seed 三件套后 close → close 保留缓存 → run 仍写出
+    /// FLV header + seq-header tag + 首 IDR tag（单帧可解码 FLV），正常退出 Ok
+    /// （spec 场景「closed 后 run 写出种子帧」；对称 Go transmux_test.go close+seed 用例）。
     #[test]
-    fn closed_before_run_exits_ok_with_header_only() {
+    fn closed_after_seed_writes_seed_frame() {
         let buf = Arc::new(FrameBuffer::new());
-        buf.close();
+        seed(&buf, 0);
+        buf.close(); // 进入 run 前已 closed，但缓存保留。
         let out = SharedBuf::default();
         StreamWriter::new(out.clone())
             .run(&buf)
-            .expect("closed buffer → normal exit");
-        assert_eq!(out.bytes(), flv_header().to_vec(), "header only");
+            .expect("closed-after-seed → write seed frame then Ok");
+
+        let got = out.bytes();
+        assert!(got.starts_with(b"FLV"), "output missing FLV signature");
+        // 非空：超过 13B header 块。
+        assert!(
+            got.len() > flv_header().len(),
+            "closed race must still emit seed tags, not header-only: {} bytes",
+            got.len()
+        );
+        let tags = walk_tags(&got);
+        assert_eq!(tags.len(), 2, "seq-header + first IDR (no subscription): {tags:?}");
+        // tag 1：AVC sequence header（ts=0，keyframe + packet type 0）。
+        assert_eq!(tags[0].0, 0);
+        assert_eq!(tags[0].1[0], 0x17, "seq-header frametype keyframe+h264");
+        assert_eq!(tags[0].1[1], FLV_AVC_SEQ_HEADER, "avc packet type = seq header");
+        // tag 2：首 IDR keyframe NALU tag（ts=0）。
+        assert_eq!(tags[1].0, 0);
+        assert!(is_keyframe_nalu(&tags[1].1), "second tag must be IDR keyframe NALU");
+    }
+
+    /// 真 close + 无种子（buf.close() 不 seed → latest_idr 返 None）→ Err(Closed)
+    /// （spec 场景「closed 且缓存缺失」专属测试，前置 closed()==true；对称 Go 真 closed 路径）。
+    #[test]
+    fn closed_no_seed_returns_closed_error() {
+        let buf = Arc::new(FrameBuffer::new());
+        buf.close();
+        assert!(buf.closed(), "precondition: buffer is closed");
+        let out = SharedBuf::default();
+        let err = StreamWriter::new(out)
+            .run(&buf)
+            .expect_err("closed + no seed must fail");
+        assert!(matches!(err, StreamError::Closed), "err = {err:?}");
     }
 
     /// 三件套缺失（未 close、调用方误用未先 wait）→ Err(Closed)
