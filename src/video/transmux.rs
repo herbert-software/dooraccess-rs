@@ -658,14 +658,24 @@ mod stream_writer_tests {
             got.len()
         );
         let tags = walk_tags(&got);
-        assert_eq!(tags.len(), 2, "seq-header + first IDR (no subscription): {tags:?}");
+        assert_eq!(
+            tags.len(),
+            2,
+            "seq-header + first IDR (no subscription): {tags:?}"
+        );
         // tag 1：AVC sequence header（ts=0，keyframe + packet type 0）。
         assert_eq!(tags[0].0, 0);
         assert_eq!(tags[0].1[0], 0x17, "seq-header frametype keyframe+h264");
-        assert_eq!(tags[0].1[1], FLV_AVC_SEQ_HEADER, "avc packet type = seq header");
+        assert_eq!(
+            tags[0].1[1], FLV_AVC_SEQ_HEADER,
+            "avc packet type = seq header"
+        );
         // tag 2：首 IDR keyframe NALU tag（ts=0）。
         assert_eq!(tags[1].0, 0);
-        assert!(is_keyframe_nalu(&tags[1].1), "second tag must be IDR keyframe NALU");
+        assert!(
+            is_keyframe_nalu(&tags[1].1),
+            "second tag must be IDR keyframe NALU"
+        );
     }
 
     /// 真 close + 无种子（buf.close() 不 seed → latest_idr 返 None）→ Err(Closed)
