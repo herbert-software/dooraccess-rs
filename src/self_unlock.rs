@@ -43,6 +43,7 @@ use crate::control::AutomationState;
 use crate::daemon::{self, HangupJob, Job, PushTracker, UnlockJob};
 use crate::ha_push::HaPushClient;
 use crate::listen18022::{DetectedFrame, SubFilter, Subscribable};
+use crate::log::log_line;
 use crate::unlock::{
     UnlockOutcome, SELF_UNLOCK_PROBE_INTERVAL, SELF_UNLOCK_PROBE_TIMEOUT, UNLOCK_TOTAL_CAP,
 };
@@ -238,7 +239,9 @@ pub fn spawn_consumer(
             // （`panic=abort` 即 abort daemon），违背本模块 no-panic 防御纪律。此时 sub 随
             // 失败闭包 drop → `Subscription` 的 `Drop` guard 兜底 cancel（清 orphan SubEntry，
             // 不留空转 filter），channel Disconnected，listener 后续投递 silent。
-            eprintln!("dooraccess-rs: [auto_unlock] failed to spawn consumer thread: {e} (self-unlock disabled)");
+            log_line(&format!(
+                "[auto_unlock] failed to spawn consumer thread: {e} (self-unlock disabled)"
+            ));
             None
         }
     }
@@ -282,9 +285,9 @@ fn run_consumer(sub: crate::listen18022::Subscription, deps: &SelfUnlockDeps) {
         }
     }
 
-    eprintln!(
-        "dooraccess-rs: [auto_unlock] self-unlock consumer stopping (dequeue={dequeue_count} triggered={triggered_count})"
-    );
+    log_line(&format!(
+        "[auto_unlock] self-unlock consumer stopping (dequeue={dequeue_count} triggered={triggered_count})"
+    ));
     // 退出统一调一次 cancel（id-幂等，listen18022.rs:664 找不到即 no-op）。
     sub.cancel();
 }
@@ -311,7 +314,7 @@ fn handle_ring(
     // flag gate：每 ring dequeue 后读运行时 auto_unlock（atomic）。off 跳过且**不写 debounce**
     // （未触发无需占窗，否则 flag-off 的 ring 污染窗口误 debounce 后续 flag-on ring）。
     if !deps.automation.load_auto_unlock() {
-        eprintln!("dooraccess-rs: [auto_unlock] flag off, skip src={outdoor_uri}");
+        log_line(&format!("[auto_unlock] flag off, skip src={outdoor_uri}"));
         return;
     }
 
@@ -319,7 +322,7 @@ fn handle_ring(
     if let Some(last) = last_triggered.get(&outdoor_uri) {
         // 单调侧 duration_since（now.duration_since(earlier)，防反向 panic）。
         if ring_at.duration_since(*last) < window {
-            eprintln!("dooraccess-rs: [auto_unlock] debounce skip src={outdoor_uri}");
+            log_line(&format!("[auto_unlock] debounce skip src={outdoor_uri}"));
             return;
         }
     }
@@ -330,17 +333,17 @@ fn handle_ring(
     let (caller_bcd, target_ip, target_port) = match parse_outdoor_uri(&outdoor_uri) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!(
-                "dooraccess-rs: [auto_unlock] parse outdoor uri {outdoor_uri:?} failed: {e} (skip)"
-            );
+            log_line(&format!(
+                "[auto_unlock] parse outdoor uri {outdoor_uri:?} failed: {e} (skip)"
+            ));
             return;
         }
     };
 
     *triggered_count = triggered_count.saturating_add(1);
-    eprintln!(
-        "dooraccess-rs: [auto_unlock] trigger src={outdoor_uri} (dequeue-triggered=debounce_skips)"
-    );
+    log_line(&format!(
+        "[auto_unlock] trigger src={outdoor_uri} (dequeue-triggered=debounce_skips)"
+    ));
 
     // ExecuteUnlockFromRing：经 worker 跑自开锁 + t_ms 测量 + 成功 push event=unlock。
     let outcome = execute_unlock_from_ring(
@@ -407,10 +410,10 @@ fn execute_unlock_from_ring(
     };
 
     let t_ms = ring_at.elapsed().as_millis();
-    eprintln!(
-        "dooraccess-rs: [auto_unlock] result={} retries={} t_ms={t_ms}",
+    log_line(&format!(
+        "[auto_unlock] result={} retries={} t_ms={t_ms}",
         outcome.result, outcome.retries
-    );
+    ));
 
     // §5.1：仅成功 push event=unlock（失败不 push，保持 Stage 1 现状）。best-effort detached。
     if outcome.result == codec::result::OK {
@@ -489,13 +492,11 @@ fn schedule_outdoor_hangup(
                 outdoor_port,
             });
             if daemon::submit_job(&job_tx, job).is_err() {
-                eprintln!(
-                    "dooraccess-rs: [auto_unlock] hangup Job::Hangup dropped (worker queue closed)"
-                );
+                log_line("[auto_unlock] hangup Job::Hangup dropped (worker queue closed)");
             }
         });
     if spawned.is_err() {
-        eprintln!("dooraccess-rs: [auto_unlock] failed to spawn hangup timer thread (skip)");
+        log_line("[auto_unlock] failed to spawn hangup timer thread (skip)");
     }
 }
 
@@ -1212,7 +1213,7 @@ mod e2e {
         let listener = match TcpListener::bind("127.0.0.1:0") {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("skip 5.8 push e2e: bind failed (sandbox?): {e}");
+                eprintln!("skip 5.8 push e2e: bind failed (sandbox?): {e}"); // TEST-ONLY
                 return None;
             }
         };

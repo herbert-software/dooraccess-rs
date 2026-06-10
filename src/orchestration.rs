@@ -21,6 +21,7 @@ use crate::daemon::{self, Job, PushTracker, UnlockJob};
 use crate::ha_push::HaPushClient;
 use crate::listen18022::{self, DetectedFrame};
 use crate::listen6672;
+use crate::log::log_line;
 use crate::unlock::{UnlockOutcome, WireKind, UNLOCK_RETRY_INTERVAL};
 use crate::wire_sender;
 
@@ -140,10 +141,9 @@ pub fn build_listen18022(
         // ① 每帧 FormatLog syslog。
         let dir =
             listen18022::infer_direction(d.src_ip, d.dst_ip, daemon_ip, indoor_ip, &outdoor_ips);
-        eprintln!(
-            "dooraccess-rs: {}",
-            listen18022::format_log(d.req, d.src_ip, d.dst_ip, &d.body, dir)
-        );
+        log_line(&listen18022::format_log(
+            d.req, d.src_ip, d.dst_ip, &d.body, dir,
+        ));
 
         // ② req=704 门铃 push（仅本机外机 src + dst==本机室内机）。
         if d.req != 704 {
@@ -153,9 +153,9 @@ pub fn build_listen18022(
         let outdoor_uri = match outdoor_by_ip.get(&src_str) {
             Some(u) => u.clone(),
             None => {
-                eprintln!(
-                    "dooraccess-rs: ring: src={src_str} not in cfg.Stations (dropped, neighbor or unconfigured station)"
-                );
+                log_line(&format!(
+                    "ring: src={src_str} not in cfg.Stations (dropped, neighbor or unconfigured station)"
+                ));
                 return;
             }
         };
@@ -203,7 +203,7 @@ pub fn build_number_query_callback(cfg: &Config) -> Option<listen6672::FrameCall
     let my_num = match codec::parse_uri(&cfg.sip) {
         Ok((name, _, _)) => name,
         Err(_) => {
-            eprintln!("dooraccess-rs: number_query: cfg.sip parse failed, callback not installed");
+            log_line("number_query: cfg.sip parse failed, callback not installed");
             return None;
         }
     };
@@ -227,20 +227,20 @@ pub fn build_number_query_callback(cfg: &Config) -> Option<listen6672::FrameCall
             }
             // ② 本机门禁网 IPv4。
             let Some(ip) = our_ip else {
-                eprintln!(
-                    "dooraccess-rs: number_query: cannot determine local IPv4 (iface={iface:?})"
-                );
+                log_line(&format!(
+                    "number_query: cannot determine local IPv4 (iface={iface:?})"
+                ));
                 return;
             };
             // ③ 构帧 + 单播回 srcIP。
             let resp = listen6672::build_number_query_response(frame, ip);
             match listen6672::send_udp_response(src_ip, &resp) {
-                Ok(()) => eprintln!(
-                    "dooraccess-rs: number_query: replied to {} with our IP {}",
+                Ok(()) => log_line(&format!(
+                    "number_query: replied to {} with our IP {}",
                     ipv4_str(src_ip),
                     ipv4_str(ip),
-                ),
-                Err(e) => eprintln!("dooraccess-rs: number_query: send: {e}"),
+                )),
+                Err(e) => log_line(&format!("number_query: send: {e}")),
             }
         },
     ))
