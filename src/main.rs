@@ -25,8 +25,10 @@ use dooraccess_rs::config::{self, Config};
 use dooraccess_rs::control::{self, AutomationState, FnPersistHook, Pusher};
 use dooraccess_rs::daemon::{self, Job, PushTracker, WorkerDeps};
 use dooraccess_rs::ha_push::HaPushClient;
+// 中央带时间戳日志入口（组 A）：视频 SharedLogFn / 散落 eprintln 收编经它（组 B）。
 use dooraccess_rs::listen18022;
 use dooraccess_rs::listen6672;
+use dooraccess_rs::log::log_line;
 use dooraccess_rs::orchestration::{
     build_listen18022, build_number_query_callback, load_automation_flags,
     parse_stations_to_ip_map, WorkerUnlockDispatch,
@@ -62,9 +64,10 @@ pub fn main_impl<W: Write>(args: &[String], stderr: &mut W) -> i32 {
     let config_path = match parse_flags(args) {
         Ok(p) => p,
         Err(msg) => {
-            let _ = writeln!(stderr, "dooraccess-rs: {msg}");
+            // EARLY-STAGE: central logger unavailable — pre-logger CLI 诊断（flag 解析失败、退出码 2）。
+            let _ = writeln!(stderr, "dooraccess-rs: {msg}"); // EARLY-STAGE: central logger unavailable
             let _ = writeln!(
-                stderr,
+                stderr, // EARLY-STAGE: central logger unavailable
                 "usage: dooraccess-rs [--config <path>]\n\tdefault config: {DEFAULT_CONFIG_PATH}"
             );
             return 2; // flag 解析失败 → 2。
@@ -80,7 +83,8 @@ pub fn main_impl<W: Write>(args: &[String], stderr: &mut W) -> i32 {
     let cfg = match config::load_config(&config_path) {
         Ok(c) => c,
         Err(e) => {
-            let _ = writeln!(stderr, "load config: {e}");
+            // logger 可用后的生产错误行 → 走 logf（得时间戳 + tag；非 EARLY-STAGE）。
+            logf(stderr, &format!("load config: {e}"));
             return 1; // config 加载失败 → 1。
         }
     };
@@ -122,7 +126,8 @@ pub fn main_impl<W: Write>(args: &[String], stderr: &mut W) -> i32 {
             0
         }
         Err(e) => {
-            let _ = writeln!(stderr, "run: {e}");
+            // logger 可用后的生产错误行 → 走 logf（得时间戳 + tag；非 EARLY-STAGE）。
+            logf(stderr, &format!("run: {e}"));
             1
         }
     }
@@ -151,9 +156,13 @@ fn parse_flags(args: &[String]) -> Result<String, String> {
     Ok(config_path)
 }
 
-/// 极简 stderr 行日志（无 logger crate；banner/syslog 由 G3a 接）。
+/// 行日志（写注入的 `W` sink，保留可测性）：经中央 [`format_log_line`] 加墙钟时间戳 + tag。
+///
+/// **MUST 写注入的 `W`、MUST NOT 委托 `log_line`（写死 stderr）**——否则 `main_impl` 现有
+/// `Vec<u8>` sink 测试断言落空（design D2/F6）。两者共享 `format_log_line` 渲染，各写各的 sink。
 fn logf<W: Write>(stderr: &mut W, msg: &str) {
-    let _ = writeln!(stderr, "dooraccess-rs: {msg}");
+    let line = dooraccess_rs::log::format_log_line(std::time::SystemTime::now(), msg);
+    let _ = writeln!(stderr, "{line}"); // CENTRAL-SINK
 }
 
 // ---------------------------------------------------------------------------
@@ -247,7 +256,7 @@ fn run<W: Write>(
     let video_mgr: Option<Arc<video::session::Manager>> = if cfg.video.forward {
         let caller = video::session::parse_caller(&cfg.sip)
             .map_err(|e| format!("video: parse caller from cfg.sip: {e}"))?;
-        let vlog: video::SharedLogFn = Arc::new(|m: &str| eprintln!("dooraccess-rs: {m}"));
+        let vlog: video::SharedLogFn = Arc::new(|m: &str| log_line(m));
         logf(
             stderr,
             &format!("video: forward enabled, format={}", cfg.video.format),
@@ -335,7 +344,7 @@ fn run<W: Write>(
                 .spawn(move || {
                     if let Err(e) = l.run(sd) {
                         // listener 非致命：HTTP-only 模式继续（锚 Go main.go:268-271）。
-                        eprintln!("dooraccess-rs: listen18022 stopped: {e}");
+                        log_line(&format!("listen18022 stopped: {e}"));
                     }
                 })?,
         );
@@ -384,7 +393,7 @@ fn run<W: Write>(
                 .name("listen6672".into())
                 .spawn(move || {
                     if let Err(e) = l.run(sd) {
-                        eprintln!("dooraccess-rs: listen6672 stopped: {e}");
+                        log_line(&format!("listen6672 stopped: {e}"));
                     }
                 })?,
         );
@@ -422,7 +431,7 @@ fn run<W: Write>(
     // /video/* 三入口的 Manager 注入（forward=false → None 保持 nil-guard 503）。
     ctrl_server.set_video(
         video_mgr.clone(),
-        Some(Arc::new(|m: &str| eprintln!("dooraccess-rs: {m}")) as video::SharedLogFn),
+        Some(Arc::new(|m: &str| log_line(m)) as video::SharedLogFn),
     );
     let http_handler: Arc<dyn dooraccess_rs::httpx::Handler> = Arc::new(ctrl_server.handler());
     let http_server = Arc::new(dooraccess_rs::httpx::server::Server::new());
@@ -706,6 +715,27 @@ mod tests {
         );
         assert_eq!(code, 1);
         let out = String::from_utf8(sink).unwrap();
+        // 既有断言：83 路径（load config）经 logf 收编进注入的 W sink。
         assert!(out.contains("load config"), "应 log config 加载失败: {out}");
+        // 3.2 强化（F1 双保险，补门禁 grep 之外的第二道闸）：断 83 路径的输出行带
+        // 时间戳前缀 shape `^dooraccess-rs: \d{4}/`，使「83 已收编」机械可验。
+        // 项目禁外部 crate（无 regex），用手工 shape 检查。
+        assert!(
+            out.lines()
+                .any(|l| l.contains("load config") && has_ts_prefix(l)),
+            "load config 行须带时间戳前缀 ^dooraccess-rs: \\d{{4}}/: {out}"
+        );
+    }
+
+    /// 手工时间戳前缀 shape 检查（替代 regex；项目禁外部 crate）。
+    /// 形如 `dooraccess-rs: 2026/06/10 ...`——前缀 "dooraccess-rs: "（15 字节）后紧跟
+    /// 4 位年 + `/`。
+    fn has_ts_prefix(line: &str) -> bool {
+        const TAG: &str = "dooraccess-rs: ";
+        let Some(rest) = line.strip_prefix(TAG) else {
+            return false;
+        };
+        let bytes = rest.as_bytes();
+        bytes.len() >= 5 && bytes[0..4].iter().all(u8::is_ascii_digit) && bytes[4] == b'/'
     }
 }

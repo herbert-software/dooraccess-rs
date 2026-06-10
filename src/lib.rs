@@ -26,6 +26,9 @@ pub mod daemon;
 pub mod ha_push;
 pub mod httpx;
 pub mod info;
+/// 中央带时间戳日志层（`add-rust-log-timestamps` 组 A）：`format_log_line`/`render`/`log_line`。
+/// 所有生产日志 sink（通用 logf / 视频 SharedLogFn / 散落 eprintln）收编经此统一入口带墙钟戳。
+pub mod log;
 /// daemon 编排接线 helper（automation flag 加载 / OnDetect 门铃 builder / 号码查询 callback /
 /// 手动 unlock → wire-worker 派发缝）；从 main.rs 上移以便 e2e 测真生产函数。
 pub mod orchestration;

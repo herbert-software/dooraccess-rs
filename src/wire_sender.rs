@@ -1161,7 +1161,7 @@ mod tests {
             }
         }
         // 无 loopback 接口（罕见）——不失败，跳过。
-        eprintln!("skip: no loopback interface lo / lo0 found");
+        eprintln!("skip: no loopback interface lo / lo0 found"); // TEST-ONLY
     }
 
     #[test]

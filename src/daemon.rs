@@ -31,6 +31,7 @@ use std::time::Duration;
 
 use crate::ha_push::HaPushClient;
 use crate::listen18022::Subscribable;
+use crate::log::log_line;
 use crate::unlock::{
     self, Deadline, InstantDeadline, Sleeper, ThreadSleeper, UnlockOutcome, UnlockWire,
     UNLOCK_TOTAL_CAP,
@@ -340,17 +341,14 @@ pub fn run_worker(deps: WorkerDeps, rx: Receiver<Job>, shutdown: Arc<AtomicBool>
                             j.outdoor_port,
                             &frame,
                         ) {
-                            eprintln!(
-                                "dooraccess-rs: auto-hangup (req=708 -> {}): {e}",
-                                j.outdoor_ip
-                            );
+                            log_line(&format!("auto-hangup (req=708 -> {}): {e}", j.outdoor_ip));
                         }
                     }
                     None => {
-                        eprintln!(
-                            "dooraccess-rs: auto-hangup skipped (no hangup wire injected, -> {})",
+                        log_line(&format!(
+                            "auto-hangup skipped (no hangup wire injected, -> {})",
                             j.outdoor_ip
-                        );
+                        ));
                     }
                 }
             }

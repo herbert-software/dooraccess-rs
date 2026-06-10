@@ -929,7 +929,7 @@ mod tests {
             Ok(s) => s,
             // 沙箱可能拦 UDP bind → 跳过（非逻辑失败；BE 正确性本就留 Phase 7 真机）。
             Err(e) => {
-                eprintln!("send_udp_response_loopback_roundtrip skipped: bind failed: {e}");
+                eprintln!("send_udp_response_loopback_roundtrip skipped: bind failed: {e}"); // TEST-ONLY
                 return;
             }
         };
@@ -940,7 +940,7 @@ mod tests {
         let payload = ring_frame(0x94);
         // dst 用 127.0.0.1（loopback），端口用 receiver 实际端口。
         if let Err(e) = send_udp_response_to([127, 0, 0, 1], port, &payload) {
-            eprintln!("send_udp_response_loopback_roundtrip skipped: send failed: {e}");
+            eprintln!("send_udp_response_loopback_roundtrip skipped: send failed: {e}"); // TEST-ONLY
             return;
         }
 
