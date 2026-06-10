@@ -105,8 +105,7 @@ fn golden_video_wire_frames() {
                 let start = build_start_frame(callee, caller);
                 let stop = build_stop_frame(callee, caller);
                 assert_eq!(start.len(), stop.len());
-                let diffs: Vec<usize> =
-                    (0..start.len()).filter(|&i| start[i] != stop[i]).collect();
+                let diffs: Vec<usize> = (0..start.len()).filter(|&i| start[i] != stop[i]).collect();
                 let want: Vec<usize> = f[3]
                     .split(',')
                     .map(|s| s.trim().parse().expect("diff offset"))

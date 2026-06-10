@@ -31,7 +31,9 @@ fn json_int(content: &str, key: &str) -> i64 {
         .find(&needle)
         .unwrap_or_else(|| panic!("expected.json missing key {key:?}"));
     let rest = &content[at + needle.len()..];
-    let colon = rest.find(':').unwrap_or_else(|| panic!("no ':' after {key:?}"));
+    let colon = rest
+        .find(':')
+        .unwrap_or_else(|| panic!("no ':' after {key:?}"));
     let num: String = rest[colon + 1..]
         .trim_start()
         .chars()
@@ -81,8 +83,7 @@ fn load_packets_tsv() -> Vec<RtpPacket> {
 #[test]
 fn reassembler_expa_fixture_parity() {
     let exp_path = fixture_path("expected.json");
-    let exp =
-        fs::read_to_string(&exp_path).unwrap_or_else(|e| panic!("read {exp_path:?}: {e}"));
+    let exp = fs::read_to_string(&exp_path).unwrap_or_else(|e| panic!("read {exp_path:?}: {e}"));
 
     let pkts = load_packets_tsv();
     // 装载前置校验（Go：`len(pkts) != expected.InputPackets` Fatalf）。
@@ -123,17 +124,37 @@ fn reassembler_expa_fixture_parity() {
 
     // 11 项字段逐项断言（与 Go checks 表一一对应）。
     let checks: [(&str, i64, i64); 11] = [
-        ("input_payload_bytes", payload_bytes, json_int(&exp, "input_payload_bytes")),
-        ("frames_complete", frames_done, json_int(&exp, "frames_complete")),
-        ("frames_dropped", stats.dropped_frames as i64, json_int(&exp, "frames_dropped")),
-        ("max_frame_bytes", stats.max_frame_bytes as i64, json_int(&exp, "max_frame_bytes")),
+        (
+            "input_payload_bytes",
+            payload_bytes,
+            json_int(&exp, "input_payload_bytes"),
+        ),
+        (
+            "frames_complete",
+            frames_done,
+            json_int(&exp, "frames_complete"),
+        ),
+        (
+            "frames_dropped",
+            stats.dropped_frames as i64,
+            json_int(&exp, "frames_dropped"),
+        ),
+        (
+            "max_frame_bytes",
+            stats.max_frame_bytes as i64,
+            json_int(&exp, "max_frame_bytes"),
+        ),
         ("nals_total", nals_total, json_int(&exp, "nals_total")),
         ("nals_sps", sps, json_int(&exp, "nals_sps")),
         ("nals_pps", pps, json_int(&exp, "nals_pps")),
         ("nals_idr", idr, json_int(&exp, "nals_idr")),
         ("nals_nonidr", nonidr, json_int(&exp, "nals_nonidr")),
         ("nals_other", other, json_int(&exp, "nals_other")),
-        ("nal_bytes_total", nal_bytes, json_int(&exp, "nal_bytes_total")),
+        (
+            "nal_bytes_total",
+            nal_bytes,
+            json_int(&exp, "nal_bytes_total"),
+        ),
     ];
     for (name, got, want) in checks {
         assert_eq!(got, want, "{name}: got {got}, want {want}");

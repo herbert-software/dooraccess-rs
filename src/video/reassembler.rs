@@ -454,7 +454,13 @@ mod tests {
         // 5 个 200KB 连续包（共 1MB > 256KB cap），最后 marker=1。
         let mut huge = vec![0x42u8; 200 * 1024];
         huge[0] = 0x61; // 首包 NAL header 合法
-        for (i, marker) in [(10u16, false), (11, false), (12, false), (13, false), (14, true)] {
+        for (i, marker) in [
+            (10u16, false),
+            (11, false),
+            (12, false),
+            (13, false),
+            (14, true),
+        ] {
             r.push(mk_pkt(i, 300, marker, &huge));
         }
         let stats = r.stats();
@@ -543,12 +549,18 @@ mod tests {
         let mut r = FrameReassembler::new(Some(Box::new(move |m: &str| {
             sink.lock().unwrap().push(m.to_string());
         })));
-        r.push(mk_pkt(1, 7777, false, &[0x00, 0x00, 0x00, 0x01, 0x61, 0xAA]));
+        r.push(mk_pkt(
+            1,
+            7777,
+            false,
+            &[0x00, 0x00, 0x00, 0x01, 0x61, 0xAA],
+        ));
         r.push(mk_pkt(100, 8888, true, &[0xBB]));
         let got = lines.lock().unwrap();
         assert!(
-            got.iter().any(|l| l
-                == "video: rtp frame dropped reason=seq-gap ts=7777 size=6 seq_range=[1..1]"),
+            got.iter()
+                .any(|l| l
+                    == "video: rtp frame dropped reason=seq-gap ts=7777 size=6 seq_range=[1..1]"),
             "drop 即时行缺失或格式漂移: {got:?}"
         );
     }

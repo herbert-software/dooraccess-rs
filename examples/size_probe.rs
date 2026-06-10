@@ -253,11 +253,13 @@ fn main() {
         black_box(&[0x68, 0xce]),
     ));
     black_box(&avc_cfg);
-    let seq_tag = black_box(dooraccess_rs::video::transmux::build_avc_sequence_header_tag(
-        black_box(&[0x67, 0x42, 0x00, 0x1f]),
-        black_box(&[0x68, 0xce]),
-        black_box(0),
-    ));
+    let seq_tag = black_box(
+        dooraccess_rs::video::transmux::build_avc_sequence_header_tag(
+            black_box(&[0x67, 0x42, 0x00, 0x1f]),
+            black_box(&[0x68, 0xce]),
+            black_box(0),
+        ),
+    );
     black_box(&seq_tag);
 
     // rtp：RTP 头解析 + Annex-B NAL 提取。
@@ -276,7 +278,9 @@ fn main() {
     black_box(rtp_recv_fp as usize);
 
     // reassembler：分片重组器构造（主体经 push 链入；构造取防 DCE）。
-    let reasm = black_box(dooraccess_rs::video::reassembler::FrameReassembler::new(None));
+    let reasm = black_box(dooraccess_rs::video::reassembler::FrameReassembler::new(
+        None,
+    ));
     black_box(&reasm);
 
     // frame_buffer：SPS/PPS/IDR 种子缓存 + fan-out 订阅。
@@ -289,7 +293,9 @@ fn main() {
         black_box(0x9abc_def0),
     ));
     black_box(&rr_sdes);
-    let bye = black_box(dooraccess_rs::video::rtcp::build_bye(black_box(0x1234_5678)));
+    let bye = black_box(dooraccess_rs::video::rtcp::build_bye(black_box(
+        0x1234_5678,
+    )));
     black_box(&bye);
 
     // session：outdoor/caller 解析（codec 复用）。

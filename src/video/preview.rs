@@ -163,7 +163,10 @@ impl PreviewClient {
         self.logf(&format!("video: preview start dial {ip}:{port}"));
         let resp = self.dial_and_exchange(ip, port, &frame)?;
         validate_start_ack(&resp)?;
-        self.logf(&format!("video: preview start ack ok ({} bytes)", resp.len()));
+        self.logf(&format!(
+            "video: preview start ack ok ({} bytes)",
+            resp.len()
+        ));
         Ok(())
     }
 
@@ -181,7 +184,10 @@ impl PreviewClient {
         self.logf(&format!("video: preview stop dial {ip}:{port}"));
         let resp = self.dial_and_exchange(ip, port, &frame)?;
         validate_stop_ack(&resp)?;
-        self.logf(&format!("video: preview stop ack ok ({} bytes)", resp.len()));
+        self.logf(&format!(
+            "video: preview stop ack ok ({} bytes)",
+            resp.len()
+        ));
         Ok(())
     }
 
@@ -400,7 +406,12 @@ mod tests {
         };
         let t0 = Instant::now();
         let err = c
-            .start_preview(&ip, port, [0x06, 0x02, 0x00, 0x00], [0x06, 0x02, 0x11, 0x03])
+            .start_preview(
+                &ip,
+                port,
+                [0x06, 0x02, 0x00, 0x00],
+                [0x06, 0x02, 0x11, 0x03],
+            )
             .expect_err("expected timeout");
         assert!(err.is_timeout(), "err = {err:?}, want Timeout");
         assert!(
@@ -425,7 +436,12 @@ mod tests {
             ..Default::default()
         };
         let err = c
-            .start_preview(&ip, port, [0x06, 0x02, 0x00, 0x00], [0x06, 0x02, 0x11, 0x03])
+            .start_preview(
+                &ip,
+                port,
+                [0x06, 0x02, 0x00, 0x00],
+                [0x06, 0x02, 0x11, 0x03],
+            )
             .expect_err("expected BadAck");
         assert!(
             matches!(err, PreviewError::BadAck(_)),
@@ -447,7 +463,12 @@ mod tests {
             ..Default::default()
         };
         let err = c
-            .start_preview(&ip, port, [0x06, 0x02, 0x00, 0x00], [0x06, 0x02, 0x11, 0x03])
+            .start_preview(
+                &ip,
+                port,
+                [0x06, 0x02, 0x00, 0x00],
+                [0x06, 0x02, 0x11, 0x03],
+            )
             .expect_err("expected SilentFin");
         assert!(
             matches!(err, PreviewError::SilentFin),
@@ -500,8 +521,13 @@ mod tests {
             ..Default::default()
         };
         let t0 = Instant::now();
-        c.start_preview(&ip, port, [0x06, 0x02, 0x00, 0x00], [0x06, 0x02, 0x11, 0x03])
-            .expect("first segment with magic+req must pass");
+        c.start_preview(
+            &ip,
+            port,
+            [0x06, 0x02, 0x00, 0x00],
+            [0x06, 0x02, 0x11, 0x03],
+        )
+        .expect("first segment with magic+req must pass");
         assert!(
             t0.elapsed() < Duration::from_millis(250),
             "single read must not wait for second segment, took {:?}",

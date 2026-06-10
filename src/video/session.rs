@@ -730,8 +730,7 @@ impl Manager {
                     if now >= next_tick {
                         next_tick = now + interval;
                         if !fired
-                            && now
-                                > *sess.ttl_deadline.lock().unwrap_or_else(|e| e.into_inner())
+                            && now > *sess.ttl_deadline.lock().unwrap_or_else(|e| e.into_inner())
                         {
                             mgr.logf(&format!(
                                 "video: session id={} outdoor={} TTL expired; auto-stop",
@@ -927,9 +926,9 @@ impl Manager {
             let per_segment = PREVIEW_DIAL_TIMEOUT
                 .min(remaining / 2)
                 .max(Duration::from_millis(1));
-            if let Err(e) = self
-                .preview
-                .stop_preview(&sess.outdoor, &self.caller, Some(per_segment))
+            if let Err(e) =
+                self.preview
+                    .stop_preview(&sess.outdoor, &self.caller, Some(per_segment))
             {
                 self.logf(&format!(
                     "video: stop-preview wire failed (continuing): {e}"
@@ -963,8 +962,8 @@ impl Manager {
             .unwrap_or_else(|e| e.into_inner())
             .take();
         if let Some(rx) = rx {
-            let wait = SESSION_THREADS_EXIT_WAIT
-                .min(deadline.saturating_duration_since(Instant::now()));
+            let wait =
+                SESSION_THREADS_EXIT_WAIT.min(deadline.saturating_duration_since(Instant::now()));
             match rx.recv_timeout(wait) {
                 Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
                 Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -1373,7 +1372,9 @@ mod tests {
         let sess = m.current_by_id(&info.id).expect("current_by_id hit");
         assert_eq!(sess.id(), info.id);
         assert_eq!(sess.outdoor_uri(), "06020000@172.16.106.152:18022");
-        assert!(m.current_by_id("ffffffff-ffff-4fff-8fff-ffffffffffff").is_none());
+        assert!(m
+            .current_by_id("ffffffff-ffff-4fff-8fff-ffffffffffff")
+            .is_none());
         m.shutdown(Duration::from_secs(3));
     }
 
@@ -1406,10 +1407,7 @@ mod tests {
     #[test]
     fn start_fails_on_preview_error_rolls_back_socket_only() {
         let (m, fp, _, _) = test_manager();
-        fp.start_err
-            .lock()
-            .unwrap()
-            .replace("boom".to_string());
+        fp.start_err.lock().unwrap().replace("boom".to_string());
         let m = Arc::new(m);
         let err = m
             .start(must_outdoor("06020000@172.16.106.152:18022"))
@@ -1617,7 +1615,8 @@ mod tests {
         // 等 TTL 过期触发 + StopPreview 已被调用但仍在 delay 中。
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
-            if fp.stops.load(Ordering::SeqCst) >= 1 && fp.stops_completed.load(Ordering::SeqCst) == 0
+            if fp.stops.load(Ordering::SeqCst) >= 1
+                && fp.stops_completed.load(Ordering::SeqCst) == 0
             {
                 break;
             }
@@ -1666,7 +1665,10 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(5));
         }
-        assert!(fp.stops.load(Ordering::SeqCst) >= 1, "TTL cleanup never fired");
+        assert!(
+            fp.stops.load(Ordering::SeqCst) >= 1,
+            "TTL cleanup never fired"
+        );
 
         let t0 = Instant::now();
         m.shutdown(Duration::from_millis(100));
@@ -1804,7 +1806,9 @@ mod tests {
         thread::spawn(move || {
             // start + teardown stop 共两连接；多余 accept 随测试结束被丢弃。
             for _ in 0..4 {
-                let Ok((mut conn, _)) = ln.accept() else { return };
+                let Ok((mut conn, _)) = ln.accept() else {
+                    return;
+                };
                 let mut buf = [0u8; 64];
                 let n = conn.read(&mut buf).unwrap_or(0);
                 let frame = &buf[..n];
@@ -1854,8 +1858,7 @@ mod tests {
                 let mut buf = [0u8; 64];
                 let _ = conn.read(&mut buf);
                 // 回 stop ack 冒充 start ack → 校验必须拒绝。
-                let _ =
-                    conn.write_all(&hex("07b8180000007265713d3730392671756572792a0000"));
+                let _ = conn.write_all(&hex("07b8180000007265713d3730392671756572792a0000"));
             }
         });
         let caller = parse_caller("06021103@10.0.0.91:18022").expect("caller");
@@ -1863,7 +1866,11 @@ mod tests {
         m.rtp_listen_addr = "127.0.0.1:0".to_string();
         let m = Arc::new(m);
         let err = m
-            .start(must_outdoor(&format!("06020000@{}:{}", addr.ip(), addr.port())))
+            .start(must_outdoor(&format!(
+                "06020000@{}:{}",
+                addr.ip(),
+                addr.port()
+            )))
             .expect_err("bad ack must fail start");
         assert!(matches!(err, StartError::Preview(_)), "err = {err:?}");
         assert!(m.current().is_none());

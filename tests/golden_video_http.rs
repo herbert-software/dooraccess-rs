@@ -281,10 +281,10 @@ fn server_with(mgr: Option<Arc<Manager>>) -> Arc<dyn Handler> {
 /// sentinel 前缀断言行（内文 runtime-variable，见文件头）→ (name, body 前缀)。
 fn prefix_sentinel(name: &str) -> Option<&'static str> {
     match name {
-        "start_409_conflict" => Some(r#"{"error":"video: another outdoor session is active: active="#),
-        "start_503_preview_timeout" => {
-            Some(r#"{"error":"video: outdoor preview signal failed: "#)
+        "start_409_conflict" => {
+            Some(r#"{"error":"video: another outdoor session is active: active="#)
         }
+        "start_503_preview_timeout" => Some(r#"{"error":"video: outdoor preview signal failed: "#),
         "start_503_other" => Some(r#"{"error":"video: rtp bind "#),
         _ => None,
     }
@@ -310,8 +310,11 @@ fn video_endpoints_golden() {
         let mut restore_timeout: Option<u32> = None;
         let handler: Arc<dyn Handler> = match name {
             // nil-guard 行（VideoMgr 缺位）。
-            "start_503_nilguard" | "start_503_nilguard_bad_json" | "stop_503_nilguard"
-            | "stop_503_nilguard_bad_json" | "dyn_503_nilguard" => server_with(None),
+            "start_503_nilguard"
+            | "start_503_nilguard_bad_json"
+            | "stop_503_nilguard"
+            | "stop_503_nilguard_bad_json"
+            | "dyn_503_nilguard" => server_with(None),
 
             // 200 成功：fixture UUID + ttl 60。
             "start_200" => {

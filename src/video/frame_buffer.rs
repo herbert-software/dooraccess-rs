@@ -382,7 +382,11 @@ mod tests {
         let (rx, _sub) = b.subscribe();
         b.push(nal(NAL_TYPE_NON_IDR, &[0x61, 0xff], 280));
         let first = rx.recv_timeout(Duration::from_millis(500)).expect("NAL");
-        assert_eq!(first.data, vec![0x61, 0xff], "订阅起点之前的间隙 NAL 不补投");
+        assert_eq!(
+            first.data,
+            vec![0x61, 0xff],
+            "订阅起点之前的间隙 NAL 不补投"
+        );
         assert_eq!(rx.try_recv().unwrap_err(), TryRecvError::Empty);
     }
 

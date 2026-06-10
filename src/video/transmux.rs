@@ -238,9 +238,7 @@ impl<W: Write> StreamWriter<W> {
     ///   - `Err(StreamError::Closed)` 三件套缺失（等价 Go `ErrStreamClosed`）
     ///   - `Err(StreamError::Io)` w 写失败（client disconnect）
     pub fn run(&mut self, buf: &Arc<FrameBuffer>) -> Result<(), StreamError> {
-        self.w
-            .write_all(&flv_header())
-            .map_err(StreamError::Io)?;
+        self.w.write_all(&flv_header()).map_err(StreamError::Io)?;
         self.flush();
 
         // 等首 IDR 归调用方（见 struct 文档）；此处对齐 Go WaitIDR 返回后的判序：
@@ -391,8 +389,7 @@ mod tests {
         let tag = build_avc_sequence_header_tag(&sps, &pps, 0).expect("tag");
         assert!(tag.len() >= FLV_TAG_HEADER_SIZE + 5 + 4, "tag too short");
         assert_eq!(tag[0], FLV_TAG_TYPE_VIDEO, "tag type");
-        let data_size =
-            ((tag[1] as u32) << 16 | (tag[2] as u32) << 8 | tag[3] as u32) as usize;
+        let data_size = ((tag[1] as u32) << 16 | (tag[2] as u32) << 8 | tag[3] as u32) as usize;
         assert_eq!(
             data_size,
             tag.len() - FLV_TAG_HEADER_SIZE - 4,
@@ -404,7 +401,11 @@ mod tests {
         // PreviousTagSize 末尾。
         let n = tag.len();
         let prev = u32::from_be_bytes([tag[n - 4], tag[n - 3], tag[n - 2], tag[n - 1]]);
-        assert_eq!(prev as usize, FLV_TAG_HEADER_SIZE + data_size, "PreviousTagSize");
+        assert_eq!(
+            prev as usize,
+            FLV_TAG_HEADER_SIZE + data_size,
+            "PreviousTagSize"
+        );
     }
 
     /// 移植 Go `TestBuildAVCNALUTag_KeyframeMarker`：IDR → 0x17 / P-frame → 0x27。
@@ -438,8 +439,7 @@ mod tests {
     fn build_avc_nalu_tag_length_prefixed_nals() {
         let idr = nal(NAL_TYPE_IDR, &[0x65, 0xaa, 0xbb]);
         let tag = build_avc_nalu_tag(std::slice::from_ref(&idr), 0).expect("tag");
-        let data_size =
-            ((tag[1] as u32) << 16 | (tag[2] as u32) << 8 | tag[3] as u32) as usize;
+        let data_size = ((tag[1] as u32) << 16 | (tag[2] as u32) << 8 | tag[3] as u32) as usize;
         let body = &tag[FLV_TAG_HEADER_SIZE..FLV_TAG_HEADER_SIZE + data_size];
         // body[5..9] 是 NAL length（big-endian）。
         let na_len = u32::from_be_bytes([body[5], body[6], body[7], body[8]]) as usize;
@@ -547,7 +547,7 @@ mod stream_writer_tests {
 
         thread::sleep(Duration::from_millis(50)); // 让 priming + 订阅就位。
         buf.push(nal(NAL_TYPE_NON_IDR, &[0x61, 0xbb], 90090)); // +90 ticks = +1ms
-        // 订阅循环跳过重复参数集。
+                                                               // 订阅循环跳过重复参数集。
         buf.push(nal(NAL_TYPE_SPS, &[0x67, 0x64, 0xc0, 0x16], 90090));
         thread::sleep(Duration::from_millis(50));
         buf.close();
@@ -594,8 +594,7 @@ mod stream_writer_tests {
 
         let tags = walk_tags(&out.bytes());
         // keyframe NALU tag：首 IDR + 订阅期 2 个 = 3。
-        let kf: Vec<&(u32, Vec<u8>)> =
-            tags.iter().filter(|(_, b)| is_keyframe_nalu(b)).collect();
+        let kf: Vec<&(u32, Vec<u8>)> = tags.iter().filter(|(_, b)| is_keyframe_nalu(b)).collect();
         assert_eq!(
             kf.len(),
             3,
@@ -624,7 +623,11 @@ mod stream_writer_tests {
         thread::sleep(Duration::from_millis(50));
         // base + 90（跨 u32 回绕）→ 1ms；base + 9000 → 100ms。
         buf.push(nal(NAL_TYPE_NON_IDR, &[0x61, 0x01], base.wrapping_add(90)));
-        buf.push(nal(NAL_TYPE_NON_IDR, &[0x61, 0x02], base.wrapping_add(9000)));
+        buf.push(nal(
+            NAL_TYPE_NON_IDR,
+            &[0x61, 0x02],
+            base.wrapping_add(9000),
+        ));
         thread::sleep(Duration::from_millis(50));
         buf.close();
         join.join().unwrap().expect("run exits Ok");

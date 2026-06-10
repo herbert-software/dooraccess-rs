@@ -437,9 +437,12 @@ mod tests {
     fn extract_nals_annexb_first_packet() {
         let payload = hex(&format!(
             "{}{}{}{}{}{}",
-            "00000001", "6711aa", // SPS (type=7)
-            "00000001", "6822bb", // PPS (type=8)
-            "00000001", "6533cc", // IDR (type=5)
+            "00000001",
+            "6711aa", // SPS (type=7)
+            "00000001",
+            "6822bb", // PPS (type=8)
+            "00000001",
+            "6533cc", // IDR (type=5)
         ));
         let nals = extract_nals_annexb(&payload, 1000);
         assert_eq!(nals.len(), 3, "want 3 NALs");
@@ -469,7 +472,10 @@ mod tests {
         let payload = hex(&format!("{}{}{}", "61aabb", "00000001", "6533cc"));
         let nals = extract_nals_annexb(&payload, 7);
         assert_eq!(nals.len(), 2);
-        assert_eq!(nals[0].nal_type, NAL_TYPE_NON_IDR, "前续分片 type 取首字节低 5 位");
+        assert_eq!(
+            nals[0].nal_type, NAL_TYPE_NON_IDR,
+            "前续分片 type 取首字节低 5 位"
+        );
         assert_eq!(nals[0].data, hex("61aabb"));
         assert_eq!(nals[1].nal_type, NAL_TYPE_IDR);
     }
@@ -623,7 +629,11 @@ mod receiver_tests {
         let _ = rx.recv_timeout(Duration::from_secs(2)).expect("NAL 2");
 
         let got = seen.lock().unwrap().clone();
-        assert_eq!(got, vec![0x1111_1111], "SSRC must latch on first packet only");
+        assert_eq!(
+            got,
+            vec![0x1111_1111],
+            "SSRC must latch on first packet only"
+        );
 
         stop.store(true, Ordering::SeqCst);
         join.join().unwrap().expect("receiver exit");
@@ -651,7 +661,8 @@ mod receiver_tests {
 
         let got = lines.lock().unwrap();
         assert!(
-            got.iter().any(|l| l.starts_with("video: rtp listening on ")),
+            got.iter()
+                .any(|l| l.starts_with("video: rtp listening on ")),
             "missing listening line: {got:?}"
         );
         assert!(

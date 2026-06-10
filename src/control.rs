@@ -1456,7 +1456,11 @@ fn handle_video_start(
     };
     // allowlist：outdoor 必须在 cfg.stations 中（防 LAN 任意 IPv4:port dial）。
     if !is_outdoor_allowed(st, &outdoor_uri) {
-        error_json(w, STATUS_BAD_REQUEST, "outdoor not in cfg.stations allowlist");
+        error_json(
+            w,
+            STATUS_BAD_REQUEST,
+            "outdoor not in cfg.stations allowlist",
+        );
         return;
     }
 
@@ -1520,7 +1524,11 @@ fn handle_video_stop(
     }
     // allowlist：与 /video/start 同步对齐（防向任意主机 best-effort 发 stop wire）。
     if !is_outdoor_allowed(st, &outdoor_uri) {
-        error_json(w, STATUS_BAD_REQUEST, "outdoor not in cfg.stations allowlist");
+        error_json(
+            w,
+            STATUS_BAD_REQUEST,
+            "outdoor not in cfg.stations allowlist",
+        );
         return;
     }
     mgr.stop(&outdoor_uri);
@@ -1765,7 +1773,10 @@ impl<'a> GoJsonScan<'a> {
     }
 
     fn skip_ws(&mut self) {
-        while matches!(self.peek(), Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')) {
+        while matches!(
+            self.peek(),
+            Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
+        ) {
             self.i += 1;
         }
     }
@@ -2864,18 +2875,47 @@ mod tests {
         let h = s.handler();
 
         let cases: &[(&str, &str, u16, &str)] = &[
-            ("GET", "/video/onlyoneseg", STATUS_NOT_FOUND, r#"{"error":"video: malformed path"}"#),
-            ("GET", "/video/not-a-uuid/stream.flv", STATUS_BAD_REQUEST, r#"{"error":"invalid session_id"}"#),
+            (
+                "GET",
+                "/video/onlyoneseg",
+                STATUS_NOT_FOUND,
+                r#"{"error":"video: malformed path"}"#,
+            ),
+            (
+                "GET",
+                "/video/not-a-uuid/stream.flv",
+                STATUS_BAD_REQUEST,
+                r#"{"error":"invalid session_id"}"#,
+            ),
             // UUID 检查先于 method：POST + 坏 UUID → 400 非 405。
-            ("POST", "/video/not-a-uuid/stream.flv", STATUS_BAD_REQUEST, r#"{"error":"invalid session_id"}"#),
-            ("POST", &format!("/video/{VIDEO_FIXED_UUID}/stream.flv"), STATUS_METHOD_NOT_ALLOWED, r#"{"error":"method POST not allowed; use GET"}"#),
-            ("GET", &format!("/video/{VIDEO_FIXED_UUID}/stream.flv"), STATUS_NOT_FOUND, r#"{"error":"video: session not found"}"#),
+            (
+                "POST",
+                "/video/not-a-uuid/stream.flv",
+                STATUS_BAD_REQUEST,
+                r#"{"error":"invalid session_id"}"#,
+            ),
+            (
+                "POST",
+                &format!("/video/{VIDEO_FIXED_UUID}/stream.flv"),
+                STATUS_METHOD_NOT_ALLOWED,
+                r#"{"error":"method POST not allowed; use GET"}"#,
+            ),
+            (
+                "GET",
+                &format!("/video/{VIDEO_FIXED_UUID}/stream.flv"),
+                STATUS_NOT_FOUND,
+                r#"{"error":"video: session not found"}"#,
+            ),
         ];
         for (method, path, want_status, want_body) in cases {
             let req = test_request_path(method, path, None, b"");
             let (status, headers, body) = Recorder::new().pipe(|w| h.serve_http(w, &req));
             assert_eq!(status, *want_status, "{method} {path}");
-            assert_eq!(String::from_utf8(body).unwrap(), *want_body, "{method} {path}");
+            assert_eq!(
+                String::from_utf8(body).unwrap(),
+                *want_body,
+                "{method} {path}"
+            );
             if *want_status == STATUS_METHOD_NOT_ALLOWED {
                 assert_eq!(headers.get("Allow"), Some("GET"), "{method} {path}");
             }
@@ -2977,10 +3017,7 @@ mod tests {
             go_json_syntax_check(b"[1 2]").unwrap_err(),
             "invalid character '2' after array element"
         );
-        assert_eq!(
-            go_json_syntax_check(b"tru").unwrap_err(),
-            GO_JSON_EOF
-        );
+        assert_eq!(go_json_syntax_check(b"tru").unwrap_err(), GO_JSON_EOF);
         assert_eq!(
             go_json_syntax_check(b"trux").unwrap_err(),
             "invalid character 'x' in literal true (expecting 'e')"
@@ -3009,12 +3046,8 @@ mod tests {
             let info = mgr.start(video_outdoor()).expect("start");
             std::thread::sleep(Duration::from_millis(150));
             let r1 = mgr.ttl_remaining(&info.id).expect("alive");
-            let req = test_request_path(
-                "GET",
-                &format!("/video/{}/stream.flv", info.id),
-                None,
-                b"",
-            );
+            let req =
+                test_request_path("GET", &format!("/video/{}/stream.flv", info.id), None, b"");
             let (status, _, body) = Recorder::new().pipe(|w| h.serve_http(w, &req));
             assert_eq!(status, STATUS_GATEWAY_TIMEOUT);
             assert_eq!(
@@ -3036,12 +3069,8 @@ mod tests {
             sess.frame_buf.push(video_nal(NAL_TYPE_IDR, 90_000));
             std::thread::sleep(Duration::from_millis(150));
             let r1 = mgr.ttl_remaining(&info.id).expect("alive");
-            let req = test_request_path(
-                "GET",
-                &format!("/video/{}/stream.flv", info.id),
-                None,
-                b"",
-            );
+            let req =
+                test_request_path("GET", &format!("/video/{}/stream.flv", info.id), None, b"");
             let (status, _, body) = Recorder::new().pipe(|w| h.serve_http(w, &req));
             assert_eq!(status, STATUS_GATEWAY_TIMEOUT);
             assert_eq!(
@@ -3063,12 +3092,7 @@ mod tests {
             let sess = mgr.current_by_id(&info.id).expect("session");
             let sid = info.id.clone();
             let worker = std::thread::spawn(move || {
-                let req = test_request_path(
-                    "GET",
-                    &format!("/video/{sid}/stream.flv"),
-                    None,
-                    b"",
-                );
+                let req = test_request_path("GET", &format!("/video/{sid}/stream.flv"), None, b"");
                 Recorder::new().pipe(|w| h.serve_http(w, &req))
             });
             std::thread::sleep(Duration::from_millis(100));
@@ -3097,12 +3121,7 @@ mod tests {
             let r1 = mgr.ttl_remaining(&info.id).expect("alive");
             let sid = info.id.clone();
             let worker = std::thread::spawn(move || {
-                let req = test_request_path(
-                    "GET",
-                    &format!("/video/{sid}/stream.flv"),
-                    None,
-                    b"",
-                );
+                let req = test_request_path("GET", &format!("/video/{sid}/stream.flv"), None, b"");
                 Recorder::new().pipe(|w| h.serve_http(w, &req))
             });
             // 等 handler 就绪刷 + ≥2 个周期刷。

@@ -333,7 +333,8 @@ mod tests {
         });
 
         // 无 0 时刻 tick：周期 80ms，前 ~30ms 内不应有包。
-        recv.set_read_timeout(Some(Duration::from_millis(30))).unwrap();
+        recv.set_read_timeout(Some(Duration::from_millis(30)))
+            .unwrap();
         let mut buf = [0u8; 256];
         assert!(
             recv.recv_from(&mut buf).is_err(),
@@ -372,7 +373,8 @@ mod tests {
             r.run(&dst, &|| None, 0x2238_9cb9, &stop_c)
         });
 
-        recv.set_read_timeout(Some(Duration::from_millis(180))).unwrap();
+        recv.set_read_timeout(Some(Duration::from_millis(180)))
+            .unwrap();
         let mut buf = [0u8; 256];
         assert!(
             recv.recv_from(&mut buf).is_err(),

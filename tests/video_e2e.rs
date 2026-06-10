@@ -203,9 +203,7 @@ fn expected_stream_bytes(plan: &ReplayPlan) -> Vec<u8> {
     out.extend_from_slice(
         &build_avc_sequence_header_tag(&sps.data, &pps.data, 0).expect("seq header tag"),
     );
-    out.extend_from_slice(
-        &build_avc_nalu_tag(std::slice::from_ref(idr), 0).expect("seed idr tag"),
-    );
+    out.extend_from_slice(&build_avc_nalu_tag(std::slice::from_ref(idr), 0).expect("seed idr tag"));
     for n in &plan.stage2_nals {
         if n.nal_type == NAL_TYPE_SPS || n.nal_type == NAL_TYPE_PPS {
             continue;
@@ -224,10 +222,7 @@ fn expected_stream_bytes(plan: &ReplayPlan) -> Vec<u8> {
 
 /// 起 mock 外机 18022 ack server：每连接单次 read，含 `req=704` 回 705 ack +
 /// 记 "start"；含 `req=708` 回 709 ack + 记 "stop"。bind 失败（沙箱）返 None。
-fn spawn_mock_outdoor(
-    events: Arc<Mutex<Vec<String>>>,
-    max_conns: usize,
-) -> Option<(String, u16)> {
+fn spawn_mock_outdoor(events: Arc<Mutex<Vec<String>>>, max_conns: usize) -> Option<(String, u16)> {
     let ln = match TcpListener::bind("127.0.0.1:0") {
         Ok(l) => l,
         Err(e) => {
@@ -296,7 +291,7 @@ fn wait_for_bye(sock: &UdpSocket, deadline: Duration) -> bool {
     while Instant::now() < end {
         match sock.recv_from(&mut buf) {
             Ok((n, _)) if compound_has_bye(&buf[..n]) => return true,
-            Ok(_) => continue, // 周期 RR+SDES（无 BYE）。
+            Ok(_) => continue,  // 周期 RR+SDES（无 BYE）。
             Err(_) => continue, // read timeout：回环再试。
         }
     }
@@ -406,7 +401,9 @@ fn http_request(addr: SocketAddr, method: &str, path: &str, body: &[u8]) -> (u16
 fn extract_session_id(body: &[u8]) -> String {
     let s = String::from_utf8_lossy(body);
     let key = "\"session_id\":\"";
-    let at = s.find(key).unwrap_or_else(|| panic!("no session_id in {s}"));
+    let at = s
+        .find(key)
+        .unwrap_or_else(|| panic!("no session_id in {s}"));
     s[at + key.len()..]
         .chars()
         .take_while(|c| *c != '"')
@@ -533,8 +530,8 @@ fn parse_flv(body: &[u8]) -> FlvStats {
     let mut o = 13;
     while o + 11 <= body.len() {
         let tag_type = body[o];
-        let size = ((body[o + 1] as usize) << 16) | ((body[o + 2] as usize) << 8)
-            | (body[o + 3] as usize);
+        let size =
+            ((body[o + 1] as usize) << 16) | ((body[o + 2] as usize) << 8) | (body[o + 3] as usize);
         let end = o + 11 + size + 4; // tag header + data + PreviousTagSize。
         if end > body.len() {
             break; // 不完整尾 tag（增量读截断）——不计入。
@@ -631,7 +628,11 @@ fn e2e_start_stream_fanout_stop_bye() {
     let (status, body) = http_request(rig.addr, "POST", "/video/start", start_body.as_bytes());
     assert_eq!(status, 200, "start: {}", String::from_utf8_lossy(&body));
     let sid = extract_session_id(&body);
-    assert_eq!(events_snapshot(&rig.events), vec!["start"], "preview start 信令");
+    assert_eq!(
+        events_snapshot(&rig.events),
+        vec!["start"],
+        "preview start 信令"
+    );
 
     // 真 receiver 实际 bind 的 RTP 端口（127.0.0.1:0 随机注入口）。
     let rtp_dst = wait_rtp_addr(&rig.logs);
@@ -641,15 +642,25 @@ fn e2e_start_stream_fanout_stop_bye() {
     let a = open_stream(rig.addr, &sid);
 
     // stage 1：replay 至 frame 1 完成（SPS+PPS+IDR 种子三件套切出）。
-    replay(&tx, rtp_dst, &pkts, 0..=plan.stage1_end, Duration::from_micros(100));
+    replay(
+        &tx,
+        rtp_dst,
+        &pkts,
+        0..=plan.stage1_end,
+        Duration::from_micros(100),
+    );
 
     // A 收到 13B 头部块 + seq-header + 种子 IDR（FLV 前缀断言的就绪信号）。
     let seed_len = {
         let sps = &plan.seed[0];
         let pps = &plan.seed[1];
         let idr = &plan.seed[2];
-        13 + build_avc_sequence_header_tag(&sps.data, &pps.data, 0).unwrap().len()
-            + build_avc_nalu_tag(std::slice::from_ref(idr), 0).unwrap().len()
+        13 + build_avc_sequence_header_tag(&sps.data, &pps.data, 0)
+            .unwrap()
+            .len()
+            + build_avc_nalu_tag(std::slice::from_ref(idr), 0)
+                .unwrap()
+                .len()
     };
     assert!(
         poll_until(Duration::from_secs(5), || a.dechunked().len() >= seed_len),
@@ -700,7 +711,10 @@ fn e2e_start_stream_fanout_stop_bye() {
         wait_for_bye(&rig.rtcp_sock, Duration::from_secs(2)),
         "teardown 必须向 outdoor:6671 发 RTCP BYE 复合包"
     );
-    assert!(rig.mgr.current().is_none(), "stop 后 active session 必须摘除");
+    assert!(
+        rig.mgr.current().is_none(),
+        "stop 后 active session 必须摘除"
+    );
 
     // FrameBuffer close → 订阅断 → StreamWriter 正常退出 → 两消费者 EOF 收口。
     // byte-exact：FLV 前缀 + 全部 tag 字节与离线期望逐字节一致（双消费者同流）。
@@ -756,7 +770,13 @@ fn e2e_slow_consumer_does_not_block_fast() {
         .expect("slow req");
 
     // stage 1 种子 → fast 就绪。
-    replay(&tx, rtp_dst, &pkts, 0..=plan.stage1_end, Duration::from_micros(100));
+    replay(
+        &tx,
+        rtp_dst,
+        &pkts,
+        0..=plan.stage1_end,
+        Duration::from_micros(100),
+    );
     assert!(
         poll_until(Duration::from_secs(5), || !fast.dechunked().is_empty()),
         "fast 未收到种子"
