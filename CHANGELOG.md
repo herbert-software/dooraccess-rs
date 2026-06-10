@@ -1,8 +1,8 @@
 # Changelog
 
-本文件记录 `dooraccess-rs`（Rust 等价移植）的显著改动。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
+本文件记录 `dooraccess-rs` 的显著改动。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
-仓库暂无 git tag（零 tag，等 D4 替换生产决策后统一起点）；在此之前改动归入 `[Unreleased]`。
+仓库暂无 git tag；在此之前改动归入 `[Unreleased]`。
 
 ## [Unreleased]
 
@@ -10,7 +10,7 @@
 
 - **生产日志带墙钟时间戳**（OpenSpec `add-rust-log-timestamps`）：新增中央带戳日志层 `src/log.rs`——
   - `render(tm, millis, msg)`（纯函数，手工 `format!` 拼接，不用 `strftime`）+ `format_log_line(now, msg)`（经 `libc::localtime_r` 取本地分解时间，不用 `tzset`）+ `log_line(msg)`（单次加锁写 stderr，多线程不交错）。
-  - 每条生产日志行前缀 `dooraccess-rs: YYYY/MM/DD HH:MM:SS.mmm`（进程内自带戳，不依赖 syslog/procd；对齐 Go stderr 回退路径格式，毫秒精度）。
+  - 每条生产日志行前缀 `dooraccess-rs: YYYY/MM/DD HH:MM:SS.mmm`（进程内自带戳，不依赖 syslog/procd；毫秒精度）。
   - 健壮性零 panic（`panic=abort`）：时钟早于 epoch（`duration_since` `Err`）或 `localtime_r` 返 null 时降级占位戳，仍输出行、不 `unwrap`。
 
 ### Changed
