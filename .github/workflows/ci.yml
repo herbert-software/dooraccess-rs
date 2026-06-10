@@ -112,7 +112,8 @@ jobs:
           mkdir -p "$DOORACCESS_GOLDEN_DIR"
           # listen6672 / listen18022 含 linux-only export（extractUDPPayload/extractTCPPayload，
           # `//go:build linux && export`）——CI runner 是 ubuntu(linux)，原生编译跑得到。
-          for pkg in codec wire18022 config automationstate http8080 listen6672 listen18022; do
+          # video（port-rust-video-forward, task 1.5）：纯 `//go:build export` 无 linux 约束。
+          for pkg in codec wire18022 config automationstate http8080 listen6672 listen18022 video; do
             go test -tags export -run ExportGolden ./internal/$pkg/
           done
       - name: Diff committed golden vs fresh Go export
@@ -121,14 +122,24 @@ jobs:
           # listener/BPF/sender 向量（组 E，task 8.4）：bpf.txt（6672+18022 双写互验）+
           # listen{6672,18022}.txt（parser/classify/numquery）+ listen{6672,18022}_extract.txt
           # （linux-only extract）+ wire_sender.txt（sender 帧 + 错误分类）。
+          # video 向量（task 1.5）：video_{wire,rtcp,flv}.txt（preview 帧/RTCP/FLV transmux）。
           for f in bcd.txt uri.txt wire.txt config.txt results.txt automation_state.txt \
                    bpf.txt listen6672.txt listen6672_extract.txt \
-                   listen18022.txt listen18022_extract.txt wire_sender.txt; do
+                   listen18022.txt listen18022_extract.txt wire_sender.txt \
+                   video_wire.txt video_rtcp.txt video_flv.txt; do
             diff -u "dooraccess-rs/testdata/golden/$f" "_fresh-golden/$f" \
               || { echo "::error::golden 向量漂移：committed $f 与当前 Go 输出不一致"; exit 1; }
           done
-          for f in parser.txt endpoint_body.txt endpoint_socket.txt middleware.txt hapush.txt mux404.txt; do
+          for f in parser.txt endpoint_body.txt endpoint_socket.txt middleware.txt hapush.txt mux404.txt \
+                   video_endpoints.txt; do
             diff -u "dooraccess-rs/testdata/golden/http/$f" "_fresh-golden/http/$f" \
               || { echo "::error::golden HTTP 向量漂移：committed http/$f 与当前 Go 输出不一致"; exit 1; }
+          done
+          # expA fixture 双侧一致性（task 1.4）：不是 export 生成的，是从 Go 仓静态复制的
+          # 语言无关 fixture（tasks 3.3 parity 测试读取）——直接 cmp 两仓原件防静默漂移。
+          for f in expA.packets.tsv expected.json; do
+            cmp "dooraccess-rs/testdata/rtp-fragmentation/$f" \
+                "dooraccess-go/tests/fixtures/rtp-fragmentation/$f" \
+              || { echo "::error::expA fixture 漂移：dooraccess-rs/testdata/rtp-fragmentation/$f 与 Go 仓原件不一致"; exit 1; }
           done
           echo "✓ committed golden 向量与当前 Go 输出逐字节一致"

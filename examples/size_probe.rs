@@ -232,5 +232,75 @@ fn main() {
     ));
     black_box(&hangup_job);
 
+    // --- Phase5 video 模块链入（port-rust-video-forward / task 7.3）---
+    // 链入 video 全栈代表函数，使 MIPS binary 反映 video 真正链入时的体型增量。
+    // 纯函数（wire start 帧 / FLV 静态构造 / RTCP 构造 / RTP+codec 解析）直接调用；
+    // 线程/socket-spawn 入口（RtpReceiver::run / RtcpSender::run / PreviewClient /
+    // Manager::start）取函数指针经 black_box 防 DCE，不在体型探针里真起线程/开 socket。
+
+    // wire18022::build_start_frame —— video 信令 req=704 start 帧（与 build_stop_frame 同居）。
+    let start_frame = black_box(dooraccess_rs::wire18022::build_start_frame(
+        black_box([0x06, 0x02, 0x00, 0x00]),
+        black_box([0x06, 0x02, 0x11, 0x03]),
+    ));
+    black_box(&start_frame);
+
+    // transmux：FLV 静态构造（header / seq-header tag / NALU tag）。
+    let flv_hdr = black_box(dooraccess_rs::video::transmux::flv_header());
+    black_box(&flv_hdr);
+    let avc_cfg = black_box(dooraccess_rs::video::transmux::pack_avc_decoder_config(
+        black_box(&[0x67, 0x42, 0x00, 0x1f]),
+        black_box(&[0x68, 0xce]),
+    ));
+    black_box(&avc_cfg);
+    let seq_tag = black_box(dooraccess_rs::video::transmux::build_avc_sequence_header_tag(
+        black_box(&[0x67, 0x42, 0x00, 0x1f]),
+        black_box(&[0x68, 0xce]),
+        black_box(0),
+    ));
+    black_box(&seq_tag);
+
+    // rtp：RTP 头解析 + Annex-B NAL 提取。
+    let rtp_pkt = black_box(dooraccess_rs::video::rtp::parse_rtp(black_box(&[
+        0x80, 0x62, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x01,
+    ])));
+    black_box(&rtp_pkt);
+    let nals = black_box(dooraccess_rs::video::rtp::extract_nals_annexb(
+        black_box(&[0x00, 0x00, 0x00, 0x01, 0x67, 0x42]),
+        black_box(0),
+    ));
+    black_box(&nals);
+    let rtp_recv_fp: fn(&str) -> std::io::Result<std::net::UdpSocket> =
+        dooraccess_rs::video::rtp::bind_udp;
+    black_box(rtp_recv_fp as usize);
+
+    // reassembler：分片重组器构造（主体经 push 链入；构造取防 DCE）。
+    let reasm = black_box(dooraccess_rs::video::reassembler::FrameReassembler::new(None));
+    black_box(&reasm);
+
+    // frame_buffer：SPS/PPS/IDR 种子缓存 + fan-out 订阅。
+    let fb = black_box(dooraccess_rs::video::frame_buffer::FrameBuffer::new());
+    black_box(&fb);
+
+    // rtcp：RR/SDES/BYE 复合包构造（CNAME 字面，golden 守字节）。
+    let rr_sdes = black_box(dooraccess_rs::video::rtcp::build_rr_sdes(
+        black_box(0x1234_5678),
+        black_box(0x9abc_def0),
+    ));
+    black_box(&rr_sdes);
+    let bye = black_box(dooraccess_rs::video::rtcp::build_bye(black_box(0x1234_5678)));
+    black_box(&bye);
+
+    // session：outdoor/caller 解析（codec 复用）。
+    let outdoor = black_box(dooraccess_rs::video::session::parse_outdoor(black_box(
+        "06020000@10.0.0.10:18022",
+    )));
+    black_box(&outdoor);
+    let caller = black_box(dooraccess_rs::video::session::parse_caller(black_box(
+        "06021103",
+    )));
+    black_box(&caller);
+
     println!("size_probe ok");
 }

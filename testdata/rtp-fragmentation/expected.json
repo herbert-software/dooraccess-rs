@@ -1,0 +1,17 @@
+{
+  "fixture": "expA.pcap",
+  "captured_at": "2026-04-27 hAP br-door",
+  "input_packets": 1539,
+  "input_payload_bytes": 1415032,
+  "frames_complete": 296,
+  "frames_dropped": 0,
+  "max_frame_bytes": 19402,
+  "nals_total": 326,
+  "nals_sps": 15,
+  "nals_pps": 15,
+  "nals_idr": 15,
+  "nals_nonidr": 281,
+  "nals_other": 0,
+  "nal_bytes_total": 1413728,
+  "annexb_overhead_per_nal": 4
+}

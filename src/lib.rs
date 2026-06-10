@@ -33,6 +33,9 @@ pub mod orchestration;
 /// ExecuteUnlockFromRing + auto-hangup detached 计时线程；Phase 4 ②）。
 pub mod self_unlock;
 pub mod sender;
+/// 视频转发栈（Phase 5 `port-rust-video-forward`）：RTP 解析 / 专有分片重组 /
+/// FLV transmux 等（对 Go `internal/video/` golden parity）。
+pub mod video;
 pub mod wire18022;
 
 // --- Phase 3 新增：FFI / BPF 地基（组 A）---

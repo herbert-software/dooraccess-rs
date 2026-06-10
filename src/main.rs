@@ -32,6 +32,7 @@ use dooraccess_rs::orchestration::{
     parse_stations_to_ip_map, WorkerUnlockDispatch,
 };
 use dooraccess_rs::self_unlock;
+use dooraccess_rs::video;
 use dooraccess_rs::{automation_state, info, wire_sender};
 
 /// 主配置默认路径（锚 Go `defaultConfigPath`）。
@@ -240,6 +241,23 @@ fn run<W: Write>(
     // ha_push client（HTTP-to-HA 反向 push；hass.api 空时 push 内部静默跳过）。
     let push_client = Arc::new(HaPushClient::new(cfg.clone(), None));
 
+    // ── 视频转发子系统（Phase 5 组 F，锚 Go main.go:147-157）：仅 cfg.video.forward=true
+    // 时构造 Manager；否则缺位（None）→ /video/* 三入口 503 nil-guard。路由本身由
+    // control::Server::handler 无条件注册（不随 forward 增减）。
+    let video_mgr: Option<Arc<video::session::Manager>> = if cfg.video.forward {
+        let caller = video::session::parse_caller(&cfg.sip)
+            .map_err(|e| format!("video: parse caller from cfg.sip: {e}"))?;
+        let vlog: video::SharedLogFn = Arc::new(|m: &str| eprintln!("dooraccess-rs: {m}"));
+        logf(
+            stderr,
+            &format!("video: forward enabled, format={}", cfg.video.format),
+        );
+        Some(Arc::new(video::session::Manager::new(caller, Some(vlog))))
+    } else {
+        logf(stderr, "video: forward disabled (cfg.video.forward=false)");
+        None
+    };
+
     // slaves 解析：显式 iface_list 优先，否则桥成员枚举（§3.1，移植 resolve_iface_list）。
     let slaves: Vec<String> = match cfg.resolve_iface_list() {
         Ok(s) => {
@@ -393,13 +411,18 @@ fn run<W: Write>(
     let unlock_dispatch: Arc<dyn control::UnlockDispatch> = Arc::new(WorkerUnlockDispatch {
         job_tx: job_tx.clone(),
     });
-    let ctrl_server = control::Server::with_dispatch(
+    let mut ctrl_server = control::Server::with_dispatch(
         cfg.clone(),
         env!("CARGO_PKG_VERSION"),
         Some(automation.share()), // handler 拨动这一 handle；与 persister/banner 读的同一组原子
         Some(persist_hook),
         Some(pusher),
         unlock_dispatch,
+    );
+    // /video/* 三入口的 Manager 注入（forward=false → None 保持 nil-guard 503）。
+    ctrl_server.set_video(
+        video_mgr.clone(),
+        Some(Arc::new(|m: &str| eprintln!("dooraccess-rs: {m}")) as video::SharedLogFn),
     );
     let http_handler: Arc<dyn dooraccess_rs::httpx::Handler> = Arc::new(ctrl_server.handler());
     let http_server = Arc::new(dooraccess_rs::httpx::server::Server::new());
@@ -490,9 +513,19 @@ fn run<W: Write>(
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
-    // ── 钉死 shutdown 排序（决策 8）──
+    // ── 钉死 shutdown 排序（决策 8 + Phase 5 骨架 MODIFIED delta ①v 插步）──
     // ① 置位 shutdown（listener recv / 在飞 unlock / push 线程观察）。
     shutdown.store(true, Ordering::SeqCst);
+
+    // ①v VideoMgr shutdown（带 deadline 5s，对齐 Go main.go:327-353 三处插桩的
+    //    stopCtx 5s；video 未启用 = no-op）——**先于 join listener/HTTP**：video
+    //    teardown（preview stop → RTCP BYE → 尾等 → cancel session 线程 →
+    //    FrameBuffer close）使 stream consumer channel 全断 → in-flight stream
+    //    handler 退出 → ④ httpx shutdown（拒新连接 + 等 in-flight handler）才能在
+    //    deadline 内完成（design D6：反序必卡满 timeout）。
+    if let Some(mgr) = &video_mgr {
+        mgr.shutdown(std::time::Duration::from_secs(5));
+    }
 
     // ② 先 join listener 线程（各于下个 SO_RCVTIMEO ~500ms wakeup 退出）。
     //    join 完即无新 OnDetect → 无新门铃 push spawn（关 RC-F1 窗口）。
