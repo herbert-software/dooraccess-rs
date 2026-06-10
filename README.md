@@ -127,7 +127,3 @@ bash scripts/check-log-gate.sh  # 日志门禁：无残留无戳直写 stderr + 
 ## 项目状态
 
 完整 daemon 已实现并在 hAP 上**灰度运行**：协议核心 / HTTP 控制面 / PF_PACKET listener / 响铃自开锁 / 视频转发 / 带戳日志全栈就位。真机验证：响铃自开锁**物理门开**、HACS 端到端**收到视频流**、PF_PACKET 大端取帧、日志带时间戳。
-
-## 文档
-
-- `CHANGELOG.md` —— 改动历史
