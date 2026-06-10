@@ -60,7 +60,7 @@ Rust 对照：MIPS 视频 binary **563,228 字节**（`make dist` 2026-06-XX 实
 | 外机悬挂处理 | N/A——走正常 `/video/stop` teardown，未触发 abort-before-stop 分支 | — | 无悬挂态 |
 | 回滚后 Go `/info` + RSS | ✅ Go pid 1010 起、`/info` 正常、free available ~3MB | — | 生产恢复 |
 | automation.state 还原 + HACS | state == `.preverify`（true/true，Rust 未动 flag）；HACS 两 switch 本会话未拨（视频不需），待 user 扫一眼确认仍 ON | — | flag 面已确认不变 |
-| 可选：HACS 端到端 / 多消费者 | 未做 | — | 加分项，留后续 |
+| 可选：HACS 端到端 / 多消费者 | ✅ **HACS 正常收到视频流**（2026-06-11，gray-deploy 的 572,780B log-timestamp build 上 user 验证）——HA stream 组件作真消费者拉流，端到端连续画面通 | — | **闭合早前 ffmpeg frame=1 follow-up**：那是 Mac curl 复用已耗尽会话的种子重放（非管道缺陷）；HACS 真消费者触发新会话/真实推流即正常收流 |
 
 ### 真机观察（按范围不在本 change 修）
 
@@ -74,3 +74,9 @@ Rust 对照：MIPS 视频 binary **563,228 字节**（`make dist` 2026-06-XX 实
 - **BE 面②（RTCP send）**：外机不收 RTCP，端到端不可验，靠 dev golden 字节保真 + const 断言（review 已修正判据）。
 - **60s+ 长流 / 端到端连续画面 / 精确 RSS·CPU**：受外机单次推流上限 + 本窗口为接续态限制**未取全**——属外机特性 + 窗口安排，非 daemon 缺陷；留下次专门窗口（需真实监视事件维持长流）。
 - **合成 D4**：与 Phase 4 self-unlock（HAP_VERIFY.md：真实响铃物理门开 t_ms=1398 + RSS 528KB）合并——协议核心 / listener BE / daemon / self-unlock / **视频 BE 面①** 全栈真机认证；视频 BE②/长流受外机限制，作 D4 已知边界记录。
+
+## 2026-06-11 更新（gray-deploy + 端到端视频闭合 + 等价判定）
+
+- **端到端视频通**：`add-rust-log-timestamps`（PR #10）合并后 swap 上 hAP 的 **572,780B** build（pid 1372，/tmp + setsid，VmRSS 604KB、8080 服务、日志带时间戳真机验证）上，**user 确认 HACS 正常收到视频流**——HA stream 组件作真消费者，端到端连续画面通。**闭合早前 ffmpeg frame=1 follow-up**（那是 Mac curl 复用耗尽会话的种子重放，非管道缺陷）。
+- **等价判定（user）**：至此 **Rust 基本等价于 Go v0.10.0**——协议/listener BE/daemon/self-unlock 物理门开/视频 BE①+端到端 HACS 收流全栈真机过。
+- **下一步**：gray-deploy 跑几天看效果（无 GOMEMLIMIT，盯 RAM/respawn；/tmp binary 重启即丢回老 Go），稳则进 D4 替换生产决策。回滚 runbook 见 DEPLOY §Rust 回滚（kill 1372 → mv .preverify → init.d Go start → 还原 HACS）。
