@@ -49,8 +49,18 @@ jobs:
         run: make dist
       - name: Record byte count
         run: ls -l dist/dooraccess-rs-mips
+      - name: Upload downloadable artifact (canonical CI build)
+        # CI-canonical 溯源（决策 7=B）：每次 run（含 workflow_dispatch）都上传可下载产物，
+        # 供 cutover `gh run download` 取来部署 + burn-in。这个被测产物即权威 binary。
+        uses: actions/upload-artifact@v7
+        with:
+          name: dooraccess-rs-mips
+          path: dist/dooraccess-rs-mips
       - name: Create GitHub Release (tag push only)
-        # workflow_dispatch dry-run 跑到此步即止（不创建 Release），仅验构建链 + 字节。
+        # workflow_dispatch dry-run 跑到此步即止（不创建 Release），仅产可下载产物。
+        # ⚠️ CI-canonical：tag 时此步用 tag-commit 的**新构建**，若 nightly 漂移可能 ≠
+        #   burn-in 测过的产物。release asset MUST == 被测产物——打 tag 后校验字节、不一致则
+        #   `gh release upload <tag> <tested-binary> --clobber` 用被测产物替换（见 DEPLOY.md §Rust 生产部署 / tasks 5.3）。
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
