@@ -1,4 +1,4 @@
-//! HA 反向 push client（移植 Go `internal/hapush`）。
+//! HA 反向 push client。
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -24,7 +24,7 @@ impl fmt::Display for NotConfiguredError {
 
 impl std::error::Error for NotConfiguredError {}
 
-/// 反向 push HTTP 客户端（对齐 Go `hapush.Client`）。
+/// 反向 push HTTP 客户端。
 pub struct HaPushClient {
     cfg: Config,
     http: Client,
@@ -178,8 +178,8 @@ pub fn pick_non_loopback_ipv4(addrs: &[Ipv4Addr]) -> String {
 
 /// 拼接 HA push 目标 URL（`http://<host>:<port><api>`）。
 ///
-/// 复刻 Go `net.JoinHostPort`：host 含 `:`（IPv6 字面量）时加 `[]` 包裹。doorlink 部署
-/// 恒 IPv4 故通常不触发，但保持与 Go buildURL 字节等价（避免未来 IPv6 HA 地址分叉）。
+/// host 含 `:`（IPv6 字面量）时加 `[]` 包裹。doorlink 部署恒 IPv4 故通常不触发，
+/// 但保留 IPv6 分支避免未来 IPv6 HA 地址出错。
 pub fn build_url(host: &str, port: i64, api: &str) -> String {
     if host.contains(':') {
         format!("http://[{host}]:{port}{api}")

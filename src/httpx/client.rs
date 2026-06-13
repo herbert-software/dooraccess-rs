@@ -1,4 +1,4 @@
-//! Bare HTTP/1.1 client（复刻 Go `client.go`）。
+//! Bare HTTP/1.1 client。
 
 use std::io::{self, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -18,7 +18,7 @@ pub struct Client {
     pub timeout: Option<Duration>,
 }
 
-/// Client 请求（对齐 Go `ClientRequest`）。
+/// Client 请求。
 #[derive(Debug, Clone)]
 pub struct ClientRequest {
     pub method: String,
@@ -57,7 +57,7 @@ pub fn new_request(method: &str, url: &str, body: Option<&[u8]>) -> Result<Clien
     })
 }
 
-/// 同 `new_request`，附带 cancel token（对齐 Go `NewRequestWithContext`）。
+/// 同 `new_request`，附带 cancel token。
 pub fn new_request_with_cancel(
     method: &str,
     url: &str,
@@ -182,7 +182,7 @@ fn write_request(
     write!(stream, "{method} {target} HTTP/1.1\r\n")
         .map_err(|e| format!("httpx: write request line: {e}"))?;
     // 按 key 排序后写,保证 request 字节确定性（`Header` 内部 HashMap iter 序随机；
-    // 与 Go `httpx/client.go` sort.Strings + `response.rs` 对齐）。
+    // header 名排序，与 response.rs 一致）。
     let mut entries: Vec<(&String, &Vec<String>)> = header.iter().collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
     for (k, vals) in entries {

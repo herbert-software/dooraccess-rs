@@ -1,4 +1,4 @@
-//! Bare HTTP/1.1 原语（复刻 Go `internal/httpx` 子集）。
+//! Bare HTTP/1.1 原语。
 //!
 //! 禁 TLS / HTTP2 / keep-alive / chunked 请求 body；仅 GET + POST。
 
@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::io::{self};
 
 // ---------------------------------------------------------------------------
-// 常量（Go: types.go）
+// 常量
 // ---------------------------------------------------------------------------
 
 pub const METHOD_GET: &str = "GET";
@@ -35,10 +35,9 @@ pub const STATUS_REQUEST_HEADER_TOO_BIG: u16 = 431;
 pub const STATUS_INTERNAL_SERVER_ERROR: u16 = 500;
 pub const STATUS_BAD_GATEWAY: u16 = 502;
 
-/// 返回 status reason phrase；未知码返空串（与 Go `StatusText` 一致）。
+/// 返回 status reason phrase；未知码返空串。
 ///
-/// 表项对齐 Go `httpx/types.go` statusText 全集（409 在 Go 表中同样缺席 →
-/// response.rs 的 "Status" fallback 与 Go 行为一致，golden `409 Status` 为证）。
+/// 表中缺席的码（如 409）由 response.rs 走 "Status" fallback（golden `409 Status` 为证）。
 pub fn status_text(code: u16) -> &'static str {
     match code {
         200 => "OK",
@@ -64,7 +63,7 @@ pub fn status_text(code: u16) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// Header（Go: types.go Header）
+// Header
 // ---------------------------------------------------------------------------
 
 /// HTTP header 集合；key 存 canonical 形式（`Content-Type`）。
@@ -112,7 +111,7 @@ impl Header {
     }
 }
 
-/// 复刻 Go `textproto.CanonicalMIMEHeaderKey`。
+/// 把 header key 规范成 canonical 形式（各 `-` 分段首字母大写、其余小写）。
 pub fn canonical_mime_header_key(key: &str) -> String {
     key.split('-')
         .map(|part| {
@@ -182,7 +181,7 @@ impl std::fmt::Debug for Request {
 // ResponseWriter / Handler
 // ---------------------------------------------------------------------------
 
-/// Server 端 handler 写响应接口（复刻 Go `ResponseWriter`）。
+/// Server 端 handler 写响应接口。
 pub trait ResponseWriter {
     fn header(&mut self) -> &mut Header;
     fn write_header(&mut self, status: u16);

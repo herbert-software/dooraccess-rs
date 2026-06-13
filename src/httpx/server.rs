@@ -1,4 +1,4 @@
-//! Bare HTTP/1.1 server（复刻 Go `server.go`）。
+//! Bare HTTP/1.1 server。
 //!
 //! thread-per-connection + blocking socket；禁 tokio / TLS / HTTP2 / keepalive。
 
@@ -14,7 +14,7 @@ use super::parse::read_request;
 use super::response::ResponseWriterImpl;
 use super::{status_text, Handler, HttpProtocolError, ReadRequestError, STATUS_BAD_REQUEST};
 
-/// `ListenAndServe` 在 graceful shutdown 后返回此错误（复刻 Go `ErrServerClosed`）。
+/// `ListenAndServe` 在 graceful shutdown 后返回此错误。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerClosedError;
 
@@ -26,7 +26,7 @@ impl std::fmt::Display for ServerClosedError {
 
 impl std::error::Error for ServerClosedError {}
 
-/// 极简 HTTP/1.1 server（字段语义对齐 Go `httpx.Server`）。
+/// 极简 HTTP/1.1 server。
 pub struct Server {
     pub addr: String,
     pub handler: Option<Arc<dyn Handler>>,
@@ -251,7 +251,7 @@ fn serve_conn_inner(stream: &mut TcpStream, ctx: &ServerConnCtx) {
         );
         let mut br = BufReader::new(&mut deadline_reader);
         // read_request 在读 body 前调 on_headers_done → 翻转 flag → body 走 whole-request
-        // deadline（与 Go 一致），而非更紧的 header deadline。
+        // deadline，而非更紧的 header deadline。
         let hd = Arc::clone(&headers_done);
         let result = read_request(&mut br, move || hd.store(true, Ordering::SeqCst));
         // belt-and-suspenders no-op：read_request 内的 on_headers_done 已翻转 flag（载荷在那）；
@@ -304,15 +304,15 @@ fn write_protocol_error(stream: &mut TcpStream, err: &HttpProtocolError) {
     );
 }
 
-/// 绝对 deadline + 每次 read 前重设 per-syscall `read_timeout`（复刻 Go `SetReadDeadline` 语义）。
+/// 绝对 deadline + 每次 read 前重设 per-syscall `read_timeout`。
 struct DeadlineReader<'a> {
     stream: &'a mut TcpStream,
     conn_start: Instant,
     read_header_timeout: Option<Duration>,
     read_timeout: Option<Duration>,
     // 共享 flag：read_request 在读 body **前**翻转（经 on_headers_done 回调），使 body
-    // 读取走 whole-request(read_timeout) 而非更紧的 read_header_timeout。Go body 在
-    // headers 后切到整请求 deadline；本 flag 复刻该时序（否则 body 误受 header deadline）。
+    // 读取走 whole-request(read_timeout) 而非更紧的 read_header_timeout。body 在
+    // headers 后切到整请求 deadline；本 flag 实现该时序（否则 body 误受 header deadline）。
     headers_done: Arc<AtomicBool>,
 }
 
@@ -538,8 +538,8 @@ mod deadline_tests {
 
         // 鉴别性场景：headers 立即发（< header deadline 200ms），body 在 350ms 发——
         // 落在 header deadline(200ms) 与 whole-request deadline(1500ms) 之间。
-        // 正确（Go / 本修复后）：body 走 whole-request 1500ms → 350 < 1500 → 读成 → 200 OK。
-        // 错误（修复前 body 误受 header 200ms deadline）：350 > 200 → 超时 → 无 200。
+        // 正确：body 走 whole-request 1500ms → 350 < 1500 → 读成 → 200 OK。
+        // 错误（body 误受 header 200ms deadline）：350 > 200 → 超时 → 无 200。
         // 故断言 200 OK 可区分两种实现，不再是「非 200」的假绿。
         let mut conn = TcpStream::connect(addr).expect("connect");
         conn.write_all(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n")
