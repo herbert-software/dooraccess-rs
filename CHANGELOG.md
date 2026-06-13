@@ -3,11 +3,13 @@
 本文件记录 dooraccess-rs 的版本变更。pre-1.0 阶段不维护 CHANGELOG（git 历史为准）；
 `v1.0.0` 是首个 git tag、转正生产基线。
 
-> 版本闸门：`v1.0.0` MUST 在真机 P-SOP 转正验证 + 转正后 procd burn-in（≥72h）通过**之后**才打
+> 版本闸门（原定）：`v1.0.0` 在真机 P-SOP 转正验证 + 转正后 procd burn-in（≥72h）通过后才打。
+> **实际：2026-06-13 打 v1.0.0 时 procd burn-in 仅 ~1h（0 respawn）；≥72h 门槛由 user 豁免**
+> （依据：灰度同款功能码已稳跑 3 天 + procd reboot 自启/0-respawn）。详 `D4_DECISION.md`。
 > （见 `dooraccess-go/DEPLOY.md` §Rust 生产部署 + OpenSpec `promote-rust-to-production`）。
 > 下列实测占位符在打 tag 前据真机结果填实。
 
-## [Unreleased] → v1.0.0（转正生产基线，待真机验证后定版）
+## v1.0.0 — 2026-06-13（转正生产基线，首个 git tag）
 
 功能等价 Go v0.10.0；转正为 hAP ac lite 上 procd 托管的正式生产 daemon，取代灰度 setsid 形态。
 
@@ -35,4 +37,5 @@
 - reboot 存活：procd 自启 Rust、Go disabled、`/info` 就绪、0 respawn
 - state 迁移生效：daemon `automation: auto_unlock=on auto_hangup=on (source=state)`（中性路径）
 - 真实响铃 self-unlock 物理门开：灰度 t_ms=1398（功能等价）；转正后新鲜复测按可用 deferred
-- procd burn-in（≥72h，**v1.0.0 tag 前置**）：进行中，到期前不打 tag
+- procd burn-in：打 tag 时 procd ~1h、pid 全程未变（0 respawn）、RSS 500–644KB、free 18MB；**≥72h 门槛 user 豁免**
+- ⚠️ 版本串：v1.0.0 binary 与转正部署的 0.0.0 binary（574,540B）仅差版本串、功能等价；生产 `/info` 现报 0.0.0（可选重部署 v1.0.0 对齐，见 `D4_DECISION.md`）

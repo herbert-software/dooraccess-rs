@@ -27,14 +27,16 @@ hAP ac lite（192.168.2.89）真机 cutover：把灰度 `/tmp`+setsid 形态提�
 | ② | size/RSS/CPU 不劣 | ✅ | binary 574,540B vs Go 3,997,853B（1/7）；RSS 500–604KB vs ~4.6MB（~1/9）|
 | ③ | 真实响铃 self-unlock 物理门开 | ✅(accept) | 灰度 t_ms=1398 物理门开（功能等价同款代码）；cutover P13 user 按可用算、新鲜复测 deferred |
 | ④ | 视频稳定 | ✅(accept) | 灰度端到端 HACS 视频流；BE②(RTCP send)/60s+ 长流为已登记边界 |
-| ⑤ | (a) 灰度 liveness 3 天 + (b) 转正后 procd burn-in ≥72h 无 OOM/respawn/分叉 | (a)✅ /(b)🔄进行中 | (a) 灰度 3 天+ 稳定（user 确认）；(b) procd 形态已稳跑、0 respawn、RSS 500KB——**≥72h 累积后正式签 + 打 v1.0.0** |
+| ⑤ | (a) 灰度 liveness 3 天 + (b) 转正后 procd burn-in ≥72h 无 OOM/respawn/分叉 | (a)✅ /(b)⚠️**user 豁免** | (a) 灰度 3 天+ 稳定（user 确认）；(b) **打 v1.0.0 时 procd 仅 ~1h burn-in**（pid 2364 全程未变=0 respawn、RSS 500–644KB、free 18MB）——**user 决定豁免 ≥72h 门槛、现在打**（依据：灰度同款功能码已稳跑 3 天 + procd 1h 0-respawn + reboot 自启 PASS）。**非满 72h，如实记录。** |
 | ⑥ | rollback binary/config 就绪 | ✅ | Go 冻结根 3,997,853B 未动 + disabled；DEPLOY §Rust 永久回滚双模式；`--state` 隔离 state |
 
 ## 结论
 
-**D4 = 转正生产已执行、Rust 为 canonical 正线、Go 降级冻结紧急回滚根。** 判据①②③④⑥满足，⑤(a)满足、⑤(b) procd burn-in ≥72h 累积中。
+**D4 = 转正生产已执行、Rust 为 canonical 正线、Go 降级冻结紧急回滚根。** 判据①②③④⑥满足，⑤(a)满足、**⑤(b) procd burn-in ≥72h 门槛由 user 豁免**（打 v1.0.0 时仅 ~1h procd burn-in、0 respawn；基线=灰度 3 天 + procd reboot 自启/0-respawn）。**2026-06-13 打首个 git tag `v1.0.0`。**
 
-**待续**：⑤(b) 满 ≥72h（procd 形态无 OOM/respawn 风暴/HA 状态分叉）→ 打首个 git tag `v1.0.0` + 校验 release asset 字节 == 574,540（被测产物）。
+## v1.0.0 版本串说明（CI-canonical 的一处偏离）
+
+打 v1.0.0 须 bump `Cargo.toml` `0.0.0`→`1.0.0`，版本串经 `CARGO_PKG_VERSION` 编进 `/info`/banner → **CI 的 v1.0.0 binary 与转正部署的 0.0.0 binary（574,540B）仅差版本串、功能等价**。故「release asset 字节 == 574,540」不再成立（版本 bump 必然改字节）。当前 hAP 部署 + burn-in 的是 0.0.0 binary、`/info` 报 `version=0.0.0`。**对齐选项（可选）**：重新部署 v1.0.0 binary（停 rust→scp→start）使部署==发布==v1.0.0、`/info` 报 1.0.0；未对齐则生产跑功能等价的 0.0.0 前身。
 
 ## 已知边界（accept）
 - BE②(RTCP send) 端到端不可验；60s+ 长视频流受外机单次推流限制；auto-hangup 物理 teardown 同 Go 待解——均 Phase 5 / DEPLOY 登记。
