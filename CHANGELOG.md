@@ -29,8 +29,10 @@
 - procd init.d 托管（取代灰度 `/tmp` + setsid）；开机自启；Go binary/init.d 转 disabled 紧急回滚根。
 - config/state 迁中性路径 `/etc/dooraccess/`（cutover 从 `/etc/dooraccess-go/` 拷贝迁移）。
 
-### 实测（待真机转正 + procd burn-in 后填，见 `D4_DECISION.md`）
-- MIPS binary 字节数：`<make dist 实测>`（对照 Go v0.10.0 MIPS 3,997,853 字节）
-- 稳态 VmRSS：`<转正后实测>`（对照 Go ~4.6MB）
-- 真实响铃 self-unlock：`result=0 t_ms=<实测>`、物理门开 `<Y/N>`
-- procd burn-in（≥72h）：respawn 计数 `<实测>` / VmRSS 时序 / HA 状态分叉 `<无/有>`
+### 实测（2026-06-13 真机转正，见 `D4_DECISION.md`）
+- MIPS binary 字节数：**574,540**（CI 产物，对照 Go v0.10.0 MIPS 3,997,853 字节 ≈ 1/7）
+- 稳态 VmRSS：**500–604 KB**（对照 Go ~4.6MB ≈ 1/9）
+- reboot 存活：procd 自启 Rust、Go disabled、`/info` 就绪、0 respawn
+- state 迁移生效：daemon `automation: auto_unlock=on auto_hangup=on (source=state)`（中性路径）
+- 真实响铃 self-unlock 物理门开：灰度 t_ms=1398（功能等价）；转正后新鲜复测按可用 deferred
+- procd burn-in（≥72h，**v1.0.0 tag 前置**）：进行中，到期前不打 tag
