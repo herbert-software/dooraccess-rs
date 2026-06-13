@@ -1,27 +1,24 @@
-//! `unlock`：executeUnlock 开锁核心（组 F，D-C 切点）。
+//! `unlock`：execute_unlock 开锁核心。
 //!
-//! 逐行移植 Go `http8080.executeUnlock`（`handlers.go:301-372`）+ `runUnlockWithRetry`
-//! （390-447）+ `tryUnlockOnce`（467-492）+ `classifyWireErr`（714）+
-//! `filterReq708ForTarget`（508）的**核心逻辑**：
-//!   - [`execute_unlock`] 串行核心：持 `Mutex`（postMu+wireMutex 等价）守 wire 出站
+//! 三步握手开锁的**核心逻辑**：
+//!   - [`execute_unlock`] 串行核心：持 `Mutex`（post+wire 串行锁）守 wire 出站
 //!     （HTTP /unlock 与 self-unlock 不交错）；retry → 结果分类
 //!   - [`run_unlock_with_retry`]：1s×8/cap10s 退避 + `per_attempt_timeout>0` fail-fast
-//!     probe 分支（per-attempt deadline + attempt_expired 重探，锚 handlers.go:399-413）
-//!     + unlock-B 不重试（handlers.go:423）
+//!     probe 分支（per-attempt deadline + attempt_expired 重探）
+//!     + unlock-B 不重试
 //!   - bye 早停：经 [`crate::listen18022::Subscribable`] 订阅 req=708；`None` 时
-//!     nil-channel select 永不命中（可无 listener mock 测）；命中 → `terminated_by_bye=true`
+//!     bye channel 永不命中（可无 listener mock 测）；命中 → `terminated_by_bye=true`
 //!   - [`classify_wire_err`]（wire 错误分类，与业务 body mismatch 分流）
 //!
-//! **范围红线**：`ExecuteUnlockFromRing` 入口包装（asyncPush + 测量）与 ring consumer
-//! **不在本变更**（Phase 4）。本模块只做 `executeUnlock` 核心 + retry/probe/bye/串行/classify。
+//! 本模块只做 `execute_unlock` 核心 + retry/probe/bye/串行/classify；ring 触发的
+//! 入口包装（async push + 测量）与 ring consumer 在 `self_unlock` 模块。
 //!
-//! ## 可测性设计（D-C：mock-e2e 不触真 socket / 真 sleep）
+//! ## 可测性设计（mock-e2e 不触真 socket / 真 sleep）
 //!
-//! Go `tryUnlockOnce` 直接调 `s.Sender.SendContext`（两次：710→711 / 518→519）。为让
-//! mock-e2e 不触真网络，本模块把"单次三步握手"抽象成 [`UnlockWire`] trait（一次
-//! `try_once` 返回 [`AttemptOutcome`]，对齐 Go `(codec.Result, unlockStage, error)`）。
-//! 真实现 [`crate::sender::WireSenderAdapter`] 用 `wire_sender::Sender` 实现它；测试用
-//! [`MockWire`] 注入 canned 序列。
+//! 「单次三步握手」（两次出站：710→711 / 518→519）抽象成 [`UnlockWire`] trait（一次
+//! `try_once` 返回 [`AttemptOutcome`]，携 `(result, stage, error)` 三元信息），让
+//! mock-e2e 不触真网络。真实现 [`crate::sender::WireSenderAdapter`] 用
+//! `wire_sender::Sender` 实现它；测试用 [`MockWire`] 注入 canned 序列。
 //!
 //! 退避 sleep 经 [`Sleeper`] trait 注入：生产 [`ThreadSleeper`]（真 sleep）；测试
 //! [`NoopSleeper`]（不 sleep，记录调用次数）避免真等 8 秒。总 cap 用 [`Deadline`] 注入
@@ -36,32 +33,32 @@ use crate::codec::result as result_code;
 use crate::listen18022::{DetectedFrame, SubFilter, Subscribable};
 
 // ---------------------------------------------------------------------------
-// 退避 / cap 常量（锚 Go handlers.go:46-65）
+// 退避 / cap 常量
 // ---------------------------------------------------------------------------
 
-/// 最大重试次数（不含首次；总 9 次尝试，锚 Go `unlockMaxRetries`）。
+/// 最大重试次数（不含首次；总 9 次尝试）。
 pub const UNLOCK_MAX_RETRIES: u32 = 8;
 
-/// HTTP 路径退避间隔（锚 Go `unlockRetryInterval` = 1s）。
+/// HTTP 路径退避间隔（1s）。
 pub const UNLOCK_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
-/// 总时长 cap（覆盖 9 次尝试，锚 Go `unlockTotalCap` = 10s）。
+/// 总时长 cap（覆盖 9 次尝试，10s）。
 pub const UNLOCK_TOTAL_CAP: Duration = Duration::from_secs(10);
 
-/// ring 路径 fail-fast per-attempt 超时（锚 Go `selfUnlockProbeTimeout` = 800ms）。
+/// ring 路径 fail-fast per-attempt 超时（800ms）。
 pub const SELF_UNLOCK_PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 
-/// ring 路径 fail-fast 退避间隔（锚 Go `selfUnlockProbeInterval` = 200ms）。
+/// ring 路径 fail-fast 退避间隔（200ms）。
 pub const SELF_UNLOCK_PROBE_INTERVAL: Duration = Duration::from_millis(200);
 
 // ---------------------------------------------------------------------------
-// 握手阶段 + 单次尝试结果（锚 Go unlockStage + tryUnlockOnce 返回三元组）
+// 握手阶段 + 单次尝试结果（携 result / stage / error 三元信息）
 // ---------------------------------------------------------------------------
 
-/// 三步握手阶段（锚 Go `unlockStage`：`stageUnlockA` / `stageUnlockB`）。
+/// 三步握手阶段（unlock-A / unlock-B）。
 ///
 /// unlock-A = 710 send / 711 ack；unlock-B = 518 send / 519 ack。unlock-B wire 失败
-/// **禁止**重试（710 已 ack，协议级不应重发整个握手，锚 handlers.go:423）。
+/// **禁止**重试（710 已 ack，协议级不应重发整个握手）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnlockStage {
     /// 710 send / 711 ack 阶段。
@@ -70,33 +67,32 @@ pub enum UnlockStage {
     UnlockB,
 }
 
-/// 单次三步握手（[`UnlockWire::try_once`]）的结果，对齐 Go `tryUnlockOnce` 返回的
-/// `(codec.Result, unlockStage, error)`：
+/// 单次三步握手（[`UnlockWire::try_once`]）的结果，携 `(result, stage, error)` 三元信息：
 ///
 ///   - [`AttemptOutcome::Ok`]：710+711+518+519 完整成功（result=0）。
-///   - [`AttemptOutcome::BusinessErr`]：外机响应了但 body 不符 spec（业务错 result=-1，
-///     **不重试**）；`stage` 标识哪步 body 校验失败（锚 Go `(ResultErr, stage, nil)`）。
+///   - [`AttemptOutcome::BusinessErr`]：外机响应了但 body 不符协议预期（业务错 result=-1，
+///     **不重试**）；`stage` 标识哪步 body 校验失败。
 ///   - [`AttemptOutcome::WireErr`]：wire 层失败（connect/send/recv），`stage` 标阶段、
-///     `err` 是分类好的 [`WireKind`]（锚 Go `(ResultErr, stage, wireErr)`）。
+///     `err` 是分类好的 [`WireKind`]。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttemptOutcome {
     /// 完整成功。
     Ok,
-    /// 外机响应了但 body 不符 spec（业务错，不重试）。
+    /// 外机响应了但 body 不符协议预期（业务错，不重试）。
     BusinessErr { stage: UnlockStage },
     /// wire 层失败（可能可重试，由 [`WireKind::is_retryable`] 决定）。
     WireErr { stage: UnlockStage, err: WireKind },
 }
 
-/// wire 错误分类（锚 Go `wire18022` 的 `ErrSilentFIN` / `ErrTimeout` + 其它）。
+/// wire 错误分类（silent FIN / timeout / 其它）。
 ///
 /// 抽成独立 enum 让 mock-e2e 不依赖真 `wire_sender::WireError`（后者携 `io::Error`
 /// 不便构造）；真实现 [`crate::sender::WireSenderAdapter`] 把 `WireError` 映射到此。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireKind {
-    /// 外机收帧后 silent FIN（ring 状态机拒绝）。锚 Go `ErrSilentFIN`。**可重试**。
+    /// 外机收帧后 silent FIN（ring 状态机拒绝）。**可重试**。
     SilentFin,
-    /// connect/send/recv 任一阶段超时。锚 Go `ErrTimeout`。**可重试**。
+    /// connect/send/recv 任一阶段超时。**可重试**。
     Timeout,
     /// 错误串含 "connection reset" / "broken pipe" 或底层 timeout。**可重试**。
     Retryable,
@@ -105,7 +101,7 @@ pub enum WireKind {
 }
 
 impl WireKind {
-    /// 是否可重试（锚 Go `wire18022.IsRetryableError`）。
+    /// 是否可重试。
     ///
     /// SilentFin / Timeout / Retryable → true；Other → false。
     /// 业务 body mismatch 不走此分类（那条路径是 [`AttemptOutcome::BusinessErr`]，不进重试）。
@@ -118,16 +114,16 @@ impl WireKind {
 }
 
 // ---------------------------------------------------------------------------
-// classify_wire_err（锚 Go classifyWireErr，handlers.go:714）
+// classify_wire_err
 // ---------------------------------------------------------------------------
 
-/// 把 wire 错误分类翻译成 result code（锚 Go `classifyWireErr`）。
+/// 把 wire 错误分类翻译成 result code。
 ///
 ///   - [`WireKind::SilentFin`] → `result_code::NO_RING`（-103，外机 ring 状态机拒绝，daemon 健康）
 ///   - [`WireKind::Timeout`] → `result_code::TIMEOUT`（-5，下游故障）
 ///   - 其它 → `result_code::ERR`（-1）
 ///
-/// 与 Go 一致：业务级 body mismatch **不**经此函数（上层直接判 [`result_code::ERR`]）。
+/// 注意：业务级 body mismatch **不**经此函数（上层直接判 [`result_code::ERR`]）。
 pub fn classify_wire_err(kind: WireKind) -> i32 {
     match kind {
         WireKind::SilentFin => result_code::NO_RING,
@@ -140,13 +136,13 @@ pub fn classify_wire_err(kind: WireKind) -> i32 {
 // 注入缝：UnlockWire（单次握手）/ Sleeper（退避）/ Deadline（总 cap）
 // ---------------------------------------------------------------------------
 
-/// 单次三步握手抽象（锚 Go `tryUnlockOnce`）。
+/// 单次三步握手抽象。
 ///
 /// `per_attempt_cap`：`Some(d)` 时（ring fail-fast probe）每步上限为 `d`（到点切断重探）；
-/// `None`（HTTP 路径）每步用 sender 自身的 5s 默认。`deadline`：总 cap（锚 Go `tryUnlockOnce`
-/// 收到的 `ctx`=attemptCtx=HTTP 路径 tctx 总 cap）——710/518 两步**共享**这同一个递减的剩余
-/// cap，故每步实际超时 = `min(per_attempt_cap_or_default, deadline.remaining())`，两步合计 ≤
-/// 剩余 cap（对齐 Go 两次 `SendContext(ctx,...)` 传同一 ctx）。`cancel`：父 ctx 取消
+/// `None`（HTTP 路径）每步用 sender 自身的 5s 默认。`deadline`：总 cap——710/518 两步
+/// **共享**这同一个递减的剩余 cap，故每步实际超时 =
+/// `min(per_attempt_cap_or_default, deadline.remaining())`，两步合计 ≤
+/// 剩余 cap。`cancel`：父级取消
 /// （SIGTERM/HACS 断开）时立即放弃。返回 [`AttemptOutcome`]。
 pub trait UnlockWire: Send + Sync {
     /// 执行一次 710→711→518→519 握手。
@@ -165,8 +161,8 @@ pub trait UnlockWire: Send + Sync {
 
 /// 退避 sleep 抽象（让测试不真等 8 秒）。
 ///
-/// 返回值表示"sleep 是否被中断"——`true` 表示被 cancel 中断（对齐 Go select 命中
-/// `<-ctx.Done()`），调用方应停止重试；`false` 表示睡满（继续重试）。
+/// 返回值表示"sleep 是否被中断"——被 cancel 中断时调用方应停止重试；
+/// 睡满则继续重试。
 pub trait Sleeper: Send + Sync {
     /// 睡 `dur`，期间监视 `cancel` 与 `bye`：
     ///   - cancel 置位 → 返 [`SleepWake::Canceled`]
@@ -180,14 +176,14 @@ pub trait Sleeper: Send + Sync {
     ) -> SleepWake;
 }
 
-/// [`Sleeper::sleep`] 的唤醒原因（对齐 Go retry select 三分支）。
+/// [`Sleeper::sleep`] 的唤醒原因（退避期三种结局）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SleepWake {
-    /// 睡满退避间隔（继续下一次重试）。锚 Go `case <-time.After(retryInterval)`。
+    /// 睡满退避间隔（继续下一次重试）。
     Elapsed,
-    /// 被 cancel 中断（父 ctx Done）。锚 Go `case <-ctx.Done()`。
+    /// 被 cancel 中断（父级取消）。
     Canceled,
-    /// bye channel 收到帧（早停）。锚 Go `case <-byeCh`。
+    /// bye channel 收到帧（早停）。
     Bye,
 }
 
@@ -224,14 +220,14 @@ impl Sleeper for ThreadSleeper {
     }
 }
 
-/// 总时长 cap 抽象（锚 Go `context.WithTimeout(ctx, unlockTotalCap)`）。
+/// 总时长 cap 抽象（带超时上限的执行预算）。
 ///
 /// 生产 [`InstantDeadline`]（真 `Instant`）；测试可注入"永不过期"或固定剩余。
 pub trait Deadline: Send + Sync {
-    /// 总 cap 是否已到（true → 应停止重试，对齐 Go `ctx.Err() != nil`）。
+    /// 总 cap 是否已到（true → 应停止重试）。
     fn expired(&self) -> bool;
 
-    /// 距总 cap 还剩多少时长（对齐 Go `attemptCtx = ctx`：每次 attempt 受**剩余总 cap**
+    /// 距总 cap 还剩多少时长（每次 attempt 受**剩余总 cap**
     /// 约束）。`None` 表示无 cap（永不过期，如生产 self-unlock 无总 cap 注入或测试
     /// `NeverExpire`）；`Some(ZERO)` 表示已到点（等价 [`Deadline::expired`] 为 true）。
     fn remaining(&self) -> Option<Duration>;
@@ -242,8 +238,7 @@ pub struct InstantDeadline {
     cap: Duration,
     /// **惰性起点**：首次 `expired()`/`remaining()` 调用时才捕获 `Instant::now()`。
     /// execute_unlock 在拿 `post_wire_mu` 锁**后**才首次查 deadline,故 cap 从拿锁时
-    /// 起算——等锁时间不计入总 cap（对齐 Go：`postMu.Lock()` 在 `WithTimeout(ctx,cap)`
-    /// 之前,handlers.go:309 vs 323）。`OnceLock` 保持 `Send + Sync`。
+    /// 起算——等锁时间不计入总 cap（拿锁先于总 cap 计时起点）。`OnceLock` 保持 `Send + Sync`。
     started: std::sync::OnceLock<Instant>,
 }
 
@@ -274,10 +269,10 @@ impl Deadline for InstantDeadline {
 }
 
 // ---------------------------------------------------------------------------
-// UnlockOutcome（锚 Go UnlockOutcome）
+// UnlockOutcome
 // ---------------------------------------------------------------------------
 
-/// `execute_unlock` 的结果（锚 Go `UnlockOutcome`）。
+/// `execute_unlock` 的结果。
 ///
 /// `result` 是 i32 result code（0 / -1 / -103 / -5 等）；`retries` 重试次数（不含首次）；
 /// `terminated_by_bye` true 表示被 bye 早停（result 必然 -103）；`wire_kind` 是最后一次
@@ -295,15 +290,14 @@ pub struct UnlockOutcome {
 }
 
 // ---------------------------------------------------------------------------
-// filter_req708_for_target（锚 Go filterReq708ForTarget，handlers.go:508）
+// filter_req708_for_target
 // ---------------------------------------------------------------------------
 
-/// 构造 bye 订阅 filter：匹配 req=708 且 src/dst 任一为 `target_ip` 的 frame
-/// （锚 Go `filterReq708ForTarget`）。
+/// 构造 bye 订阅 filter：匹配 req=708 且 src/dst 任一为 `target_ip` 的 frame。
 ///
-/// `target_ip == None`（解析失败 fallback）时退化为匹配所有 req=708（保持 Go
-/// `targetIP == nil` 旧行为）。匹配 src/dst 任一方向：两个方向的 bye 都标志 ring
-/// session 已结束（design.md 待解 #1 默认决策）。
+/// `target_ip == None`（解析失败 fallback）时退化为匹配所有 req=708。
+/// 匹配 src/dst 任一方向：两个方向的 bye 都标志 ring
+/// session 已结束。
 pub fn filter_req708_for_target(target_ip: Option<[u8; 4]>) -> SubFilter {
     match target_ip {
         None => Box::new(|d: &DetectedFrame| d.req == 708),
@@ -314,18 +308,18 @@ pub fn filter_req708_for_target(target_ip: Option<[u8; 4]>) -> SubFilter {
 }
 
 // ---------------------------------------------------------------------------
-// run_unlock_with_retry（锚 Go runUnlockWithRetry，handlers.go:390-447）
+// run_unlock_with_retry
 // ---------------------------------------------------------------------------
 
-/// 执行带退避重试的 unlock 三步握手（锚 Go `runUnlockWithRetry`）。
+/// 执行带退避重试的 unlock 三步握手。
 ///
 /// 返回 `(result_code, retries, terminated_by_bye, last_wire_kind)`。
 ///
 /// 参数：
 ///   - `wire`：单次握手注入缝（生产真 sender / 测试 mock）。
-///   - `bye`：bye 早停 channel；`None`（无 listener）时等价 Go nil-channel select 永不命中。
-///   - `cancel`：父 ctx 取消信号（SIGTERM/HACS 断开）。
-///   - `deadline`：总 cap（锚 Go `ctx.WithTimeout(unlockTotalCap)`）。
+///   - `bye`：bye 早停 channel；`None`（无 listener）时该 channel 永不命中。
+///   - `cancel`：父级取消信号（SIGTERM/HACS 断开）。
+///   - `deadline`：总 cap（[`UNLOCK_TOTAL_CAP`] 派生）。
 ///   - `sleeper`：退避 sleep 注入缝。
 ///   - `per_attempt_timeout`：`Some` → ring fail-fast probe；`None` → HTTP 路径。
 ///   - `retry_interval`：attempt 间退避。
@@ -343,24 +337,24 @@ pub fn run_unlock_with_retry(
     per_attempt_timeout: Option<Duration>,
     retry_interval: Duration,
 ) -> (i32, u32, bool, Option<WireKind>) {
-    // 跨 attempt 保留最后一次 wire 失败分类（对齐 Go `lastWireErr`）：cap 在退避后命中时
-    // top-of-loop bail 须把它带出去（等价 Go retry `select` 的 `<-ctx.Done()` 分支返回
-    // wireErr，handlers.go:436-437），让 execute_unlock 归一分支正确分类。首次 attempt 前
-    // 就过期则仍为 None（等价 Go 循环未设 lastWireErr → 返回 nil，handlers.go:446）。
+    // 跨 attempt 保留最后一次 wire 失败分类：cap 在退避后命中时
+    // top-of-loop bail 须把它带出去（让退避后取消分支带出 wire 错误），
+    // 让 execute_unlock 归一分支正确分类。首次 attempt 前
+    // 就过期则仍为 None（循环未设过任何 wire 失败分类 → 返回 None）。
     let mut last_wire_kind: Option<WireKind> = None;
 
     // attempt 0 = 首次；attempt 1..=UNLOCK_MAX_RETRIES = 重试。
     for attempt in 0..=UNLOCK_MAX_RETRIES {
-        // 总 cap 已到 → 停（对齐 Go ctx.Done() 在 attempt 前/select 中命中）。
+        // 总 cap 已到 / 取消置位 → 停。
         if deadline.expired() || cancel.load(Ordering::SeqCst) {
             // 中断路径：无新尝试，按上一次失败分类（首次就被取消则无 wire_kind）。
             return (result_code::NO_RING, attempt, false, last_wire_kind);
         }
 
-        // 每次 attempt 的单帧超时对齐 Go 两层：sender 固定 5s SO_*TIMEO（`SendContext` 内
-        // `conn.SetDeadline(now+5s)`）∧ 剩余总 cap（attemptCtx=tctx 在 cap 命中时 `conn.Close()`）。
-        // 关键（修复 bugbot #1）：一次 attempt 内 710+518 两步**共享**递减的剩余总 cap——Go 把
-        // **同一个 ctx** 传给两次 `SendContext`，第二步的 cap 预算 = 第一步消耗后的剩余。故不在此
+        // 每次 attempt 的单帧超时受两层约束：sender 固定 5s 收发超时 ∧ 剩余总 cap
+        // （cap 命中时关连接）。
+        // 关键：一次 attempt 内 710+518 两步**共享**递减的剩余总 cap——
+        // 第二步的 cap 预算 = 第一步消耗后的剩余。故不在此
         // 预算单个 effective 传下去（那样每步各起新 5s 预算 → 合计可达 2×effective、超剩余 cap），
         // 而是把 `per_attempt_cap`（本路径单帧上限：ring probe=800ms / HTTP=None→sender 默认 5s）
         // 与 `deadline`（总 cap，可重读递减剩余）一并传进 try_once，由其对 710/518 **各自**在调
@@ -376,34 +370,34 @@ pub fn run_unlock_with_retry(
         );
 
         match outcome {
-            // 业务结果（OK / -1 unexpected response）—— 直接返回不重试（锚 handlers.go:414-417）。
+            // 业务结果（OK / -1 unexpected response）—— 直接返回不重试。
             AttemptOutcome::Ok => return (result_code::OK, attempt, false, None),
             AttemptOutcome::BusinessErr { .. } => return (result_code::ERR, attempt, false, None),
             AttemptOutcome::WireErr { stage, err } => {
-                // 记录本次 wire 失败分类（top-of-loop cap bail 据此带出，对齐 Go lastWireErr）。
+                // 记录本次 wire 失败分类（top-of-loop cap bail 据此带出）。
                 last_wire_kind = Some(err);
                 // per-attempt deadline 命中（探到未就绪外机挂住连接）视为可重试——但总 cap
-                // 已 Done 不算（锚 handlers.go:410）。这里以 WireKind::Timeout 在 ring 路径
-                // 近似 attemptExpired（per_attempt_timeout 击中表现为 Timeout）。
+                // 已到不算。这里以 WireKind::Timeout 在 ring 路径
+                // 近似 attempt_expired（per_attempt_timeout 击中表现为 Timeout）。
                 let attempt_expired = per_attempt_timeout.is_some()
                     && err == WireKind::Timeout
                     && !deadline.expired();
 
-                // unlock-B 阶段 wire 失败 → **禁止**重试（710 已 ack，锚 handlers.go:423）。
+                // unlock-B 阶段 wire 失败 → **禁止**重试（710 已 ack）。
                 if stage == UnlockStage::UnlockB {
                     return (result_code::NO_RING, attempt, false, Some(err));
                 }
 
-                // 不可重试 且 非 attempt_expired → 直接返回（锚 handlers.go:427）。
+                // 不可重试 且 非 attempt_expired → 直接返回。
                 if !err.is_retryable() && !attempt_expired {
                     return (result_code::NO_RING, attempt, false, Some(err));
                 }
 
-                // 还有重试配额 → 退避；否则 quota 耗尽返回（锚 handlers.go:431-444）。
+                // 还有重试配额 → 退避；否则 quota 耗尽返回。
                 if attempt < UNLOCK_MAX_RETRIES {
                     match sleeper.sleep(retry_interval, cancel, bye) {
                         SleepWake::Bye => {
-                            // bye 早停（result 必然 -103，锚 handlers.go:434-435）。
+                            // bye 早停（result 必然 -103）。
                             return (result_code::NO_RING, attempt + 1, true, Some(err));
                         }
                         SleepWake::Canceled => {
@@ -414,25 +408,25 @@ pub fn run_unlock_with_retry(
                         }
                     }
                 }
-                // quota 耗尽（锚 handlers.go:443-444）。
+                // quota 耗尽。
                 return (result_code::NO_RING, attempt, false, Some(err));
             }
         }
     }
-    // 不可达（循环必在内部 return）；保留对齐 Go 末尾 return。
+    // 不可达（循环必在内部 return）；保留末尾 return。
     (result_code::NO_RING, UNLOCK_MAX_RETRIES, false, None)
 }
 
 // ---------------------------------------------------------------------------
-// execute_unlock（锚 Go executeUnlock，handlers.go:301-372）
+// execute_unlock
 // ---------------------------------------------------------------------------
 
-/// `execute_unlock` 串行核心（锚 Go `executeUnlock`）。
+/// `execute_unlock` 串行核心。
 ///
-/// 持 `post_wire_mu`（postMu+wireMutex 等价）守 wire 出站全程——HTTP /unlock 与
+/// 持 `post_wire_mu`（post+wire 串行锁）守 wire 出站全程——HTTP /unlock 与
 /// self-unlock 经同一 [`Mutex`] 串行，不交错。订阅 req=708 bye 早停（`listener==None`
-/// 时不订阅，等价 Go nil-channel select 永不命中）→ [`run_unlock_with_retry`] →
-/// 结果分类（锚 handlers.go:345-364：cap 击中且非可重试 → 翻译成 Timeout 走 -5）。
+/// 时不订阅，bye channel 永不命中）→ [`run_unlock_with_retry`] →
+/// 结果分类（cap 击中且非可重试 → 翻译成 Timeout 走 -5）。
 ///
 /// 返回 [`UnlockOutcome`]（result code 已分类好）。
 #[allow(clippy::too_many_arguments)]
@@ -450,12 +444,11 @@ pub fn execute_unlock(
     per_attempt_timeout: Option<Duration>,
     retry_interval: Duration,
 ) -> UnlockOutcome {
-    // postMu+wireMutex 串行：守 wire 出站全程（锚 handlers.go:309-314）。
+    // post+wire 串行锁：守 wire 出站全程。
     let _guard = post_wire_mu.lock().unwrap_or_else(|e| e.into_inner());
 
     // bye watcher：订阅 req=708（src/dst 任一为 target）。listener==None → 不订阅，
-    // bye=None，run_unlock_with_retry 的 select 永不命中（锚 handlers.go:336-341 +
-    // Listener==nil → byeCh nil channel）。
+    // bye=None，run_unlock_with_retry 的 bye channel 永不命中。
     let target_ip_bytes = parse_ipv4(target_ip);
     let sub = listener.map(|l| l.subscribe(Some(filter_req708_for_target(target_ip_bytes))));
     let bye_ref = sub.as_ref().map(|s| &s.ch);
@@ -474,9 +467,9 @@ pub fn execute_unlock(
         retry_interval,
     );
 
-    // 结果分类（锚 handlers.go:345-364）。归一后的 wire_kind 回写到返回值（修复 bugbot #3：
-    // cap 击中翻 Timeout 后须同步 wire_kind，使 result 与 wire_kind 一致——对齐 Go
-    // `UnlockOutcome.WireErr` 是已归一值的契约）。
+    // 结果分类。归一后的 wire_kind 回写到返回值：cap 击中翻
+    // Timeout 后须同步 wire_kind，使 result 与 wire_kind 一致——
+    // `UnlockOutcome.wire_kind` 是已归一值的契约。
     let mut wire_kind = wire_kind;
     if result == result_code::OK || result == result_code::ERR {
         // OK / 业务错：result 已是最终值。
@@ -485,7 +478,7 @@ pub fn execute_unlock(
         result = result_code::NO_RING;
     } else if let Some(kind) = wire_kind {
         // 重试耗尽路径：用真实 wire 分类。cap 击中（deadline 到）且非可重试 →
-        // 翻译成 Timeout 让上层走 -5（锚 handlers.go:360-362）。
+        // 翻译成 Timeout 让上层走 -5。
         //
         // `deadline.expired() && !kind.is_retryable()` 的可达性：
         //   - cap-bail（top-of-loop）/ quota 耗尽 / 普通退避路径**不会**带出非可重试错——
@@ -494,23 +487,22 @@ pub fn execute_unlock(
         //     故这些路径的 last_wire_kind 恒为可重试类。
         //   - **但 unlock-B 分支例外**：unlock-B wire 失败无论可否重试都直接返 `Some(err)`
         //     （710 已 ack 禁重试），若该 err 非可重试（如二次 connect refused→Other）且总 cap
-        //     恰在此刻过期，则本翻转条件可达 → 翻 Timeout → -5，与 Go handlers.go:360-362
-        //     （`tctx.Err()!=nil && !IsRetryableError(err)` 同条件）行为一致，故保留。
+        //     恰在此刻过期，则本翻转条件可达 → 翻 Timeout → -5（cap 已到 + 非可重试错
+        //     同条件），故保留。
         let kind = if deadline.expired() && !kind.is_retryable() {
             WireKind::Timeout
         } else {
             kind
         };
-        // 回写归一后的 kind（与 result 一致，对齐 Go WireErr 已归一契约）。
+        // 回写归一后的 kind（与 result 一致，wire_kind 已归一契约）。
         wire_kind = Some(kind);
         result = classify_wire_err(kind);
     } else {
-        // 无 wire_kind 的中断路径（cancel/cap 在首次尝试前命中）→ NO_RING（保持 Go
-        // runUnlockWithRetry 返回 ResultNoRing）。
+        // 无 wire_kind 的中断路径（cancel/cap 在首次尝试前命中）→ NO_RING。
         result = result_code::NO_RING;
     }
 
-    // 显式 cancel 订阅（per-invocation，不累积泄漏，锚 handlers.go:339 defer sub.Cancel()）。
+    // 显式 cancel 订阅（per-invocation，不累积泄漏）。
     if let Some(s) = &sub {
         s.cancel();
     }
@@ -523,14 +515,14 @@ pub fn execute_unlock(
     }
 }
 
-/// 解析点分十进制 IPv4 为 `[u8;4]`；失败返 `None`（锚 Go `net.ParseIP` fallback 到
+/// 解析点分十进制 IPv4 为 `[u8;4]`；失败返 `None`（fallback 到
 /// 匹配所有 req=708）。
 fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
     s.parse::<std::net::Ipv4Addr>().ok().map(|ip| ip.octets())
 }
 
 // ===========================================================================
-// tests（mock-e2e：mock UnlockWire + mock Subscribable + Noop sleeper；锚 8.3）
+// tests（mock-e2e：mock UnlockWire + mock Subscribable + Noop sleeper）
 // ===========================================================================
 
 #[cfg(test)]
@@ -1047,7 +1039,7 @@ mod tests {
         // HTTP 路径（per_attempt=None）：wire 始终 Timeout（可重试）。Deadline 在前几次
         // attempt 返 remaining>0（cap 未到，attempt 受剩余 cap 约束），随后 expired。
         // 验：最后一次是 timeout 类 → execute_unlock 归一分支把 result 分类成 -5
-        // （对齐 Go：cap 中途命中 wire 返 Timeout(Some) → classifyWireErr → -5）。
+        // （cap 中途命中 wire 返 Timeout(Some) → classify_wire_err → -5）。
         struct CapAfter {
             // remaining() 调用次数计数；超过阈值返回 ZERO（cap 到）。
             calls: AtomicUsize,
@@ -1089,8 +1081,8 @@ mod tests {
         assert!(out.wire_kind.is_some(), "应保留末次 wire_kind 供归一分类");
     }
 
-    // --- 场景（修复 bugbot #3）：cap 击中 + unlock-B 非可重试错 → wire_kind 回写归一为
-    //     Timeout，与 result(-5) 一致 ---
+    // --- 场景：cap 击中 + unlock-B 非可重试错 → wire_kind 回写归一为 Timeout，与
+    //     result(-5) 一致 ---
 
     #[test]
     fn unlock_b_non_retryable_cap_hit_remaps_wire_kind() {
@@ -1177,7 +1169,7 @@ mod tests {
         assert!(!f(&mk(704)));
     }
 
-    // --- listener==None：bye-watch nil channel select 永不命中（可无 listener 测） ---
+    // --- listener==None：bye-watch channel 永不命中（可无 listener 测） ---
 
     #[test]
     fn unlock_no_listener_no_bye() {

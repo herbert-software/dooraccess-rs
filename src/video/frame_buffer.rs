@@ -1,23 +1,19 @@
-//! frame_buffer：RTP receiver 写入 / 多 stream consumer 读出的中央缓冲
-//! （移植 Go `internal/video/rtp.go` 的 `FrameBuffer`）。
+//! frame_buffer：RTP receiver 写入 / 多 stream consumer 读出的中央缓冲。
 //!
-//! 双重职责（锚 Go）：
+//! 双重职责：
 //!   - 缓存最近 SPS/PPS/IDR 三件套（新 consumer 经 [`FrameBuffer::latest_idr`] 取种子）
 //!   - fan-out NAL stream 给所有 active consumers（chunked 发到 HTTP client）
 //!
-//! 等价纪律（spec「FrameBuffer fan-out 与 backpressure 等价」/ design D3）：
+//! 行为纪律：
 //!   - per-consumer `std::sync::mpsc::sync_channel(64)` + `try_send` 非阻塞 fan-out：
 //!     channel 满时**丢弃新到的 NAL（drop-newest）**，缓冲内旧 NAL 保留，
-//!     永不阻塞 RTP receiver；丢帧与 Go 一致**静默**（无计数无日志——stats 的
-//!     dropped_frames 是 reassembler 层另一概念，禁混淆、禁顺手加非 parity 计数器）
+//!     永不阻塞 RTP receiver；丢帧**静默**（无计数无日志——stats 的
+//!     dropped_frames 是 reassembler 层另一概念，禁混淆、禁顺手加计数器）
 //!   - 种子获取走 [`FrameBuffer::latest_idr`]（订阅 channel 本身**不投递**种子；
-//!     Go 另有 `SeedNALs` 但生产无调用方——死代码不移植，同 SnapshotFLV 档处理；
-//!     种子快照与订阅起点之间存在 NAL 间隙是 Go 已知行为，等价保持）
-//!   - IDR-ready 用 `Mutex + Condvar` 广播（Go `close(idrReady)` 的等价物）；
-//!     [`FrameBuffer::wait_idr`] 支持 deadline，且 **closed 错误与 timeout 分型**
-//!     （[`WaitIdrError`]；Go 是 `WaitIDR` 返 nil + 调用方 `Closed()` 自判两段式，
-//!     Rust 合并为带分型的单返回是等价重构——HTTP 层靠它区分 503「session closed」
-//!     与 504 timeout）
+//!     种子快照与订阅起点之间存在 NAL 间隙是已知行为，保持不补投）
+//!   - IDR-ready 用 `Mutex + Condvar` 广播；[`FrameBuffer::wait_idr`] 支持
+//!     deadline，且 **closed 错误与 timeout 分型**（[`WaitIdrError`]）——HTTP 层
+//!     靠它区分 503「session closed」与 504 timeout
 //!   - `close` 语义：close 后 Push 静默丢、所有 consumer channel 断开、close 后新
 //!     `subscribe` 返回已断开的 channel
 //!
@@ -29,11 +25,10 @@ use std::time::{Duration, Instant};
 
 use super::rtp::{NalUnit, NAL_TYPE_IDR, NAL_TYPE_PPS, NAL_TYPE_SPS};
 
-/// per-consumer channel 缓冲深度（锚 Go `make(chan nalUnit, 64)`：
-/// 外机 ~99 包/s × 不到 1s burst）。
+/// per-consumer channel 缓冲深度（外机 ~99 包/s × 不到 1s burst）。
 pub const CONSUMER_CHAN_DEPTH: usize = 64;
 
-/// [`FrameBuffer::wait_idr`] 错误分型（spec 场景「close 与 wait_idr 竞态分型」）。
+/// [`FrameBuffer::wait_idr`] 错误分型（close 与 wait_idr 竞态分型）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitIdrError {
     /// buffer 已 close（session teardown）→ HTTP 层映射 503「session closed」。
@@ -59,7 +54,7 @@ struct Inner {
     pps: Option<NalUnit>,
     idr: Option<NalUnit>,
 
-    // 首个 IDR 已出现（Go `idrReadyHit`；信号经 Condvar 广播）。
+    // 首个 IDR 已出现（信号经 Condvar 广播）。
     idr_ready: bool,
 
     // closed 标志位：close 后 Push 静默丢弃。
@@ -70,7 +65,7 @@ struct Inner {
     next_id: u64,
 }
 
-/// RTP receiver 写入 / 多 consumer 读出的中央缓冲。锚 Go `FrameBuffer`。
+/// RTP receiver 写入 / 多 consumer 读出的中央缓冲。
 pub struct FrameBuffer {
     inner: Mutex<Inner>,
     idr_cond: Condvar,
@@ -83,7 +78,7 @@ impl Default for FrameBuffer {
 }
 
 impl FrameBuffer {
-    /// 构造空 buffer（锚 Go `NewFrameBuffer`）。
+    /// 构造空 buffer。
     pub fn new() -> FrameBuffer {
         FrameBuffer {
             inner: Mutex::new(Inner {
@@ -99,7 +94,7 @@ impl FrameBuffer {
         }
     }
 
-    /// RTP receiver 的写入路径（锚 Go `Push`）：
+    /// RTP receiver 的写入路径：
     ///   - SPS/PPS/IDR：更新种子缓存 + 首个 IDR 时 Condvar 广播
     ///   - 所有 NAL：`try_send` fan-out 给所有 consumer（满 → drop-newest，静默）
     ///   - closed 后静默丢弃
@@ -123,20 +118,20 @@ impl FrameBuffer {
             }
             inner.consumers.iter().map(|(_, tx)| tx.clone()).collect()
         };
-        // 锁外 fan-out（锚 Go 先 snapshot consumers 再 unlock send）。
+        // 锁外 fan-out（先 snapshot consumers 再 unlock send）。
         // try_send 满 → Err(Full) 丢新 NAL（drop-newest）；断开 → 忽略（退订路径清理）。
         for tx in senders {
             let _ = tx.try_send(n.clone());
         }
     }
 
-    /// 注册一个 consumer，返 (接收端, 退订句柄)。锚 Go `Subscribe`。
+    /// 注册一个 consumer，返 (接收端, 退订句柄)。
     ///
     /// close 后调用：返回**已断开**的 channel（接收端立刻 `Err(Disconnected)`），
-    /// 退订句柄为 no-op——对齐 Go `closed` 分支返已 close 的 chan。
+    /// 退订句柄为 no-op。
     ///
     /// 退订：[`Subscription`] drop（或显式 [`Subscription::unsubscribe`]）即摘除
-    /// 发送端 → 接收端 drain 完缓冲后断开（Go `delete + close(ch)` 等价）。
+    /// 发送端 → 接收端 drain 完缓冲后断开。
     pub fn subscribe(self: &Arc<Self>) -> (Receiver<NalUnit>, Subscription) {
         let (tx, rx) = sync_channel::<NalUnit>(CONSUMER_CHAN_DEPTH);
         let mut inner = self.inner.lock().unwrap();
@@ -162,7 +157,7 @@ impl FrameBuffer {
         )
     }
 
-    /// 返回最近 (SPS, PPS, IDR) 三件套种子（任一缺失返 `None`）。锚 Go `LatestIDR`。
+    /// 返回最近 (SPS, PPS, IDR) 三件套种子（任一缺失返 `None`）。
     pub fn latest_idr(&self) -> Option<(NalUnit, NalUnit, NalUnit)> {
         let inner = self.inner.lock().unwrap();
         match (&inner.sps, &inner.pps, &inner.idr) {
@@ -171,8 +166,7 @@ impl FrameBuffer {
         }
     }
 
-    /// 阻塞等首个 IDR，支持 deadline。锚 Go `WaitIDR(ctx)` + 调用方 `Closed()`
-    /// 两段式的合并分型版：
+    /// 阻塞等首个 IDR，支持 deadline；结果带分型：
     ///   - close（含等待中被 close 的竞态）→ [`WaitIdrError::Closed`]（→ 503）
     ///   - deadline 内无 IDR → [`WaitIdrError::Timeout`]（→ 504）
     pub fn wait_idr(&self, timeout: Duration) -> Result<(), WaitIdrError> {
@@ -197,7 +191,6 @@ impl FrameBuffer {
 
     /// 标记 buffer 关闭：后续 Push 静默丢；现有 consumer channel 全断开；
     /// 等待中的 [`FrameBuffer::wait_idr`] 立即返 [`WaitIdrError::Closed`]。
-    /// 锚 Go `Close`。
     pub fn close(&self) {
         let mut inner = self.inner.lock().unwrap();
         if inner.closed {
@@ -206,12 +199,11 @@ impl FrameBuffer {
         inner.closed = true;
         // 摘除全部发送端（drop SyncSender → 接收端 drain 完后 Disconnected）。
         inner.consumers.clear();
-        // 唤醒所有 wait_idr（醒后见 closed → Err(Closed)；Go 用 close(idrReady)
-        // + caller Closed() 自判，Rust 分型单返回等价）。
+        // 唤醒所有 wait_idr（醒后见 closed → Err(Closed)）。
         self.idr_cond.notify_all();
     }
 
-    /// 返 buffer 是否已 close。锚 Go `Closed`。
+    /// 返 buffer 是否已 close。
     pub fn closed(&self) -> bool {
         self.inner.lock().unwrap().closed
     }
@@ -223,7 +215,7 @@ impl FrameBuffer {
     }
 }
 
-/// 退订句柄（Go `Subscribe` 返回的 unsubscribe 闭包的等价物）。
+/// 退订句柄（[`FrameBuffer::subscribe`] 返回，持有 consumer 注册）。
 ///
 /// drop 即退订（摘除发送端 → 接收端 drain 完缓冲后断开）；显式
 /// [`Subscription::unsubscribe`] 仅是带语义名的 drop。
@@ -246,7 +238,7 @@ impl Drop for Subscription {
     }
 }
 
-// ── 单测（移植 Go rtp_test.go FrameBuffer 用例 + spec 场景）─────────────────────
+// ── 单测（FrameBuffer 行为用例 + 补充场景）─────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -269,7 +261,7 @@ mod tests {
         b.push(nal(NAL_TYPE_IDR, &[0x65, 0xcc], 100));
     }
 
-    /// 移植 Go `TestFrameBuffer_PushAndSeed`（种子走 latest_idr API，SeedNALs 不移植）。
+    /// push 三件套后种子可经 latest_idr 取出。
     #[test]
     fn push_and_seed() {
         let b = FrameBuffer::new();
@@ -281,7 +273,7 @@ mod tests {
         assert_eq!(idr.data, vec![0x65, 0xcc]);
     }
 
-    /// 三件套任一缺失 → None（Go LatestIDR ok=false）。
+    /// 三件套任一缺失 → None。
     #[test]
     fn latest_idr_requires_all_three() {
         let b = FrameBuffer::new();
@@ -290,7 +282,7 @@ mod tests {
         assert!(b.latest_idr().is_none(), "missing PPS must yield None");
     }
 
-    /// 移植 Go `TestFrameBuffer_WaitIDR_ReturnsImmediatelyAfterIDR`。
+    /// IDR 已 push 后 wait_idr 立即返回。
     #[test]
     fn wait_idr_returns_immediately_after_idr() {
         let b = FrameBuffer::new();
@@ -299,7 +291,7 @@ mod tests {
             .expect("wait_idr after IDR push");
     }
 
-    /// 移植 Go `TestFrameBuffer_WaitIDR_TimeoutNoIDR`：无 IDR → Timeout 分型。
+    /// 无 IDR → Timeout 分型。
     #[test]
     fn wait_idr_timeout_no_idr() {
         let b = FrameBuffer::new();
@@ -309,7 +301,7 @@ mod tests {
         assert_eq!(err, WaitIdrError::Timeout);
     }
 
-    /// 移植 Go `TestFrameBuffer_FanOutToConsumer`。
+    /// push 的 NAL 按序 fan-out 给订阅的 consumer。
     #[test]
     fn fan_out_to_consumer() {
         let b = Arc::new(FrameBuffer::new());
@@ -322,7 +314,7 @@ mod tests {
         assert_eq!(n2.data, vec![0x61, 0x02]);
     }
 
-    /// 慢消费者丢帧不阻塞（spec 场景）：consumer A 不读，积满 64 后丢新 NAL
+    /// 慢消费者丢帧不阻塞：consumer A 不读，积满 64 后丢新 NAL
     /// （drop-newest——缓冲内旧 NAL 保留）；push 全程不阻塞、其它 consumer 不受影响。
     #[test]
     fn slow_consumer_drops_newest_without_blocking() {
@@ -364,8 +356,8 @@ mod tests {
         }
     }
 
-    /// 新消费者种子与间隙（spec 场景「新消费者种子」）：latest_idr 取三件套；
-    /// 种子快照与订阅首 NAL 之间的 NAL 不补投（Go 已知间隙行为）。
+    /// 新消费者种子与间隙：latest_idr 取三件套；
+    /// 种子快照与订阅首 NAL 之间的 NAL 不补投（已知间隙行为）。
     #[test]
     fn new_consumer_seed_and_gap() {
         let b = Arc::new(FrameBuffer::new());
@@ -390,7 +382,7 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap_err(), TryRecvError::Empty);
     }
 
-    /// 移植 Go `TestFrameBuffer_CloseShutsDownConsumers`。
+    /// close 后现有 consumer channel 断开。
     #[test]
     fn close_shuts_down_consumers() {
         let b = Arc::new(FrameBuffer::new());
@@ -402,7 +394,7 @@ mod tests {
         }
     }
 
-    /// 移植 Go `TestFrameBuffer_PushAfterCloseIsNoop`。
+    /// close 后 push 静默丢、不更新种子。
     #[test]
     fn push_after_close_is_noop() {
         let b = FrameBuffer::new();
@@ -412,7 +404,7 @@ mod tests {
         assert!(b.closed());
     }
 
-    /// close 后新 subscribe 返已断开 channel（spec close 语义）。
+    /// close 后新 subscribe 返已断开 channel（close 语义）。
     #[test]
     fn subscribe_after_close_returns_disconnected() {
         let b = Arc::new(FrameBuffer::new());
@@ -422,7 +414,7 @@ mod tests {
         sub.unsubscribe(); // no-op 句柄不 panic。
     }
 
-    /// close 竞态分型（spec 场景「close 与 wait_idr 竞态分型」）：等待中 close →
+    /// close 竞态分型（close 与 wait_idr 竞态分型）：等待中 close →
     /// 立即返 Closed（非 Timeout），上层据此 503 而非 504。
     #[test]
     fn wait_idr_close_race_returns_closed() {
@@ -441,8 +433,7 @@ mod tests {
         );
     }
 
-    /// 已 close 再 wait_idr → Closed（即便 IDR 曾出现过——对齐 Go handler
-    /// WaitIDR-nil 后 Closed() 判 503 的两段式语义）。
+    /// 已 close 再 wait_idr → Closed（即便 IDR 曾出现过——HTTP 层据此判 503）。
     #[test]
     fn wait_idr_after_close_returns_closed_even_with_idr() {
         let b = FrameBuffer::new();

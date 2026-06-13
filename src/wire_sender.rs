@@ -1,30 +1,28 @@
-//! `wire_sender`：18022 wire 帧 TCP sender（组 B 实现）。
+//! `wire_sender`：18022 wire 帧 TCP sender。
 //!
-//! 逐行移植 Go `wire18022.Sender`（`sender.go` / `sender_linux.go` / `sender_other.go`）：
 //! TCP 短连接（每帧独立 socket）+ `connect`/`write`/`read` 各阶段 5s deadline +
 //! cancel-aware + silent-FIN 检测（[`WireError::SilentFin`]）+ timeout 归一
 //! （[`WireError::Timeout`]）+ [`is_retryable_error`] 分类 + `SO_BINDTODEVICE`
-//! （破口三处之一，借 `libc`）+ [`get_iface_ip`] / [`pick_ipv4_from_addrs`]。
+//! （libc 破口三处之一）+ [`get_iface_ip`] / [`pick_ipv4_from_addrs`]。
 //!
-//! 注意（design D-F）：`wire18022`（Phase1 纯函数 frame builder）与 `wire_sender`（本模块，
-//! TCP + libc）拆开——`is_retryable_error` / `SilentFin` / `Timeout` 在 Rust 归本模块，
-//! Go 在 `wire18022` 包。Phase 4 import 须知此切分。
+//! 注意：`wire18022`（纯函数 frame builder）与 `wire_sender`（本模块，
+//! TCP + libc）拆开——`is_retryable_error` / `SilentFin` / `Timeout` 归本模块。
 //!
 //! ## cancel 语义
 //!
-//! Rust 无 Go `context`。本模块用 `&AtomicBool` 作 cancel 信号（对齐 Phase2 `trait Sender`
-//! 的 `cancel` 参数风格）：[`Sender::send_context`] 在 connect / read 阻塞期间起一个监视线程，
+//! 本模块用 `&AtomicBool` 作 cancel 信号（对齐 `trait Sender` 的 `cancel` 参数风格）：
+//! [`Sender::send_context`] 在 connect / read 阻塞期间起一个监视线程，
 //! 一旦 cancel 置位或顶层 deadline 到，就 `shutdown` socket 让阻塞的 connect/read 立即返错。
 //!
-//! ## SO_BINDTODEVICE（design D-A 路 (a)）
+//! ## SO_BINDTODEVICE
 //!
-//! Go `sender.go:118-130` 用 `dialer.Control` 在 fd 上 `setsockopt(SO_BINDTODEVICE)`，
-//! 而 `std::net::TcpStream::connect` 无 pre-connect fd hook。生产 hAP 门禁网（br-door）默认
-//! 路由是家庭网，不绑设备会从错网卡出包。故 `iface` 非空时走**手动**
+//! `std::net::TcpStream::connect` 无 pre-connect fd hook，无法在 fd 上
+//! `setsockopt(SO_BINDTODEVICE)`。生产 hAP 门禁网（br-door）默认路由是家庭网，
+//! 不绑设备会从错网卡出包。故 `iface` 非空时走**手动**
 //! `socket() + setsockopt(SO_BINDTODEVICE) + bind(local) + connect()`（自实现 connect
 //! deadline，因放弃了 `TcpStream::connect_timeout`），再 `from_raw_fd` 包成 `TcpStream`
-//! 复用 std 的 write/read。非 Linux（开发期 macOS）：SO_BINDTODEVICE 降级 no-op（对齐 Go
-//! `sender_other.go`），仍设源 IP（LocalAddr bind）——仅本机测试，生产必须 Linux。
+//! 复用 std 的 write/read。非 Linux（开发期 macOS）：SO_BINDTODEVICE 降级 no-op，
+//! 仍设源 IP（LocalAddr bind）——仅本机测试，生产必须 Linux。
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
@@ -35,26 +33,24 @@ use std::time::{Duration, Instant};
 /// connect / send / recv 各阶段默认超时（与原版 doorlink 一致 5s）。
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// 单次读取响应的最大字节数（锚 Go `maxRecvBytes`）。
+/// 单次读取响应的最大字节数。
 const MAX_RECV_BYTES: usize = 256;
 
 // ---------------------------------------------------------------------------
-// 错误类型（锚 Go ErrSilentFIN / ErrTimeout + IsRetryableError 分类）
+// 错误类型（SilentFIN / Timeout sentinel + is_retryable_error 分类）
 // ---------------------------------------------------------------------------
 
 /// wire sender 错误。
 ///
-/// [`WireError::SilentFin`] / [`WireError::Timeout`] 是可判别的"哨兵"变体，对齐 Go 的
-/// `ErrSilentFIN` / `ErrTimeout` sentinel；[`is_retryable_error`] 据此分类。
+/// [`WireError::SilentFin`] / [`WireError::Timeout`] 是可判别的"哨兵"变体；
+/// [`is_retryable_error`] 据此分类。
 #[derive(Debug)]
 pub enum WireError {
     /// 外机收到帧后未发响应 body 直接 FIN（业务 idle / ring 状态机拒绝）。
-    /// 锚 Go `ErrSilentFIN`。
     SilentFin,
     /// connect / send / recv 阶段超时；`stage` 标阶段名（"connect"/"write"/"read"）。
-    /// 锚 Go `ErrTimeout`（经 `wrapTimeout` 包裹）。
     Timeout { stage: &'static str },
-    /// cancel 信号触发，主动放弃 connect/read（Go 侧由 ctx 取消触发）。
+    /// cancel 信号触发，主动放弃 connect/read。
     Canceled { stage: &'static str },
     /// 其它 IO 错误；`stage` 标阶段名，`source` 携底层 `io::Error`。
     Io {
@@ -100,7 +96,7 @@ impl WireError {
         matches!(self, WireError::Timeout { .. })
     }
 
-    /// 底层 IO 错误是否表示 deadline 触发的超时（对齐 Go `net.Error.Timeout()`）。
+    /// 底层 IO 错误是否表示 deadline 触发的超时。
     /// `TimedOut`（Linux）与 `WouldBlock`（macOS/BSD SO_RCVTIMEO 击中）都算。
     fn io_is_timeout(&self) -> bool {
         match self {
@@ -113,12 +109,12 @@ impl WireError {
     }
 }
 
-/// 把 [`io::Error`] 的超时归一化为 [`WireError::Timeout`]（锚 Go `wrapTimeout`）。
+/// 把 [`io::Error`] 的超时归一化为 [`WireError::Timeout`]。
 ///
 /// `io::ErrorKind::TimedOut`（Linux：read/write 上的 SO_*TIMEO 击中）→ [`WireError::Timeout`]；
 /// `io::ErrorKind::WouldBlock`（macOS/BSD：SO_RCVTIMEO 击中时 read 返 EAGAIN/EWOULDBLOCK 而非
-/// ETIMEDOUT；Rust std 不像 Go `net` 那样把 deadline 触发的 WouldBlock 归一为 timeout）→
-/// 同样归 [`WireError::Timeout`]，与 Go `net.Error.Timeout()=true` 行为对齐。
+/// ETIMEDOUT；Rust std 不会把 deadline 触发的 WouldBlock 归一为 timeout）→
+/// 同样归 [`WireError::Timeout`]（把 deadline 触发的 WouldBlock 统一视为超时）。
 /// 其余包成 [`WireError::Io`] 保留阶段名 + 底层 err。
 fn wrap_timeout(err: io::Error, stage: &'static str) -> WireError {
     match err.kind() {
@@ -129,11 +125,11 @@ fn wrap_timeout(err: io::Error, stage: &'static str) -> WireError {
 
 /// 报告 `err` 是否表示 transient wire 失败，调用方可在退避后重试。
 ///
-/// 逐条对齐 Go `IsRetryableError`（与 retry-unlock-on-ring-state-mismatch design.md 决策 3）：
+/// 重试错误分类：
 ///   - [`WireError::SilentFin`]：外机 ring state 未稳定时直接 close 连接（典型 -103 路径，
 ///     重试 ~3s 后外机 ring state 切换可能成功）
 ///   - [`WireError::Timeout`]：connect/send/recv 任一阶段 deadline 击中（哨兵）
-///   - 底层 `io::Error` 的 `ErrorKind::TimedOut`（对齐 Go `net.Error.Timeout()`）
+///   - 底层 `io::Error` 的 `ErrorKind::TimedOut`
 ///   - 错误字符串含 "connection reset" / "broken pipe"：socket 半关闭后再写
 ///
 /// 业务级错误（外机响应了但 body 校验失败）**不**走此函数——那条路径在 unlock 核心由
@@ -148,8 +144,8 @@ pub fn is_retryable_error(err: &WireError) -> bool {
     if err.io_is_timeout() {
         return true;
     }
-    // 错误串匹配（锚 Go `strings.Contains(msg, "connection reset"/"broken pipe")`）。
-    // ErrorKind::ConnectionReset / BrokenPipe 是首选判别；同时兜底字符串匹配以对齐 Go。
+    // 错误串匹配 "connection reset"/"broken pipe"。
+    // ErrorKind::ConnectionReset / BrokenPipe 是首选判别；同时兜底字符串匹配。
     if let WireError::Io { source, .. } = err {
         match source.kind() {
             io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe => return true,
@@ -164,12 +160,12 @@ pub fn is_retryable_error(err: &WireError) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Sender（锚 Go wire18022.Sender struct + Send / SendContext）
+// Sender（Send / SendContext）
 // ---------------------------------------------------------------------------
 
 /// 用预先绑定的网卡 IP + Linux `SO_BINDTODEVICE` 发送 18022 wire 帧。
 ///
-/// 设计要点（锚 Go `Sender`）：
+/// 设计要点：
 ///   - `SO_BINDTODEVICE("br-door")`：内核层确保出站包走门禁网（即使家庭网默认路由更优）
 ///   - bind(iface_ip, 0)：源 IP 锁定为门禁网 IP（避免操作系统选错源 IP）
 ///   - 各阶段 deadline = 5s：避免外机静默时主线程长时间挂起
@@ -190,7 +186,7 @@ pub struct Sender {
 impl Sender {
     /// 朝 `target_ip:target_port` 发 `frame`；`want_recv=true` 时读取最多 256 字节响应。
     ///
-    /// 等价 Go `Send`（内部用永不取消的 cancel 信号）。
+    /// 内部用永不取消的 cancel 信号调 [`Sender::send_context`]。
     ///
     /// 错误语义：
     ///   - 解析 IP / 创建 socket / connect 失败 → [`WireError::Io`]
@@ -209,8 +205,8 @@ impl Sender {
 
     /// cancel-aware 版本：`cancel` 置位时立即放弃 connect/read（不等 timeout）。
     ///
-    /// 等价 Go `SendContext`：之前 `Send` 用 `context.Background()`，shutdown 时排队的
-    /// wire send 仍跑满 5s 超时，阻塞 process exit。现在 cancel 置位即刻 shutdown socket。
+    /// 无 cancel 时排队的 wire send 会跑满 5s 超时、阻塞 process exit；
+    /// cancel 置位即刻 shutdown socket，让阻塞的 connect/read 立即返错。
     pub fn send_context(
         &self,
         cancel: &AtomicBool,
@@ -236,7 +232,7 @@ impl Sender {
         let stream = self.connect(target, local_ip, deadline, cancel)?;
 
         // 起 cancel/deadline 监视线程：cancel 置位或顶层 deadline 到 → shutdown 让
-        // 阻塞的 read/write 立即返错（Go 侧 ctx.Done() → conn.Close()）。
+        // 阻塞的 read/write 立即返错。
         let watcher = CancelWatcher::spawn(&stream, cancel, deadline);
 
         let result = self.write_then_read(&stream, frame, want_recv, timeout, deadline, cancel);
@@ -249,7 +245,7 @@ impl Sender {
     ///
     /// `deadline`：本次 send 的绝对 deadline（= `connect 起点 + timeout`），与 [`CancelWatcher`]
     /// 用的同一个——n==0 EOF 分支据此区分「deadline 触发 watcher shutdown」（→ Timeout）与
-    /// 「外机真 silent FIN」（→ SilentFin），见下方注释（修复 bugbot #2）。
+    /// 「外机真 silent FIN」（→ SilentFin），见下方注释。
     fn write_then_read(
         &self,
         stream: &TcpStream,
@@ -296,22 +292,20 @@ impl Sender {
         };
         if n == 0 {
             // cancel/deadline 触发时 CancelWatcher `shutdown(Both)` 让阻塞 read 返 Ok(0)(EOF)。
-            // 这不是外机 silent FIN——Go `conn.Close()` 让 Read 返 "closed network connection"
-            // 错（非 EOF）归 generic Io(-1，不可重试）。故 cancel 置位时先判 Canceled，避免
-            // 误判成可重试 SilentFin(-103)。
+            // 这不是外机 silent FIN——cancel 触发的关闭应归 Canceled（不可重试），不是 -103。
+            // 故 cancel 置位时先判 Canceled，避免误判成可重试 SilentFin(-103)。
             if cancel.load(Ordering::SeqCst) {
                 return Err(WireError::Canceled { stage: "read" });
             }
-            // 修复 bugbot #2：CancelWatcher 不仅监视 cancel，也监视本次 send 的 deadline
-            // （wire_sender.rs CancelWatcher::spawn 内 `cancel || Instant::now()>=deadline` →
+            // CancelWatcher 不仅监视 cancel，也监视本次 send 的 deadline
+            // （CancelWatcher::spawn 内 `cancel || Instant::now()>=deadline` →
             // `shutdown(Both)`）。若 deadline 已过而 cancel 未置位，这个 Ok(0) 是 deadline
-            // 触发 shutdown 的产物、**不是**外机 silent FIN——对齐 Go `conn.Close()` 因 deadline
-            // 让 Read 返错（非 EOF）归 Timeout/-5（而非可重试 SilentFin/-103）。
+            // 触发 shutdown 的产物、**不是**外机 silent FIN——归 Timeout/-5
+            // （而非可重试 SilentFin/-103）。
             if Instant::now() >= deadline {
                 return Err(WireError::Timeout { stage: "read" });
             }
             // 0 字节响应 + EOF = silent FIN（外机 ring 状态机拒绝 / idle timeout）。
-            // 锚 Go：`if n == 0 { if err == nil || err == io.EOF { return ErrSilentFIN } }`。
             return Err(WireError::SilentFin);
         }
         // n>0 视为读到部分响应（短连接正常路径，含随后的 EOF）。
@@ -335,7 +329,7 @@ impl Sender {
     }
 }
 
-/// 解析 `target_ip:target_port` 为 `SocketAddr`（仅接受字面 IP，与 Go 一致——目标是外机 BCD@IP）。
+/// 解析 `target_ip:target_port` 为 `SocketAddr`（仅接受字面 IP——目标是外机 BCD@IP）。
 fn parse_target(target_ip: &str, target_port: u16) -> Result<SocketAddr, WireError> {
     let ip: IpAddr = target_ip
         .parse()
@@ -357,7 +351,6 @@ fn classify_io(err: io::Error, stage: &'static str, cancel: &AtomicBool) -> Wire
 
 /// 起一个后台线程监视 cancel/deadline，触发时 `shutdown` socket 让阻塞 read/write 立即返错。
 ///
-/// 锚 Go `SendContext` 里 `go func(){ select{ <-ctx.Done(): conn.Close(); <-stop: } }()`。
 /// drop 时通过 `done` 标志停线程（并 join，确保不泄漏）。
 struct CancelWatcher {
     done: Arc<AtomicBool>,
@@ -412,12 +405,12 @@ impl Drop for CancelWatcher {
 }
 
 // ---------------------------------------------------------------------------
-// GetIfaceIP / pickIPv4FromAddrs（锚 Go 同名函数）
+// get_iface_ip / pick_ipv4_from_addrs
 // ---------------------------------------------------------------------------
 
 /// 返回 `iface` 的第一个 IPv4 地址（优先非 loopback，否则 loopback fallback）。
 ///
-/// 锚 Go `GetIfaceIP`：用接口名查地址枚举。Linux 用 `getifaddrs` 走 [`platform::iface_ipv4s`]；
+/// 用接口名查地址枚举：Linux 用 `getifaddrs` 走 [`platform::iface_ipv4s`]；
 /// 非 Linux（macOS）同样有 `getifaddrs`，平台层统一实现。
 pub fn get_iface_ip(iface: &str) -> Result<Ipv4Addr, WireError> {
     // 先确认接口存在（if_nametoindex）。
@@ -433,7 +426,7 @@ pub fn get_iface_ip(iface: &str) -> Result<Ipv4Addr, WireError> {
 
 /// 从 IPv4 列表挑第一个：优先非 loopback，否则 loopback fallback。
 ///
-/// 锚 Go `pickIPv4FromAddrs`。抽为纯函数便于单测（空列表 / 仅 loopback / 优先非 loopback）。
+/// 抽为纯函数便于单测（空列表 / 仅 loopback / 优先非 loopback）。
 pub fn pick_ipv4_from_addrs(addrs: &[Ipv4Addr]) -> Option<Ipv4Addr> {
     let mut fallback: Option<Ipv4Addr> = None;
     for &ip in addrs {
@@ -760,7 +753,7 @@ mod platform {
 
 #[cfg(not(target_os = "linux"))]
 mod platform {
-    //! 非 Linux（开发期 macOS）降级：SO_BINDTODEVICE no-op（对齐 Go `sender_other.go`），
+    //! 非 Linux（开发期 macOS）降级：SO_BINDTODEVICE no-op，
     //! 仍设源 IP（LocalAddr bind）。用 std `TcpStream::connect_timeout` 实现 connect deadline，
     //! 起轮询线程兼顾 cancel；getifaddrs 在 macOS 同样可用做 `iface_ipv4s`。
 
@@ -835,7 +828,7 @@ mod platform {
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> Result<TcpStream, WireError> {
-        // 非 Linux：SO_BINDTODEVICE no-op（Go sender_other.go），仍设源 IP。
+        // 非 Linux：SO_BINDTODEVICE no-op，仍设源 IP。
         connect_with_cancel(target, local_ip, deadline, cancel)
     }
 
@@ -877,7 +870,7 @@ mod platform {
 }
 
 // ---------------------------------------------------------------------------
-// 单测（127.0.0.1 mock server；锚 Go sender_test.go）
+// 单测（127.0.0.1 mock server）
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -1116,7 +1109,7 @@ mod tests {
         stop();
     }
 
-    // --- pick_ipv4_from_addrs 纯函数（锚 Go TestPickIPv4FromAddrs）---
+    // --- pick_ipv4_from_addrs 纯函数 ---
 
     #[test]
     fn pick_ipv4_empty() {
@@ -1143,7 +1136,7 @@ mod tests {
         assert_eq!(pick_ipv4_from_addrs(&[a, b]), Some(a));
     }
 
-    // --- get_iface_ip（loopback 接口；锚 Go TestGetIfaceIP_Loopback / _Missing）---
+    // --- get_iface_ip（loopback 接口）---
 
     #[test]
     fn get_iface_ip_loopback() {
@@ -1170,7 +1163,7 @@ mod tests {
         assert!(err.is_err(), "expected error for nonexistent interface");
     }
 
-    // --- is_retryable_error（锚 Go TestIsRetryableError）---
+    // --- is_retryable_error ---
 
     #[test]
     fn is_retryable_silent_fin() {

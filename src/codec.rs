@@ -1,36 +1,35 @@
-//! Phase1 codec 模块：安居宝协议字段级编解码的 Rust 等价实现。
+//! codec 模块：安居宝协议字段级编解码。
 //!
-//! 与 Go `local/dooraccess-go internal/codec` golden parity：
-//!   - 伪 BCD 编解码（`bcd.go`）
-//!   - SIP URI 拆分（`uri.go`，含 D5 IPv4 收紧）
-//!   - result 码常量集（`results.go`）
+//! 三块（均对 committed golden 字节逐字节回归）：
+//!   - 伪 BCD 编解码
+//!   - SIP URI 拆分（含 IPv4 收紧）
+//!   - result 码常量集
 //!
-//! D1：wire/输出逐字节精确，错误**分类**（sentinel 级）与 Go 对应，
-//! 错误 message 仅语义等价、不复刻 Go `fmt.Errorf` 子类后缀。
+//! wire/输出逐字节精确，错误以 sentinel 级分类（见各错误枚举），
+//! 错误 message 仅作诊断、不构成 parity 断言面。
 
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 
 // ---------------------------------------------------------------------------
-// 伪 BCD 编解码（Go: EncodeBCD / DecodeBCD）
+// 伪 BCD 编解码
 // ---------------------------------------------------------------------------
 
-/// 伪 BCD 编码错误。sentinel 级对应 Go `ErrBCDLength` / `ErrBCDFormat`。
+/// 伪 BCD 编码错误（两个 sentinel：长度错 / 格式错）。
 ///
-/// 携带的动态上下文（got / ch / index）仅供 Rust 侧诊断，
-/// 不要求与 Go message 字面一致（D1）。
+/// 携带的动态上下文（got / ch / index）仅供诊断。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BcdError {
-    /// 号码串长度不是 8（Go `ErrBCDLength`）。
+    /// 号码串长度不是 8。
     Length { got: usize },
-    /// 号码串含非 hex 字符（Go `ErrBCDFormat`）。
+    /// 号码串含非 hex 字符。
     Format { ch: char, index: usize },
 }
 
 /// 把 8 位号码字符串编码为 4 字节伪 BCD。
 ///
 /// 编码规则：拆 4 个 2 字符 hex pair，每对当一字节看（伪 BCD：`"06"` → `0x06` 非 `0x60`）。
-/// 接受 `'0'-'9' / 'a'-'f' / 'A'-'F'`，与 Go `strtol(., 16)` 行为一致。
+/// 接受 `'0'-'9' / 'a'-'f' / 'A'-'F'`（按 base-16 解析每个 nibble）。
 pub fn encode_bcd(num_str: &str) -> Result<[u8; 4], BcdError> {
     let bytes = num_str.as_bytes();
     if bytes.len() != 8 {
@@ -51,7 +50,7 @@ pub fn encode_bcd(num_str: &str) -> Result<[u8; 4], BcdError> {
     Ok(out)
 }
 
-/// 反向：4 字节 → 8 位小写 hex 字符串（每字节 `%02x` 拼接），与 Go `DecodeBCD` 等价。
+/// 反向：4 字节 → 8 位小写 hex 字符串（每字节 `%02x` 拼接）。
 pub fn decode_bcd(b: [u8; 4]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = [0u8; 8];
@@ -74,33 +73,31 @@ fn hex_nibble(c: u8) -> Option<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// SIP URI 拆分（Go: ParseURI，含 D5 IPv4 收紧）
+// SIP URI 拆分（含 IPv4 收紧）
 // ---------------------------------------------------------------------------
 
-/// SIP URI 解析错误。四个 sentinel 级与 Go `ErrURIFormat` / `ErrURINameLen` /
-/// `ErrURIIPv4Only` / `ErrURIPort` 对应。
+/// SIP URI 解析错误（四个 sentinel：格式 / name 长度 / IPv4 / port）。
 ///
-/// D1：Go 用同 `ErrURIFormat` sentinel + message 后缀区分"缺 @"/"缺 :port"两子类；
-/// Rust 据 D1 只对齐到 `Format` 一个 sentinel，不复刻子类。
+/// "缺 @" 与 "缺 :port" 两种格式错统一归到 `Format` 一个 sentinel，不再细分子类。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UriError {
-    /// 整体格式错（缺 `@` / 缺 `:port` 等），Go `ErrURIFormat`。
+    /// 整体格式错（缺 `@` / 缺 `:port` 等）。
     Format,
-    /// 名不是恰好 8 字符，Go `ErrURINameLen`。
+    /// 名不是恰好 8 字符。
     NameLen { got: usize },
-    /// IP 不是规范点分十进制 IPv4，Go `ErrURIIPv4Only`。
+    /// IP 不是规范点分十进制 IPv4。
     IPv4Only,
-    /// 端口不是 1-65535 整数，Go `ErrURIPort`。
+    /// 端口不是 1-65535 整数。
     Port,
 }
 
 /// 拆分 `name@ip:port` 形式的 SIP URI。
 ///
 /// anjubao 模式严格 8 位号码 + IPv4 + 整数端口（1-65535）。
-/// IP 用 `std::net::Ipv4Addr`（D5）：只接受规范点分十进制，拒前导零（`01.2.3.4`）、
+/// IP 用 `std::net::Ipv4Addr`：只接受规范点分十进制，拒前导零（`01.2.3.4`）、
 /// 拒 IPv4-mapped IPv6（`::ffff:1.2.3.4`）。
 ///
-/// 返回的 `ip` 是原始子串（与 Go 一致，未做规范化）。检查顺序逐字对齐 Go：
+/// 返回的 `ip` 是原始子串（未做规范化）。检查顺序：
 /// 格式 → name 长度 → IPv4 → port。
 pub fn parse_uri(uri: &str) -> Result<(String, String, u16), UriError> {
     let at = match uri.find('@') {
@@ -121,13 +118,12 @@ pub fn parse_uri(uri: &str) -> Result<(String, String, u16), UriError> {
         return Err(UriError::NameLen { got: name.len() });
     }
 
-    // D5：规范点分十进制 IPv4 永不含 ':'，显式拒含冒号输入（v6-mapped）+ Ipv4Addr 拒前导零。
+    // 规范点分十进制 IPv4 永不含 ':'，显式拒含冒号输入（v6-mapped）+ Ipv4Addr 拒前导零。
     if ip.contains(':') || Ipv4Addr::from_str(ip).is_err() {
         return Err(UriError::IPv4Only);
     }
 
-    // Go 用 strconv.Atoi 后做 1<=p<=65535 范围检查；以 i64 解析复刻该语义
-    // （"-1"/"65536"/"abc" 均归 Port）。
+    // 以 i64 解析后做 1<=p<=65535 范围检查（"-1"/"65536"/"abc" 均归 Port）。
     let port = match port_str.parse::<i64>() {
         Ok(p) if (1..=65535).contains(&p) => p as u16,
         _ => return Err(UriError::Port),
@@ -137,13 +133,13 @@ pub fn parse_uri(uri: &str) -> Result<(String, String, u16), UriError> {
 }
 
 // ---------------------------------------------------------------------------
-// result 码常量集（Go: results.go）
+// result 码常量集
 // ---------------------------------------------------------------------------
 
 /// doorlink 内部 result code（int32 范围）。
 ///
-/// v0.1.6 起 Go 删除 result→中文消息表；daemon 响应 body 是 result int 十进制字符串，
-/// i18n 是 HA 端责任。Rust 侧同样**不**引入消息表，仅暴露逐值相等的命名常量。
+/// 无 result→中文消息表：daemon 响应 body 是 result int 十进制字符串，
+/// i18n 是 HA 端责任。本模块只暴露命名常量，不引入消息表。
 pub mod result {
     pub const OK: i32 = 0;
     pub const NO_CHANGE: i32 = 1;

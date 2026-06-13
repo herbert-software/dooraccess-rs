@@ -1,5 +1,4 @@
-//! Phase 5 mock 外机 video e2e（`port-rust-video-forward` 组 G / tasks 7.1；
-//! spec「跨语言 golden、e2e 与体型 Gate」③）。
+//! mock 外机 video e2e。
 //!
 //! 链路全真组件：HTTP（httpx server + control mux）→ `Manager`（默认依赖 =
 //! 真 `PreviewClient` / 真 `RtpReceiver` / 真 `RtcpSender`）→ FrameBuffer →
@@ -9,7 +8,7 @@
 //!   - UDP replay `testdata/rtp-fragmentation/expA.packets.tsv` 子集（含 ≥2 个
 //!     完整 IDR frame 的连续段）灌真 RTP receiver
 //!
-//! 覆盖（任务 7.1 钉死的链条）：start→stream FLV 前缀断言 + ≥2 keyframe tag
+//! 覆盖的链条：start→stream FLV 前缀断言 + ≥2 keyframe tag
 //! （0x17）与 tag 计数断言→多消费者 fan-out→慢消费者丢帧不阻塞→stop/bye
 //! teardown→TTL 过期 detached cleanup。全 tunable 压缩（TTL/monitor/tail-wait
 //! 注入口），**禁真实 60s 等待**——成功路径的等待全部是「条件就绪即返回」的
@@ -723,7 +722,7 @@ fn e2e_start_stream_fanout_stop_bye() {
     assert_eq!(got_a, expected, "consumer A FLV 字节流");
     assert_eq!(got_b, expected, "consumer B FLV 字节流（fan-out 等价）");
 
-    // tag 计数 + ≥2 keyframe（0x17）显式断言（任务 7.1 字面要求）。
+    // tag 计数 + ≥2 keyframe（0x17）显式断言。
     let got = parse_flv(&got_a);
     assert_eq!(got.video_tags, want.video_tags, "video tag 计数");
     assert!(
@@ -759,7 +758,7 @@ fn e2e_slow_consumer_does_not_block_fast() {
 
     // fast：贪读消费者；slow：发出请求后**一个字节都不读**（handler 写满 socket
     // 缓冲后阻塞 → 其 chan(64) 积满 → try_send 丢帧，但 RTP receiver 与 fast
-    // 不得受影响——Go parity：丢帧静默，无计数可观测，断言面 = fast 不受阻）。
+    // 不得受影响——丢帧静默，无计数可观测，断言面 = fast 不受阻）。
     let fast = open_stream(rig.addr, &sid);
     let mut slow_conn = TcpStream::connect(rig.addr).expect("slow connect");
     slow_conn

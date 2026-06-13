@@ -1,13 +1,11 @@
-//! BPF filter golden parity 回归（组 E，task 6.3）。
+//! BPF filter golden parity 回归。
 //!
-//! 读 `testdata/golden/bpf.txt`（Go `bpf.Assemble(buildBPFFilter())` 逐指令导出，SoT =
-//! `golang.org/x/net/bpf.Assemble`），对 Rust 烤好的 `bpf::BPF_6672` / `bpf::BPF_18022`
-//! const 逐字段（op / jt / jf / k）断言相等。
+//! 读 committed golden 向量 `testdata/golden/bpf.txt`（每行一条 BPF 指令），对 Rust 烤好的
+//! `bpf::BPF_6672` / `bpf::BPF_18022` const 逐字段（op / jt / jf / k）断言相等。
 //!
-//! 若 Rust const 与 Go assemble 输出不一致 → 组 A 烤错（真 bug），本测试 fail；**不在此处
-//! 改 src/bpf.rs**，由主 agent 决定（见组 E 返回契约 issues）。
+//! 若 Rust const 与 golden 向量不一致 → const 烤错（真 bug），本测试 fail。
 //!
-//! Rust CI 不依赖 Go：向量已 committed，本测试只读静态文件。
+//! 向量已 committed，本测试只读静态文件。
 
 use std::fs;
 use std::path::PathBuf;
@@ -72,7 +70,7 @@ fn assert_inst_eq(actual: &SockFilter, g: &GoldenInst) {
     );
 }
 
-/// task 6.3：Rust const 对 `bpf.txt` 逐字段断言相等。
+/// Rust const 对 `bpf.txt` 逐字段断言相等。
 #[test]
 fn golden_bpf_parity() {
     let text = load_golden();
@@ -121,7 +119,7 @@ fn golden_bpf_parity() {
     assert_eq!(BPF_18022.len(), 13, "BPF_18022 must be 13 insts");
 }
 
-/// task 6.3 sanity：每条 jump 的 jt/jf 偏移 ≤ len-1-idx（不越界）。
+/// sanity：每条 jump 的 jt/jf 偏移 ≤ len-1-idx（不越界）。
 /// 与 bpf.rs 内单测重复一份，独立于 const 内联路径，防 golden 解析失效时仍有结构校验。
 #[test]
 fn golden_bpf_jumps_in_bounds() {

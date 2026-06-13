@@ -1,7 +1,7 @@
-//! /video/* endpoint golden parity（port-rust-video-forward 组 F / tasks 6.1-6.3）。
+//! /video/* endpoint golden parity。
 //!
-//! 读 `testdata/golden/http/video_endpoints.txt`（Go `export_golden_video_test.go`
-//! 导出，组 A / 1.3）逐行回放 REQUEST_HEX 给 Rust control server，对 RESPONSE_HEX
+//! 读 committed golden 向量 `testdata/golden/http/video_endpoints.txt` 逐行回放
+//! REQUEST_HEX 给 Rust control server，对 RESPONSE_HEX
 //! / STATUS 断言（套路对齐 `golden_http.rs` 的 endpoint_socket_golden）。
 //!
 //! 错误消息字面即契约——除以下三行按 **sentinel 前缀 + wrap 形态** 断言（golden
@@ -36,7 +36,7 @@ use dooraccess_rs::video::session::{
     parse_caller, parse_outdoor, Caller, Manager, Outdoor, PreviewPort, RtcpPort, RtpPort,
 };
 
-/// 与 Go export 一致的两个 allowlist 站点 + 固定 session UUID。
+/// golden 向量约定的两个 allowlist 站点 + 固定 session UUID。
 const TEST_OUTDOOR_URI: &str = "06020000@172.16.106.152:18022";
 const OUTDOOR_URI2: &str = "06020001@172.16.106.153:18022";
 const SESSION_ID: &str = "11111111-2222-4333-8444-555555555555";
@@ -244,7 +244,7 @@ fn mgr_with_session(fixture: &Path) -> Arc<Manager> {
     m
 }
 
-/// 与 Go `exportVideoConfig` 一致的 cfg（两个 allowlist 站点）。
+/// golden 向量约定的 cfg（两个 allowlist 站点）。
 fn export_video_config() -> Config {
     let mut cfg = Config::default();
     cfg.sip = "06021103@10.0.0.91:18022".into();
@@ -305,7 +305,7 @@ fn video_endpoints_golden() {
         let want_raw = hex_to_bytes(f[3]);
         let want_status: u16 = f[4].parse().expect("status");
 
-        // 每行独立 server/Manager 状态（对齐 Go export 逐 case 新建 fake）。
+        // 每行独立 server/Manager 状态（逐 case 新建 fake）。
         let mut cleanup_mgr: Option<Arc<Manager>> = None;
         let mut restore_timeout: Option<u32> = None;
         let handler: Arc<dyn Handler> = match name {
@@ -351,7 +351,7 @@ fn video_endpoints_golden() {
                 server_with(Some(m))
             }
             "stream_504_no_keyframe" => {
-                // 空 FrameBuffer + tunable startup timeout 压缩（锚 Go setTestStartupTimeout）。
+                // 空 FrameBuffer + 经 set_stream_startup_timeout_ms 压缩 startup 超时（避免真等满）。
                 restore_timeout = Some(set_stream_startup_timeout_ms(100));
                 let m = mgr_with_session(&fixture);
                 cleanup_mgr = Some(Arc::clone(&m));

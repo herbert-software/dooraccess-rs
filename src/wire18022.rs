@@ -6,11 +6,10 @@
 //!   - req=708 bye（36B + caller/callee BCD 替换）
 //!   - req=518 变体 appoint（29B + from BCD 后 2 字节替换）
 //!
-//! Go 参考实现：`dooraccess-go/internal/wire18022/frames.go`，逐字节对齐。
 //! 任何模板字节漂移都会导致外机静默 / FIN —— golden 向量逐字节回归。
 //!
-//! 帧头 length 字段是**小端**（与 Go `binary.LittleEndian` 一致），即使部署目标
-//! MIPS24Kc 是大端 —— wire 格式固定，不随 host 字节序变化。
+//! 帧头 length 字段是**小端**，即使部署目标 MIPS24Kc 是大端 —— wire 格式固定，
+//! 不随 host 字节序变化。
 
 /// 通用帧头 magic 高字节。
 pub const MAGIC_HI: u8 = 0x07;
@@ -24,14 +23,12 @@ pub const HEADER_SIZE: usize = 6;
 ///   checksum = ('m' + sum(frame[0..29])) & 0xff
 const CHECKSUM_SEED: u32 = 0x6d; // 'm'
 
-/// 响应帧解析失败的错误类型。
+/// 响应帧解析失败的错误类型（单一 malformed-frame sentinel）。
 ///
-/// 对应 Go sentinel `ErrFrameMalformed`。按 design D1，错误**分类**（sentinel 级）
-/// 须与 Go 对应，但 message 字面只要求语义等价 —— `reason` 仅供调试/诊断，
-/// 不构成 parity 断言面。
+/// `reason` 仅供调试/诊断，不构成 parity 断言面。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameError {
-    /// 人类可读的失败原因（语义等价于 Go 的 `fmt.Errorf` 上下文，非字面 parity）。
+    /// 人类可读的失败原因（仅诊断用）。
     pub reason: &'static str,
 }
 
@@ -55,9 +52,7 @@ impl std::error::Error for FrameError {}
 
 /// req=711 OK ack body（10 字节）。
 ///
-/// v0.3.3 fix-doorbell-pipeline 实测：byte 0 = `0x00`（**不是**反编译残留注释的 `0x2a`）。
-/// SoT = Go `frames.go` 变量 `resp711Body` + `samples/anjubao-doorbell/observations.md §4`。
-/// 见 `testdata/golden/EXCEPTIONS.md §wire②`。
+/// 实测：byte 0 = `0x00`（**不是**反编译残留注释的 `0x2a`）。committed golden 字节。
 const RESP_711_BODY: [u8; 10] = [0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00];
 
 /// req=519 OK ack body（10 字节全 0，unlock-B / appoint 共用响应）。
@@ -116,7 +111,7 @@ pub fn build_unlock_a_frame(from_bcd: [u8; 4], to_bcd: [u8; 4]) -> Vec<u8> {
 ///   - 25-28: callee BCD = `to_bcd`
 ///   - 29:    checksum = `('m' + sum(frame[0..29])) & 0xff`
 ///
-/// length 字段须**先填入**再纳入 sum（对照 golden checksum 行）。
+/// length 字段须**先填入**再纳入 sum（见 golden checksum 行）。
 pub fn build_unlock_b_frame(from_bcd: [u8; 4], to_bcd: [u8; 4]) -> Vec<u8> {
     let mut frame = vec![0u8; 30];
     frame[0] = MAGIC_HI;
@@ -166,18 +161,18 @@ pub fn build_bye_frame(from_bcd: [u8; 4], to_bcd: [u8; 4]) -> Vec<u8> {
     assemble_frame(&body)
 }
 
-/// 构造 req=704 preview-start 帧（36B，移植 Go `video.BuildStartFrame`）。
+/// 构造 req=704 preview-start 帧（36B）。
 ///
 /// **与 [`build_preview_frame`]（req=705 fail-fast 探针帧）无关**：start 帧带
 /// callee/caller BCD，发到外机触发其向 daemon UDP 9880 推 RTP 流。
 ///
-/// 与 [`build_stop_frame`] 恰差 2 字节（observations §2.2）：
+/// 与 [`build_stop_frame`] 恰差 2 字节：
 ///   - offset 12：req 数字 `'4'` ↔ `'8'`（704 ↔ 708）
 ///   - offset 19：分隔符 `'*'`（0x2a）↔ `'='`（0x3d）
 ///
-/// arg 序对齐 Go `BuildStartFrame(calleeBCD=外机BCD, callerBCD=室内机BCD)`。
+/// arg 序：首参 = callee BCD（外机），次参 = caller BCD（室内机）。
 ///
-/// 字节布局（整帧 offset，逐字节锚 Go `video/preview.go` BuildStartFrame）：
+/// 字节布局（整帧 offset）：
 ///   - 0-1:   `07 b8`（magic）
 ///   - 2-3:   `1e 00`（length = 30 = body.len()，小端）
 ///   - 4-5:   `00 00`（reserved）
@@ -194,19 +189,19 @@ pub fn build_start_frame(callee_bcd: [u8; 4], caller_bcd: [u8; 4]) -> Vec<u8> {
     assemble_frame(&body)
 }
 
-/// 构造 req=708 preview-stop 帧（36B，移植 Go `video.BuildStopFrame`）。
+/// 构造 req=708 preview-stop 帧（36B）。
 ///
 /// **与自指 [`build_bye_frame`] 的本质区别**：preview-stop 帧用 **preview-shape** body
 /// （分隔符 `=`、尾常量 `80 00 00 00 02 00 00 01`），发到**外机**目标终止其响铃/推流
 /// session。室内机自指 bye 帧（[`build_bye_frame`]，尾 `01 00 00 00 03 00 00 00`，
-/// from==to 室内机自指）对正在推流的外机**无终止作用**（Go `handlers.go:615-621` +
-/// spec `req-708-bye.md` 实证），auto-hangup 用错帧 = 真机不工作。
+/// from==to 室内机自指）对正在推流的外机**无终止作用**（实测），
+/// auto-hangup 用错帧 = 真机不工作。
 ///
-/// arg 序对齐 Go `BuildStopFrame(calleeBCD=外机BCD, callerBCD=室内机BCD)`：
-///   - `outdoor_bcd`：首参（calleeBCD 槽）= 外机 BCD
-///   - `monitor_bcd`：次参（callerBCD 槽）= 室内机 BCD
+/// arg 序：
+///   - `outdoor_bcd`：首参（callee BCD 槽）= 外机 BCD
+///   - `monitor_bcd`：次参（caller BCD 槽）= 室内机 BCD
 ///
-/// 字节布局（整帧 offset，逐字节锚 Go `video.preview.go` BuildStopFrame）：
+/// 字节布局（整帧 offset）：
 ///   - 0-1:   `07 b8`（magic）
 ///   - 2-3:   `1e 00`（length = 30 = body.len()，小端）
 ///   - 4-5:   `00 00`（reserved）
@@ -258,7 +253,7 @@ pub fn build_appoint_frame(from_bcd: [u8; 4]) -> Vec<u8> {
 /// 帧不完整 / magic 错 / reserved 错 / length 不匹配 / 缺 `"req="` 或 `"&query[=*]"`
 /// 时返 [`FrameError`]。
 ///
-/// **双分隔符**（v0.3.3 实测例外，见 `EXCEPTIONS.md §wire①`）：同时接受 `&query=`
+/// **双分隔符**（实测例外）：同时接受 `&query=`
 /// 与 `&query*`（外机 req=705/709/711 ack 实测用 `*` = 0x2a）。仅认 `&query=`
 /// 会重踩"unlock-A OK ack 解析失败 → daemon 报 unexpected response"。
 pub fn parse_response_frame(b: &[u8]) -> Result<(i64, Vec<u8>), FrameError> {
@@ -311,12 +306,11 @@ pub fn parse_response_frame(b: &[u8]) -> Result<(i64, Vec<u8>), FrameError> {
     Ok((req, body))
 }
 
-/// 严格解析 req 编号 ASCII：纯数字、长度 1..=10、值须落在平台 `int` 范围内。
+/// 严格解析 req 编号 ASCII：纯数字、长度 1..=10、值须落在 32-bit `int` 范围内。
 ///
-/// **int 宽度对齐（部署目标 GOARCH=mips → int32）**：Go `parseReqNum` 末尾用
-/// `strconv.Atoi`，其返回平台 `int`。hAP QCA9533 是 32-bit，故 Go-MIPS 上 Atoi 对
-/// `> i32::MAX`（如 10 位 `3000000000`）**返错 → 帧被拒**。Rust 累加用 `i64` 不会自然
-/// 拒，故显式加 `> i32::MAX` 检查对齐 Go-MIPS（10 位 ≤ `i64` 不溢出，安全累加后再判范围）。
+/// **int 宽度约束（部署目标 MIPS → 32-bit int）**：超 `i32::MAX` 的 req 编号
+/// （如 10 位 `3000000000`）**须被拒 → 帧被拒**。累加用 `i64` 不会自然拒，
+/// 故显式加 `> i32::MAX` 检查（10 位 ≤ `i64` 不溢出，安全累加后再判范围）。
 fn parse_req_num(s: &[u8]) -> Result<i64, FrameError> {
     if s.is_empty() {
         return Err(FrameError::new("empty req number"));
@@ -331,7 +325,7 @@ fn parse_req_num(s: &[u8]) -> Result<i64, FrameError> {
         }
         n = n * 10 + (c - b'0') as i64;
     }
-    // 对齐 Go-MIPS strconv.Atoi(int=int32)：超 int32 范围拒（10 位可达 9_999_999_999 > i32::MAX）。
+    // 32-bit int 约束：超 int32 范围拒（10 位可达 9_999_999_999 > i32::MAX）。
     if n > i32::MAX as i64 {
         return Err(FrameError::new("req number out of platform int range"));
     }
@@ -341,9 +335,9 @@ fn parse_req_num(s: &[u8]) -> Result<i64, FrameError> {
 /// 严格校验响应：`req` 必须等于 `want_req`，且 body 必须等于该 req 的标准模板。
 ///
 /// 比 [`parse_response_frame`] 仅看 req 更严：
-///   - 711 必须 byte 0 = `0x00` + 标准 10 字节模板（[`RESP_711_BODY`]，v0.3.3 实测）
+///   - 711 必须 byte 0 = `0x00` + 标准 10 字节模板（[`RESP_711_BODY`]，实测）
 ///   - 519 必须全 10 字节 0 body（[`RESP_519_BODY`]）
-///   - 其它 req 编号未在 spec 规定 body 模板，仅 req 校验通过即 true
+///   - 其它 req 编号无规定 body 模板，仅 req 校验通过即 true
 ///
 /// 任一不匹配返 `false`。
 pub fn validate_response(resp: &[u8], want_req: i64) -> bool {
@@ -357,7 +351,7 @@ pub fn validate_response(resp: &[u8], want_req: i64) -> bool {
     match want_req {
         711 => body.len() == RESP_711_BODY.len() && body == RESP_711_BODY,
         519 => body.len() == RESP_519_BODY.len() && body == RESP_519_BODY,
-        // 其它 req 编号未在 spec 中规定 body 模板，仅 req 校验。
+        // 其它 req 编号无规定 body 模板，仅 req 校验。
         _ => true,
     }
 }
@@ -368,9 +362,9 @@ pub fn validate_response(resp: &[u8], want_req: i64) -> bool {
 mod tests {
     use super::*;
 
-    /// build_stop_frame golden：逐字节对齐 Go `video.BuildStopFrame(outdoorBCD, monitorBCD)`。
+    /// build_stop_frame golden：逐字节回归 committed golden 向量。
     ///
-    /// 期望字节由 Go `internal/video/preview.go` BuildStopFrame 布局推导（非猜测）：
+    /// 期望字节由 preview-stop 帧布局推导（非猜测）：
     ///   - 0-1   magic        07 b8
     ///   - 2-3   length       1e 00  (= 30 = body.len()，小端)
     ///   - 4-5   reserved     00 00
@@ -430,9 +424,7 @@ mod tests {
         );
     }
 
-    /// build_start_frame golden：逐字节对齐 Go `video.BuildStartFrame`（移植
-    /// Go `TestBuildStartFrame_ByteLevel`，实测 hex 来自 spec
-    /// messages/tcp18022-preview/req-704-start.md）。
+    /// build_start_frame golden：逐字节回归 committed golden 向量（实测 hex）。
     #[test]
     fn build_start_frame_golden() {
         let callee: [u8; 4] = [0x06, 0x02, 0x00, 0x00];
@@ -461,7 +453,7 @@ mod tests {
         assert_eq!(got[19], b'*', "分隔符须为 '*'（0x2a）");
     }
 
-    /// start vs stop 恰差 2 处断言（移植 Go `TestBuildStopFrame_ByteLevelDiffFromStart`）：
+    /// start vs stop 恰差 2 处断言：
     /// offset 12（req 数字 '4'↔'8'）+ offset 19（sep '*'↔'='）。
     #[test]
     fn start_stop_frames_differ_exactly_two_bytes() {

@@ -1,31 +1,30 @@
-//! PF_PACKET raw-socket FFI 缝（组 A 地基）。
+//! PF_PACKET raw-socket FFI 缝。
 //!
 //! 这是整个 Rust port **第一次破 0-crate gate**——`AF_PACKET` / `bind(sockaddr_ll)` /
 //! `setsockopt(SO_ATTACH_FILTER / PACKET_ADD_MEMBERSHIP)` / `recvfrom` 无 std 等价物，
-//! 必须直接调 `libc`。破口被严格框死（见 `lib.rs` 顶部边界注释 + design.md D-A）：
+//! 必须直接调 `libc`。破口被严格框死（见 `lib.rs` 顶部边界注释）：
 //!   ① `listen6672` PF_PACKET ② `listen18022` PF_PACKET ③ `wire_sender` 的 `SO_BINDTODEVICE`
 //! 本模块只承载 ①②（PF_PACKET 通用缝）+ htons + 平台无关 BPF 类型；SO_BINDTODEVICE
 //! 由 `wire_sender` 自持。
 //!
 //! **大端字节序**：目标硬件 hAP ac lite = QCA9533 MIPS24Kc **big-endian**，开发机
 //! （macOS-arm64）与常规 CI（Linux-x86）都小端。memory `dooraccess_pf_packet_byte_order.md`
-//! 记录 Go 版曾 ship `v<<8|v>>8` 的 htons bug，致 daemon 在 hAP 上**收 0 帧**、开发机全过
+//! 记录过 `v<<8|v>>8` 的 htons bug 会致 daemon 在 hAP 上**收 0 帧**、开发机全过
 //! （/proc/net/packet Proto=0300 vs 期望 0003）。本模块的 `htons` 用平台无关写法（见下），
 //! **禁止** `v<<8|v>>8`。
 //!
 //! **Linux-only**：PF_PACKET recv 缝用 `#[cfg(target_os = "linux")]` 守护，非 Linux 提供
-//! stub（对齐 Go `listener_other.go`），让 macOS 也能 `cargo build` / `cargo test`。
+//! stub，让 macOS 也能 `cargo build` / `cargo test`。
 
 // ---------------------------------------------------------------------------
-// htons — 平台无关 host→network byte order（task 2.3）
+// htons — 平台无关 host→network byte order
 // ---------------------------------------------------------------------------
 
 /// 把主机字节序 `u16` 转为网络字节序（big-endian）。
 ///
-/// 锚 Go `listener_linux.go htons`：`binary.BigEndian.Put` 写 BE buffer 再
-/// `binary.NativeEndian.Get` 读回。Rust 等价：
-///   - `to_be_bytes()` = `BigEndian.Put`（永远写出 BE 顺序的 2 字节）
-///   - `from_ne_bytes()` = `NativeEndian.Get`（按主机序读回）
+/// 写出 BE buffer 再按主机序读回：
+///   - `to_be_bytes()`：永远写出 BE 顺序的 2 字节
+///   - `from_ne_bytes()`：按主机序读回
 ///
 /// 语义验证：
 ///   - LE 主机（x86 / arm64 LE）：`0x0003u16.to_be_bytes()` = `[0x00, 0x03]`，
@@ -40,7 +39,7 @@ pub const fn htons(v: u16) -> u16 {
     u16::from_ne_bytes(v.to_be_bytes())
 }
 
-// BE 第二层防御（task 9.1，编译期断言分支）：本机 macOS（LE）不跑 qemu，但**任何**针对
+// BE 第二层防御（编译期断言分支）：本机 macOS（LE）不跑 qemu，但**任何**针对
 // 大端目标（hAP MIPS24Kc）的编译都会触发这两条 const 断言——`htons` 在 BE 上必须是 no-op
 // （host=network），否则就是 `v<<8|v>>8` 那类 swap bug 回归（hAP 收 0 帧）。const 求值是
 // 编译期，无需运行 BE 二进制即可在 `cargo build --target mips-unknown-linux-musl` 时认证。
@@ -63,22 +62,22 @@ const _: () = assert!(
 );
 
 // ---------------------------------------------------------------------------
-// BPF 类型重导出 + size 守门（task 2.2 / 6.1 依赖）
+// BPF 类型重导出 + size 守门
 // ---------------------------------------------------------------------------
 
 /// BPF 单条指令。字段 `code:u16, jt:u8, jf:u8, k:u32`。
 ///
-/// **Linux**：直接 alias 到 `libc::sock_filter`（T1 探针 2026-06-08 实测 libc 0.2.186
+/// **Linux**：直接 alias 到 `libc::sock_filter`（实测 libc 0.2.186
 /// mips 目标完整导出，无需手搓）。
 /// **非 Linux（macOS host）**：libc 不导出 `sock_filter`（它是 `linux/filter.h` 的 kernel
 /// uapi，仅 linux_like target 定义）。为让 `bpf.rs` 的 const 表与 golden 测试在 macOS 上
-/// 也能编译/运行，提供一个 `repr(C)` 字段等价 mirror（与 Go `x/sys/unix.SockFilter` 同布局）。
+/// 也能编译/运行，提供一个 `repr(C)` 字段等价 mirror（布局 `code:u16 jt:u8 jf:u8 k:u32`）。
 /// 此 mirror **不**用于真 socket（macOS 无 AF_PACKET，PF_PACKET 路径全 stub），仅承载 const
 /// 字节值供 golden 对照。
 #[cfg(target_os = "linux")]
 pub type SockFilter = libc::sock_filter;
 
-/// 非 Linux host 的 `sock_filter` 等价 mirror（布局对齐 Go `x/sys/unix.SockFilter`）。
+/// 非 Linux host 的 `sock_filter` 等价 mirror（布局 `code:u16 jt:u8 jf:u8 k:u32`）。
 #[cfg(not(target_os = "linux"))]
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,14 +100,14 @@ pub struct SockFprog {
     pub filter: *mut SockFilter,
 }
 
-// size 守门：防 libc 版本漂移把字段宽度改了（T1 实测 mips：sock_fprog=8 / sock_filter=8）。
+// size 守门：防 libc 版本漂移把字段宽度改了（实测 mips：sock_fprog=8 / sock_filter=8）。
 // 仅当未来 libc 版本回归致断言失败时，才钉版本或退回 repr(C) 手搓，**不引第二个 crate**。
 const _: () = assert!(
     core::mem::size_of::<SockFilter>() == 8,
     "sock_filter must be 8 bytes (code:u16 jt:u8 jf:u8 k:u32)"
 );
 // 注：sock_fprog 含一个裸指针，64-bit host 上 = 2+6(pad)+8 = 16；mips32 上 = 2+2(pad)+4 = 8。
-// 因此 size 断言按指针宽度分叉（与 D-A T1「sock_fprog=8(ptr 4)」一致）。
+// 因此 size 断言按指针宽度分叉（与实测「sock_fprog=8(ptr 4)」一致）。
 #[cfg(target_pointer_width = "32")]
 const _: () = assert!(
     core::mem::size_of::<SockFprog>() == 8,
@@ -121,22 +120,22 @@ const _: () = assert!(
 );
 
 // ---------------------------------------------------------------------------
-// int 宽度回归钉死（task 2.4）
+// int 宽度回归钉死
 // ---------------------------------------------------------------------------
 //
-// Phase1 对抗 review 抓出 Go `int=int32 on MIPS` vs Rust 分叉。Phase3 在三处重现同类
-// 风险：sockaddr_ll.sll_ifindex=c_int、timeval.tv_sec(mips32=32-bit)、BPF 字段宽度。
-// T1 探针实测 mips struct 真实宽度与 Go GOARCH=mips 一致——这里写 revert 回归断言钉死，
+// 三处 struct 字段宽度需钉死：
+// sockaddr_ll.sll_ifindex=c_int、timeval.tv_sec(mips32=32-bit)、BPF 字段宽度。
+// 这里写回归断言钉死实测 mips struct 宽度——
 // host 上跑 host 宽度断言，mips target 上 cfg 分叉断言 mips 宽度。
 
-// sll_ifindex 是 c_int（32-bit on all linux targets）。Go 用 int(ifi.Index) 赋值，
-// 但 wire struct 字段是 c_int；Rust 必须用 c_int 不能用 i64。
+// sll_ifindex 是 c_int（32-bit on all linux targets）；
+// 必须用 c_int 不能用 i64。
 const _: () = assert!(
     core::mem::size_of::<libc::c_int>() == 4,
     "c_int must be 32-bit (sll_ifindex)"
 );
 
-// timeval.tv_sec：mips32 是 32-bit（**非 time64**，T1 实测 timeval=8 / time_t=4）；
+// timeval.tv_sec：mips32 是 32-bit（**非 time64**，实测 timeval=8 / time_t=4）；
 // host（macOS-arm64 / Linux-x86_64）是 64-bit。两处都断言以钉死不分叉到意外宽度。
 // `libc::time_t` 是 deprecated 别名（libc 预告 musl 1.2.0 转 64-bit）；这两个 const-assert
 // 正是钉死 time_t 宽度的守卫，允许 deprecated。revisit on musl 1.2.5 升级。
@@ -153,9 +152,8 @@ const _: () = assert!(
     "time_t must be 64-bit on 64-bit linux"
 );
 
-// BPF 字段宽度：SockFilter.code=u16 / jt=u8 / jf=u8 / k=u32（与 Go RawInstruction
-// Op uint16 / Jt uint8 / Jf uint8 / K uint32 一一对应）。size 已由上面断言守，这里再钉
-// 字段宽度防 libc 把某字段改成 native int。
+// BPF 字段宽度：SockFilter.code=u16 / jt=u8 / jf=u8 / k=u32。
+// size 已由上面断言守，这里再钉字段宽度防 libc 把某字段改成 native int。
 //
 // Linux：用 `libc::sock_filter` 字面量构造——若 libc 改了字段类型，赋值会编译失败。
 // 非 Linux：用本模块 repr(C) mirror，同样的字面量校验字段类型。
@@ -173,7 +171,7 @@ const _: () = {
 };
 
 // ---------------------------------------------------------------------------
-// PF_PACKET 缝（task 2.1）—— Linux only
+// PF_PACKET 缝 —— Linux only
 // ---------------------------------------------------------------------------
 
 /// FFI / socket 层错误。携带 errno + 阶段标签，便于上层归类 / log。
@@ -249,7 +247,7 @@ mod linux {
         let mut sll: libc::sockaddr_ll = unsafe { core::mem::zeroed() };
         sll.sll_family = libc::AF_PACKET as libc::c_ushort;
         sll.sll_protocol = htons(libc::ETH_P_ALL as u16);
-        // sll_ifindex 是 c_int（32-bit）——锚 Go SockaddrLinklayer.Ifindex；见 int 宽度断言。
+        // sll_ifindex 是 c_int（32-bit）——见 int 宽度断言。
         sll.sll_ifindex = ifindex as libc::c_int;
         // SAFETY: sll 是已初始化的 sockaddr_ll；长度精确。
         let rc = unsafe {
@@ -268,7 +266,7 @@ mod linux {
     /// `setsockopt(SOL_PACKET, PACKET_ADD_MEMBERSHIP, packet_mreq{ifindex, PACKET_MR_PROMISC})`。
     pub fn set_promisc(fd: RawFd, ifindex: u32) -> Result<(), FfiError> {
         let mut mreq: libc::packet_mreq = unsafe { core::mem::zeroed() };
-        // mr_ifindex 是 c_int（32-bit）——锚 Go PacketMreq.Ifindex int32。
+        // mr_ifindex 是 c_int（32-bit）。
         mreq.mr_ifindex = ifindex as libc::c_int;
         mreq.mr_type = libc::PACKET_MR_PROMISC as libc::c_ushort;
         // SAFETY: mreq 已初始化；长度精确。
@@ -309,7 +307,7 @@ mod linux {
 
     /// `setsockopt(SOL_SOCKET, SO_RCVTIMEO, timeval{0, 500_000})`（500ms 周期 wakeup）。
     ///
-    /// 失败**不致命**（与 Go 一致——仅 log 后继续）：返回 errno 让调用方决定是否仅 log。
+    /// 失败**不致命**（仅 log 后继续）：返回 errno 让调用方决定是否仅 log。
     // `libc::time_t`/`suseconds_t` 是 deprecated 别名（libc 预告 musl 1.2.0 转 64-bit）；
     // 宽度由上方 const-assert 钉死，允许 deprecated。revisit on musl 1.2.5 升级。
     #[allow(deprecated)]
@@ -381,7 +379,7 @@ mod linux {
 pub use linux::*;
 
 // ---------------------------------------------------------------------------
-// 非 Linux stub（对齐 Go listener_other.go）—— 让 macOS 能编译 + 测纯软逻辑
+// 非 Linux stub —— 让 macOS 能编译 + 测纯软逻辑
 // ---------------------------------------------------------------------------
 
 #[cfg(not(target_os = "linux"))]
@@ -425,7 +423,7 @@ mod tests {
 
     #[test]
     fn htons_matches_platform_semantics() {
-        // 锚 Go htons：to_be_bytes + from_ne_bytes。
+        // htons = to_be_bytes + from_ne_bytes。
         let got = htons(0x0003);
         if cfg!(target_endian = "little") {
             assert_eq!(got, 0x0300, "LE host must swap (htons of 0x0003 = 0x0300)");
@@ -442,7 +440,7 @@ mod tests {
 
     #[test]
     fn sock_filter_field_widths() {
-        // task 2.4 回归：BPF 字段宽度不分叉。
+        // 回归：BPF 字段宽度不分叉。
         assert_eq!(core::mem::size_of::<SockFilter>(), 8);
         // 字段类型钉死：能用这些字面量构造即证字段类型正确。
         let f = SockFilter {

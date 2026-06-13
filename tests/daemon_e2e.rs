@@ -1,8 +1,7 @@
-//! Phase 4 骨架 mock-e2e 测试（`port-rust-daemon-skeleton` G4，tasks §10.1-10.11）。
+//! daemon 骨架 mock-e2e 测试（§10.1-10.11）。
 //!
-//! 行为锚 Go `cmd/dooraccess-go/main_test.go` /
-//! `main_automation_flags_test.go` / `main_automation_startup_push_test.go` /
-//! `internal/http8080/selfunlock_test.go`。
+//! 覆盖 daemon 编排：启动/停止、自动化 flag 三级优先级、startup push、号码查询分发、
+//! worker 串行排队、shutdown 不死锁、门铃 push、push 不阻塞 unlock、JoinHandle 回收。
 //!
 //! ## crate gate
 //!
@@ -97,7 +96,7 @@ fn never() -> Arc<AtomicBool> {
 }
 
 // ---------------------------------------------------------------------------
-// mock UnlockWire（复用 Phase 3 风格：固定 AttemptOutcome / 可控阻塞）
+// mock UnlockWire（固定 AttemptOutcome / 可控阻塞）
 // ---------------------------------------------------------------------------
 
 /// 固定返一个 `AttemptOutcome` 的 mock wire（记录被调次数）。
@@ -132,7 +131,7 @@ impl UnlockWire for FixedWire {
 }
 
 /// 可控阻塞 wire：第一次 `try_once` 卡在 `gate` Barrier 上（精确控制 worker 忙窗口），
-/// 之后返回 `outcome`。用于 10.7 排队 / 10.10 不阻塞（worker 忙时验排队/响应性）。
+/// 之后返回 `outcome`。用于排队 / 不阻塞（worker 忙时验排队/响应性）。
 struct GatedWire {
     gate: Arc<Barrier>,
     used: AtomicBool,
@@ -181,7 +180,7 @@ fn spawn_worker(
 }
 
 /// 经真 `orchestration::WorkerUnlockDispatch` 派发缝投一个 unlock job 并等 reply（与 HTTP
-/// `/unlock` handler 走的生产函数一致；§10.2/§10.7 unlock dispatch）。worker 已退/panic 时
+/// `/unlock` handler 走的生产函数一致）。worker 已退/panic 时
 /// dispatch 内部退化为 wire-failure outcome（不永等），故此处永返 `Ok`，由 caller 断言 result。
 fn dispatch_unlock(tx: &mpsc::Sender<Job>) -> UnlockOutcome {
     let dispatch = WorkerUnlockDispatch { job_tx: tx.clone() };
@@ -226,7 +225,7 @@ impl Pusher for SpyPusher {
 }
 
 // 手动 unlock 派发缝直接用 lib 的真 `orchestration::WorkerUnlockDispatch`（不再复刻）——
-// e2e 测 HTTP `/unlock` → worker → reply 回灌全链路走的是生产函数（G4 FIX 问题 B）。
+// e2e 测 HTTP `/unlock` → worker → reply 回灌全链路走的是生产函数。
 
 // ---------------------------------------------------------------------------
 // loopback HTTP e2e 脚手架（须沙箱外；bind 失败静默跳过）
@@ -257,7 +256,7 @@ fn start_http(
     Some((addr, srv, t))
 }
 
-/// 优雅停 loopback HTTP server（问题 A 修好后：直接调真 `shutdown()`，无需戳 throwaway
+/// 优雅停 loopback HTTP server（直接调真 `shutdown()`，无需戳 throwaway
 /// 连接）。serve 的 accept 循环用 nonblocking accept + 短 poll 周期释放 listener 锁，故
 /// `shutdown()` 的 take() 在一个 poll 周期内抢到锁取走 listener → serve 见 None+closing →
 /// 返 `ServerClosedError` 退出。无死锁、无悬挂线程。
@@ -336,7 +335,7 @@ fn build_control_handler(
 // ===========================================================================
 
 /// 起 control server（loopback）→ GET /info + GET /automation 正确 → graceful shutdown
-/// 排空（worker 哨兵退出 + http server shutdown）。锚 Go `main_test.go`。
+/// 排空（worker 哨兵退出 + http server shutdown）。
 #[test]
 fn t10_1_daemon_start_info_automation_graceful_shutdown() {
     let cfg = e2e_config();
@@ -528,7 +527,7 @@ fn t10_2_manual_unlock_worker_reply_paths() {
 // 10.3 automation flag 三级优先级 e2e（state>config>env）
 //
 // 调真生产 `orchestration::load_automation_flags`（state>config>env 三级优先级）——上移到
-// lib 后 e2e 测真接线而非复刻（G4 FIX 问题 B）。`resolve_flags` 仅是一层薄适配（路径
+// lib 后 e2e 测真接线而非复刻。`resolve_flags` 仅是一层薄适配（路径
 // String 化 + no-op logf），断言走的逻辑全在生产函数里。
 // ===========================================================================
 
@@ -599,9 +598,9 @@ fn t10_3_flag_priority_config_over_env() {
 // ===========================================================================
 // 10.4 Persister e2e（拨动→原子落盘→重启回读→失败不阻塞→同值 no-op）
 //
-// G4 角度：经 HTTP `/auto_unlock` 拨动 → AutomationState.store → Persister.persist 全链
+// 经 HTTP `/auto_unlock` 拨动 → AutomationState.store → Persister.persist 全链
 // 路落盘，再用启动加载语义（parse）回读一致。（write_atomic/dedup/failure 的单元级在
-// G1 golden_state.rs 已覆盖；此处验「endpoint→persist→reload」端到端 + 无半写。）
+// golden_state.rs 已覆盖；此处验「endpoint→persist→reload」端到端 + 无半写。）
 // ===========================================================================
 
 #[test]
@@ -776,7 +775,7 @@ fn worker_shutdown(tx: &mpsc::Sender<Job>, worker: thread::JoinHandle<()>) {
 // ===========================================================================
 
 /// banner 后 spawn detached push automation_state：两 flag 字符串 "true"/"false" 编码。
-/// 用 SpyPusher 直驱 spawn_push（不触真网络）。锚 Go `main_automation_startup_push_test.go`。
+/// 用 SpyPusher 直驱 spawn_push（不触真网络）。
 #[test]
 fn t10_5_startup_push_automation_state_string_encoded() {
     // 用真 HaPushClient（api 空 → push 内部 NotConfigured，不发网络）验 spawn_push 不 panic；
@@ -971,7 +970,7 @@ fn t10_7_second_unlock_queues_while_worker_busy_http_responsive() {
 
 /// shutdown 时正阻塞的手动 unlock handler 经 reply 回灌解除；哨兵后 worker 退出（即便
 /// 仍持 sender clone）；worker panic 时阻塞 handler 经 reply Sender drop 收 Disconnected
-/// 不永等（决策 8 worker-death）。
+/// 不永等（worker-death）。
 #[test]
 fn t10_8_shutdown_no_deadlock_and_worker_panic_unblocks() {
     // (a) 哨兵后 worker 退出（仍持 sender clone）。
@@ -1277,7 +1276,7 @@ fn t10_9_doorbell_push_on_req704() {
 }
 
 // ===========================================================================
-// 10.10 push 不阻塞 unlock e2e（决策 3 关键）
+// 10.10 push 不阻塞 unlock e2e
 //
 // mock HA 离线（push 挂 5s）同时排队一个 Job::Unlock → unlock MUST NOT 被 push
 // head-of-line 阻塞（push off-worker）。用注入的 blocking Pusher（挂 ~2s 代表「HA 离线
@@ -1304,7 +1303,7 @@ fn t10_10_push_does_not_block_unlock() {
         started: push_started.clone(),
     });
 
-    // 决策 3：push 走 detached 线程（off worker）。这里用 control.rs 的 maybe_push 经
+    // push 走 detached 线程（off worker）。这里用 control.rs 的 maybe_push 经
     // detached 包装等价——但更直接：在 unlock 之前先在 detached 线程触发慢 push，再在
     // worker 上跑 unlock，验 unlock 不被 push 挂起拖慢。
     let push_thread = {
@@ -1341,7 +1340,7 @@ fn t10_10_push_does_not_block_unlock() {
 }
 
 // ===========================================================================
-// 10.11 JoinHandle 回收 e2e（RC-F6）
+// 10.11 JoinHandle 回收 e2e
 //
 // 连续触发 N 次门铃 push（各完成）→ Vec<JoinHandle> 长度有界（≈并发数，非累计 N）→
 // retain(!is_finished()) 生效不泄漏。

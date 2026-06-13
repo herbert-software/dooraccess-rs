@@ -1,21 +1,18 @@
-//! rtp：RTP 头解析 + Annex-B NAL 提取 + receiver 主循环
-//! （移植 Go `internal/video/rtp.go` 的解析部分 + `BindUDP`/`RunWithConn`）。
+//! rtp：RTP 头解析 + Annex-B NAL 提取 + receiver 主循环。
 //!
-//! 等价纪律（spec「RTP receiver 与专有分片重组器等价」）：
-//!   - 校验集与 Go **完全一致——仅校验 V=2 / X=0 / CC=0**。P 位 Go 不校验，
-//!     P=1 包被接受且 padding 字节留在 payload（已知宽松行为，禁「顺手」加 P 校验
-//!     造成接受集分叉）；PT 仅解析存字段，**不过滤**。
-//!   - 多字节字段 NBO 显式 `from_be_bytes`（新 BE 面，golden + 单测锚定）。
+//! 解析纪律：
+//!   - 校验集**仅校验 V=2 / X=0 / CC=0**。P 位不校验，P=1 包被接受且 padding
+//!     字节留在 payload（已知宽松行为，禁「顺手」加 P 校验造成接受集分叉）；
+//!     PT 仅解析存字段，**不过滤**。
+//!   - 多字节字段 NBO 显式 `from_be_bytes`（BE 面，golden + 单测锚定）。
 //!
 //! receiver 主循环（[`RtpReceiver::run_with_conn`]）：
 //!   - bind 经 [`bind_udp`] **独立同步**暴露——session 层必须先 bind 再发 preview
 //!     信令（否则外机推流到未就绪端口）
-//!   - 1s socket read-timeout 轮询 stop flag（对齐 Go 1s deadline 循环）
+//!   - 1s socket read-timeout 轮询 stop flag
 //!   - `expect_src_ip` 过滤非外机来源；SSRC **仅首包**锁存经 sink 回调
-//!   - Go 的 stats ticker / conn-watch 两个辅助 goroutine 在 Rust **内联**进
-//!     recv 循环（design D2 登记的有意简化）；周期行 10s 仅值变化时打印；
-//!     final 行 Rust 退出**必打**（Go 仅取消路径 racy best-effort——spec 登记
-//!     为确定性超集的有意差异）
+//!   - stats ticker / conn-watch 在 Rust **内联**进 recv 循环（有意简化）；
+//!     周期行 10s 仅值变化时打印；final 行退出**必打**（含错误退出——确定性超集）
 
 /// RTP 固定头长度（RFC 3550，无 CSRC/extension）。
 pub const RTP_HEADER_LEN: usize = 12;
@@ -29,16 +26,16 @@ pub const NAL_TYPE_SPS: u8 = 7;
 /// PPS。
 pub const NAL_TYPE_PPS: u8 = 8;
 
-/// RTP 头解析结果（最小字段集，外机不发 CSRC/extension；锚 Go `rtpPacket`）。
+/// RTP 头解析结果（最小字段集，外机不发 CSRC/extension）。
 ///
-/// `payload` 持有所有权拷贝：Go receiver 在 `reasm.Push` 前显式深拷 payload
-/// （read loop 复用缓冲会被下一次 ReadFromUDP 覆盖）；Rust 把这次必然的
-/// per-packet 拷贝收进 [`parse_rtp`]，重组器与测试可安全持有。
+/// `payload` 持有所有权拷贝：read loop 复用接收缓冲会被下一次 recv 覆盖，必须在
+/// 投递重组器前深拷 payload；这次必然的 per-packet 拷贝收进 [`parse_rtp`]，
+/// 重组器与测试可安全持有。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RtpPacket {
     /// marker bit（frame 边界唯一可信信号）。
     pub marker: bool,
-    /// payload type（仅解析存字段，不过滤——Go 等价）。
+    /// payload type（仅解析存字段，不过滤）。
     pub pt: u8,
     /// 16-bit 序列号（回绕比较见 reassembler）。
     pub seq: u16,
@@ -46,11 +43,11 @@ pub struct RtpPacket {
     pub timestamp: u32,
     /// 同步源标识。
     pub ssrc: u32,
-    /// RTP payload（头后全部字节；P=1 时含 padding，等价 Go）。
+    /// RTP payload（头后全部字节；P=1 时含 padding）。
     pub payload: Vec<u8>,
 }
 
-/// RTP 解析错误（语义等价 Go `parseRTP` 的 error 上下文，message 非 parity 面）。
+/// RTP 解析错误（携带人类可读失败原因，message 内容非字节契约面）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RtpError {
     /// 人类可读失败原因。
@@ -65,9 +62,9 @@ impl core::fmt::Display for RtpError {
 
 impl std::error::Error for RtpError {}
 
-/// 解析最小 RTP 包（V=2 X=0 CC=0；外机实测）。锚 Go `parseRTP`。
+/// 解析最小 RTP 包（V=2 X=0 CC=0；外机实测）。
 ///
-/// 校验顺序与 Go 一致：长度 → version → CC → X。P 位不检（P=1 接受），
+/// 校验顺序：长度 → version → CC → X。P 位不检（P=1 接受），
 /// PT 仅解析。多字节字段 `from_be_bytes`。
 pub fn parse_rtp(b: &[u8]) -> Result<RtpPacket, RtpError> {
     if b.len() < RTP_HEADER_LEN {
@@ -104,9 +101,8 @@ pub fn parse_rtp(b: &[u8]) -> Result<RtpPacket, RtpError> {
 }
 
 /// H.264 NAL 单元（含 1-byte header + RBSP payload；不含 Annex-B start code）。
-/// 锚 Go `nalUnit`。
 ///
-/// `data` 持有所有权：切 frame 时 NAL 字节脱离重组 buffer（Go 深拷的等价物），
+/// `data` 持有所有权：切 frame 时 NAL 字节脱离重组 buffer（深拷），
 /// 下一 frame 复写 buffer 不会污染已交付的 NAL。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NalUnit {
@@ -119,14 +115,14 @@ pub struct NalUnit {
 }
 
 /// 4 字节 Annex-B start code `00 00 00 01`（实测外机用 4 字节版本，
-/// observations §3 + spec format.md）。
+/// observations §3）。
 const START_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
 
 fn find_start_code(hay: &[u8]) -> Option<usize> {
     hay.windows(START_CODE.len()).position(|w| w == START_CODE)
 }
 
-/// 从字节流中拆出 Annex-B start-code 分隔的 NAL 单元。锚 Go `extractNALsAnnexB`。
+/// 从字节流中拆出 Annex-B start-code 分隔的 NAL 单元。
 ///
 /// 返回的 `NalUnit.data` 不含 start code，从 NAL header byte 开始（所有权拷贝）。
 /// 无 start code = 续传 fragment，整段作为单个 NAL 返回（后续 transmux 不切，原样写出）；
@@ -182,7 +178,7 @@ pub fn extract_nals_annexb(payload: &[u8], ts: u32) -> Vec<NalUnit> {
 }
 
 // ---------------------------------------------------------------------------
-// receiver 主循环（锚 Go BindUDP / RTPReceiver.RunWithConn）
+// receiver 主循环（bind_udp + RtpReceiver::run_with_conn）
 // ---------------------------------------------------------------------------
 
 use super::frame_buffer::FrameBuffer;
@@ -193,14 +189,14 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// read loop 的 socket read-timeout（轮询 stop flag 用；锚 Go 1s SetReadDeadline）。
+/// read loop 的 socket read-timeout（1s 轮询 stop flag 用）。
 const RECV_POLL_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// 单包接收缓冲（锚 Go `buf := make([]byte, 2048)`；外机包 ≤ MTU）。
+/// 单包接收缓冲（2048B；外机包 ≤ MTU）。
 const RECV_BUF_LEN: usize = 2048;
 
-/// stats 周期行间隔（ms，生产 10s）。test-tunable（D8：`AtomicU32` 毫秒，
-/// MIPS32 禁 64-bit 原子）——CI 禁真实 10s 等待。
+/// stats 周期行间隔（ms，生产 10s）。test-tunable（`AtomicU32` 毫秒，
+/// MIPS32 禁 64-bit 原子）——测试禁真实 10s 等待。
 static STATS_INTERVAL_MS: AtomicU32 = AtomicU32::new(10_000);
 
 fn stats_interval() -> Duration {
@@ -214,10 +210,10 @@ pub fn set_stats_interval_ms_for_test(ms: u64) -> u64 {
 }
 
 /// 同步绑定 UDP 监听 socket（addr 如 ":9880" 形式须带 host，例 "0.0.0.0:9880"），
-/// 失败立刻返错。锚 Go `BindUDP`。
+/// 失败立刻返错。
 ///
-/// 与 run 拆分的原因（抄 Go 注释语义）：Manager.Start 必须先确认 UDP socket 已绑定
-/// 才告知外机推流——否则外机以为流可达而 daemon 永远收不到包。
+/// 与 run 拆分的原因：Manager.Start 必须先确认 UDP socket 已绑定才告知外机推流
+/// ——否则外机以为流可达而 daemon 永远收不到包。
 /// 调用方拿到 socket 后传给 [`RtpReceiver::run_with_conn`] 接管 read loop。
 pub fn bind_udp(addr: &str) -> std::io::Result<UdpSocket> {
     UdpSocket::bind(addr)
@@ -226,11 +222,10 @@ pub fn bind_udp(addr: &str) -> std::io::Result<UdpSocket> {
 /// SSRC sink 回调形态（session 层注入：写 `AtomicU32` streamSSRC）。
 pub type SsrcSink = Box<dyn Fn(u32) + Send + Sync>;
 
-/// 测试 hook 形态（每个合法 RTP 包调一次；锚 Go `PacketHook`）。
+/// 测试 hook 形态（每个合法 RTP 包调一次）。
 pub type PacketHook = Box<dyn Fn(&RtpPacket) + Send + Sync>;
 
 /// UDP 9880 RTP receiver：解析 RTP + 重组 frame + 推 NAL 进 [`FrameBuffer`]。
-/// 锚 Go `RTPReceiver`。
 ///
 /// `logf` 用 [`SharedLogFn`]（Arc 形态）：重组器需独立持有 log hook
 /// （drop 即时行从重组器内部打），receiver 自身行与之共享同一 sink。
@@ -240,9 +235,9 @@ pub struct RtpReceiver {
     /// NAL 写入目标。
     pub buf: Arc<FrameBuffer>,
     /// 解析到外机 SSRC 时回调（**仅首包**锁存；RTCP RR report block 字段用——
-    /// 外机中途重启换 SSRC 不更新，Go 已知行为保持）。
+    /// 外机中途重启换 SSRC 不更新，已知行为保持）。
     pub ssrc_sink: Option<SsrcSink>,
-    /// 测试 hook：每收到一个合法 RTP 包调一次（锚 Go `PacketHook`）。
+    /// 测试 hook：每收到一个合法 RTP 包调一次。
     pub packet_hook: Option<PacketHook>,
 }
 
@@ -254,13 +249,13 @@ impl RtpReceiver {
     }
 
     /// 接管已绑定的 socket 跑 read loop，直到 `stop` 置位（返 `Ok`）或致命
-    /// recv 错误（返 `Err`）。锚 Go `RunWithConn`（ctx → `AtomicBool` stop flag）。
+    /// recv 错误（返 `Err`）。
     ///
-    /// socket 所有权移入，退出时随 drop 关闭（Go `defer conn.Close()` 等价）。
+    /// socket 所有权移入，退出时随 drop 关闭。
     /// `expect_src_ip` 非空时仅处理来自该源 IP 的包（防御邻居外机/广播误入）。
     ///
     /// stats ticker 内联：周期行（10s，仅值变化时打）+ 退出必打 final 行
-    /// （含错误退出——spec 登记的确定性超集）。
+    /// （含错误退出——确定性超集）。
     pub fn run_with_conn(
         &self,
         conn: UdpSocket,
@@ -284,7 +279,7 @@ impl RtpReceiver {
         });
         let mut reasm = FrameReassembler::new(reasm_logf);
 
-        // stats ticker 内联（design D2 有意简化）：仅值变化时打周期行。
+        // stats ticker 内联（有意简化）：仅值变化时打周期行。
         let interval = stats_interval();
         let mut last_stats = ReassemblerStats::default();
         let mut next_stats = Instant::now() + interval;
@@ -334,7 +329,7 @@ impl RtpReceiver {
                     continue;
                 }
             };
-            // SSRC 仅首包锁存（锚 Go `if !ssrcSeen && r.SSRCSink != nil`）。
+            // SSRC 仅首包锁存。
             if !ssrc_seen {
                 if let Some(sink) = &self.ssrc_sink {
                     sink(pkt.ssrc);
@@ -345,7 +340,7 @@ impl RtpReceiver {
                 hook(&pkt);
             }
             // payload 所有权已在 parse_rtp 深拷（read loop 复用 buf 不会踩烂
-            // 重组器持有的 frame 字节流——Go 显式 pktCopy 深拷的等价物）。
+            // 重组器持有的 frame 字节流）。
             let (nals, _) = reasm.push(pkt);
             for nal in nals {
                 self.buf.push(nal);
@@ -354,7 +349,7 @@ impl RtpReceiver {
     }
 }
 
-// ── 单测（移植 Go rtp_test.go 等价用例 + P=1 接受边界）─────────────────────────
+// ── 单测（RTP 解析 + NAL 提取用例 + P=1 接受边界）──────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -368,8 +363,7 @@ mod tests {
             .collect()
     }
 
-    /// 移植 Go `TestParseRTP_FirstPacketSample`：实测首包头
-    /// （observations §3 / spec format.md）。
+    /// 实测首包头解析（observations §3 / spec format.md）。
     #[test]
     fn parse_rtp_first_packet_sample() {
         let hdr = hex("8062c55682f6d2103e4ab183"); // 12B fixed header
@@ -386,7 +380,7 @@ mod tests {
         assert_eq!(got.payload, payload, "payload");
     }
 
-    /// 移植 Go `TestParseRTP_RejectsWrongVersion`。
+    /// V≠2 拒收。
     #[test]
     fn parse_rtp_rejects_wrong_version() {
         let mut bad = vec![0u8; 12];
@@ -394,7 +388,7 @@ mod tests {
         assert!(parse_rtp(&bad).is_err(), "V=1 must be rejected");
     }
 
-    /// 移植 Go `TestParseRTP_RejectsCSRCList`。
+    /// CC>0 拒收。
     #[test]
     fn parse_rtp_rejects_csrc_list() {
         let mut bad = vec![0u8; 12];
@@ -402,7 +396,7 @@ mod tests {
         assert!(parse_rtp(&bad).is_err(), "CC>0 must be rejected");
     }
 
-    /// X=1 拒收（Go parseRTP extension 分支）。
+    /// X=1 拒收（extension header 不支持）。
     #[test]
     fn parse_rtp_rejects_extension() {
         let mut bad = vec![0u8; 12];
@@ -410,13 +404,13 @@ mod tests {
         assert!(parse_rtp(&bad).is_err(), "X=1 must be rejected");
     }
 
-    /// 移植 Go `TestParseRTP_RejectsTooShort`。
+    /// 短于固定头长度拒收。
     #[test]
     fn parse_rtp_rejects_too_short() {
         assert!(parse_rtp(&[0x80, 0x62]).is_err(), "short packet accepted");
     }
 
-    /// P=1 接受集等价（spec 场景「P=1 包接受集等价」）：Go 不校验 P 位，
+    /// P=1 接受集：不校验 P 位，
     /// P=1 包被接受且 padding 字节留在 payload。
     #[test]
     fn parse_rtp_accepts_padding_bit() {
@@ -432,7 +426,7 @@ mod tests {
         assert_eq!(got.payload[3], 0x03);
     }
 
-    /// 移植 Go `TestExtractNALsAnnexB_FirstPacket`：SPS+PPS+IDR 拼包。
+    /// SPS+PPS+IDR 拼包拆分。
     #[test]
     fn extract_nals_annexb_first_packet() {
         let payload = hex(&format!(
@@ -456,7 +450,7 @@ mod tests {
         assert_eq!(nals[2].data, hex("6533cc"));
     }
 
-    /// 移植 Go `TestExtractNALsAnnexB_NoStartCodeIsFragment`：无 start code = 续传分片。
+    /// 无 start code = 续传分片。
     #[test]
     fn extract_nals_annexb_no_start_code_is_fragment() {
         let payload = hex("6133aabbcc"); // type=1 P-frame fragment 续传
@@ -466,7 +460,7 @@ mod tests {
         assert_eq!(nals[0].data, payload);
     }
 
-    /// 首个 start code 之前有数据 → 视作前续分片（Go idx>0 分支）。
+    /// 首个 start code 之前有数据 → 视作前续分片。
     #[test]
     fn extract_nals_annexb_leading_fragment_before_start_code() {
         let payload = hex(&format!("{}{}{}", "61aabb", "00000001", "6533cc"));
@@ -480,7 +474,7 @@ mod tests {
         assert_eq!(nals[1].nal_type, NAL_TYPE_IDR);
     }
 
-    /// 空 payload / 空 NAL 段不产出（Go len 守卫）。
+    /// 空 payload / 空 NAL 段不产出（长度守卫）。
     #[test]
     fn extract_nals_annexb_empty_and_adjacent_start_codes() {
         assert!(extract_nals_annexb(&[], 0).is_empty(), "empty payload");
@@ -492,7 +486,7 @@ mod tests {
     }
 }
 
-// ── receiver 主循环单测（真 UDP socket pair；移植 Go RTPReceiver 用例）──────────
+// ── receiver 主循环单测（真 UDP socket pair）──────────────────────────────────
 
 #[cfg(test)]
 mod receiver_tests {
@@ -501,7 +495,7 @@ mod receiver_tests {
     use std::sync::Mutex;
     use std::thread;
 
-    /// 构 RTP wire 包：12B 头 + payload（锚 Go mkRTP）。
+    /// 构 RTP wire 包：12B 头 + payload。
     fn mk_rtp(seq: u16, ts: u32, ssrc: u32, marker: bool, payload: &[u8]) -> Vec<u8> {
         let mut pkt = vec![0u8; 12 + payload.len()];
         pkt[0] = 0x80; // V=2 P=0 X=0 CC=0
@@ -546,8 +540,7 @@ mod receiver_tests {
         (target, fbuf, stop, join, lines)
     }
 
-    /// 移植 Go `TestRTPReceiver_NALsNotCorruptedByBufferReuse`（receiver 层
-    /// buffer-reuse 安全；reassembler 层版本在 reassembler.rs 五件套之五）。
+    /// receiver 层 buffer-reuse 安全（reassembler 层版本在 reassembler.rs）。
     #[test]
     fn nals_not_corrupted_by_buffer_reuse() {
         const NAL_LEN: usize = 200;
@@ -607,7 +600,7 @@ mod receiver_tests {
         join.join().unwrap().expect("receiver exit");
     }
 
-    /// SSRC 仅首包锁存（spec：外机中途换 SSRC 不更新，已知行为保持）。
+    /// SSRC 仅首包锁存（外机中途换 SSRC 不更新，已知行为保持）。
     #[test]
     fn ssrc_sink_latches_first_packet_only() {
         let seen: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));

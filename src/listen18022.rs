@@ -1,17 +1,16 @@
-//! `listen18022`：门禁网 TCP 18022 wire 帧监听 + Subscribe 订阅（组 D）。
+//! `listen18022`：门禁网 TCP 18022 wire 帧监听 + Subscribe 订阅。
 //!
-//! 移植 Go `internal/listen18022`（`parser.go` / `dedup.go` / `listener.go` /
-//! `listener_linux.go` / `listener_other.go`）：
+//! 组成：
 //!   - `parse_frame`（req + body 抽取，复用 `crate::wire18022::parse_response_frame`
 //!     兼容 `&query=` / `&query*` 双 sep）
 //!   - `extract_tcp_payload`（L2→ethertype 0x0800→IP(ihl/proto=6)→TCP(dataOff)→
 //!     payload + src/dst IP + src/dst port，全 `from_be_bytes` 读 wire BE）
 //!   - dedup ringbuffer（key=src_ip^src_port<<32^FNV-1a(payload[..64])，64 容量 /
-//!     200ms 窗口，**时钟注入 seam**，与组 C listen6672 同风格）
+//!     200ms 窗口，**时钟注入 seam**，与 listen6672 同风格）
 //!   - **`trait Subscribable`** + `Subscription{ch, cancel}`：`subscribe(filter)`
 //!     注册、buffered 8、filter panic 用 `catch_unwind` 隔离、chan 满 `try_send`
 //!     失败即 silent drop、cancel 移除订阅 + 多次 cancel no-op（unlock bye 早停的
-//!     依赖缝 — 组 F 注入 mock 实现 `trait Subscribable`，`Listener==nil` 等价于
+//!     依赖缝 — unlock 核心注入 mock 实现 `trait Subscribable`；持
 //!     `Option<&dyn Subscribable>` 为 `None` 时不订阅）。
 //!   - `dispatch_for_test` 等价 hook（绕 PF_PACKET 直驱 dispatch + Subscribe 投递，
 //!     跨模块测试用）。
@@ -26,18 +25,18 @@ use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 
 // ===========================================================================
-// parser（锚 Go parser.go ParseFrame + listener_linux.go extractTCPPayload）
+// parser（parse_frame + extract_tcp_payload）
 // ===========================================================================
 
-/// 解析后的 18022 wire 帧结果（锚 Go `DetectedFrame`）。
+/// 解析后的 18022 wire 帧结果。
 ///
-/// 字段对齐 Go：`Req` / `Body` / `SrcIP` / `DstIP` / `SrcPort` / `DstPort`。
+/// 字段：`req` / `body` / `src_ip` / `dst_ip` / `src_port` / `dst_port`。
 /// IP 用 `[u8; 4]`（IPv4-only，与 BPF 过滤一致；mock/测试构造方便）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetectedFrame {
     /// anjubao 协议 req= 编号（如 704 / 705 / 708 / 518 / 710 / 711）。
     ///
-    /// 注：复用 `wire18022::parse_response_frame` 返 `i64`，逐字保留宽度（Go 是 int）。
+    /// 注：复用 `wire18022::parse_response_frame` 返 `i64`。
     pub req: i64,
     /// wire 帧 `&query=` / `&query*` 之后的二进制 body（不含 magic/length/req= 前缀）。
     pub body: Vec<u8>,
@@ -51,16 +50,16 @@ pub struct DetectedFrame {
     pub dst_port: u16,
 }
 
-/// 把 wire payload 解析为 `(req, body)`（锚 Go `ParseFrame`）。
+/// 把 wire payload 解析为 `(req, body)`。
 ///
 /// 直接委托 `crate::wire18022::parse_response_frame`，兼容 `&query=` / `&query*`
-/// 双分隔符（v0.3.3 fix-doorbell-pipeline 经验沉淀）。错误时返 `None`（上游
-/// dispatch 把非合法 anjubao wire 当 TCP 控制帧残留 silent drop）。
+/// 双分隔符。错误时返 `None`（上游 dispatch 把非合法 anjubao wire 当 TCP 控制帧残留
+/// silent drop）。
 pub fn parse_frame(payload: &[u8]) -> Option<(i64, Vec<u8>)> {
     crate::wire18022::parse_response_frame(payload).ok()
 }
 
-/// 从 L2 frame 中抽 TCP payload + src/dst IP + src/dst port（锚 Go `extractTCPPayload`）。
+/// 从 L2 frame 中抽 TCP payload + src/dst IP + src/dst port。
 ///
 /// BPF 已过滤为 IPv4/TCP/port=18022。untagged-only（slave 接口 frame 已被 kernel
 /// 剥 802.1Q tag）。全用 `from_be_bytes` 读 wire 多字节字段（wire 永远 big-endian）。
@@ -69,7 +68,7 @@ pub fn parse_frame(payload: &[u8]) -> Option<(i64, Vec<u8>)> {
 ///
 /// 返回 `Some((payload, src_ip, dst_ip, src_port, dst_port))`；任何长度/类型不符返
 /// `None`。无 payload（纯 SYN/ACK/FIN）返 `Some` + 空 payload，调用方 `parse_frame`
-/// 失败再 drop（双层防御，对齐 Go ok=true + 空 payload 语义）。
+/// 失败再 drop（双层防御：返 `Some` + 空 payload 语义）。
 #[allow(clippy::type_complexity)]
 pub fn extract_tcp_payload(frame: &[u8]) -> Option<(Vec<u8>, [u8; 4], [u8; 4], u16, u16)> {
     const ETH_HDR_LEN: usize = 14;
@@ -111,12 +110,12 @@ pub fn extract_tcp_payload(frame: &[u8]) -> Option<(Vec<u8>, [u8; 4], [u8; 4], u
 }
 
 // ===========================================================================
-// 诊断纯函数：InferDirection + FormatLog（锚 Go parser.go）
+// 诊断纯函数：infer_direction + format_log
 // ===========================================================================
 
-/// wire 帧的协议层方向（锚 Go `Direction`）。
+/// wire 帧的协议层方向。
 ///
-/// 判别值与 Go `iota` 顺序一致（`Unknown=0` 起），便于跨语言对照。
+/// 判别值从 `Unknown=0` 起按顺序排列。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
     /// 未能匹配任何已知设备对。
@@ -136,7 +135,7 @@ pub enum Direction {
 }
 
 impl Direction {
-    /// 方向字符串（log 用），逐字对齐 Go `Direction.String`。
+    /// 方向字符串（log 用）。
     pub fn as_str(&self) -> &'static str {
         match self {
             Direction::OutdoorToIndoor => "outdoor→indoor",
@@ -156,15 +155,15 @@ impl core::fmt::Display for Direction {
     }
 }
 
-/// 根据 src/dst IP + 已知设备 IP 列表推断方向（锚 Go `InferDirection`）。
+/// 根据 src/dst IP + 已知设备 IP 列表推断方向。
 ///
 /// 已知 IP（任一为 `None` 则该方向不参与匹配，返 `Unknown`）：
 ///   - `daemon_ip`: hAP daemon 自身 IP（如 .202）
 ///   - `indoor_ip`: 真实室内机 IP（如 .91）
 ///   - `outdoor_ips`: 外机 IP 列表（如 .151~.157）
 ///
-/// IPv4-only：用 `[u8; 4]` 等值比较替代 Go `net.IP.To4().Equal`（Phase 3 listener
-/// 已把帧 IP 收敛为 `[u8; 4]`，无 v4-in-v6 歧义）。
+/// IPv4-only：用 `[u8; 4]` 等值比较（listener 已把帧 IP
+/// 收敛为 `[u8; 4]`，无 v4-in-v6 歧义）。
 pub fn infer_direction(
     src_ip: [u8; 4],
     dst_ip: [u8; 4],
@@ -196,12 +195,12 @@ pub fn infer_direction(
     }
 }
 
-/// 把 IPv4 字节渲染成点分十进制（等价 Go `net.IP.String()` 对 IPv4 的输出）。
+/// 把 IPv4 字节渲染成点分十进制。
 fn fmt_ip(ip: [u8; 4]) -> String {
     format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
 }
 
-/// 已知 req= 编号的协议语义注释（锚 Go `reqNote`）。无注释返 `""`。
+/// 已知 req= 编号的协议语义注释。无注释返 `""`。
 fn req_note(req: i64) -> &'static str {
     match req {
         704 => "invite-query",
@@ -216,7 +215,7 @@ fn req_note(req: i64) -> &'static str {
     }
 }
 
-/// 生成探针 syslog log 行（锚 Go `FormatLog`，逐字节对齐输出格式）。
+/// 生成探针 syslog log 行。
 ///
 /// 格式：
 ///
@@ -259,7 +258,7 @@ pub fn format_log(
 }
 
 // ===========================================================================
-// dedup ringbuffer（锚 Go dedup.go，时钟注入 seam — 与 listen6672 同风格）
+// dedup ringbuffer（时钟注入 seam — 与 listen6672 同风格）
 // ===========================================================================
 
 /// ringbuffer 固定容量（与 listen6672 一致：broadcast/forward 重复 frame 跨 slave
@@ -270,13 +269,13 @@ pub const DEDUP_CAPACITY: usize = 64;
 pub const DEDUP_WINDOW_MS: u64 = 200;
 
 /// dedup_key 哈希时 payload 截断上限（防 malformed 帧污染 ringbuffer；18022 wire
-/// frame 通常 ≤ 36 byte，截 64 与 Go `maxHashBytes` 一致）。
+/// frame 通常 ≤ 36 byte，截 64 即够）。
 const MAX_HASH_BYTES: usize = 64;
 
 /// 可注入时钟 seam：返回单调毫秒时刻。
 ///
 /// 生产用 `MonotonicClock`（包 `std::time::Instant`）；测试用固定时刻 fake clock
-/// 让时间相关 ringbuffer 行为确定（锚 Go `monotonicNow` 可注入封装）。
+/// 让时间相关 ringbuffer 行为确定（单调时刻可注入封装）。
 pub trait Clock: Send + Sync {
     /// 返回单调毫秒时刻（任意起点，仅差值有意义）。
     fn now_ms(&self) -> u64;
@@ -315,7 +314,7 @@ struct DedupEntry {
     set: bool,
 }
 
-/// 固定容量 ringbuffer，用于多 slave 模式去重相同 frame（锚 Go `Dedup`）。
+/// 固定容量 ringbuffer，用于多 slave 模式去重相同 frame。
 ///
 /// 线程安全：内部 `Mutex`。`seen` 是唯一写入路径。
 pub struct Dedup {
@@ -345,8 +344,7 @@ impl Dedup {
     /// 检查 `key` 是否在 `DEDUP_WINDOW_MS` 内被见过。返回 true 表示重复，调用方应 drop。
     ///
     /// 命中后**不**更新 ts；未命中则把 (key, now) 写入 head 位置（环形覆盖最旧 entry）。
-    /// 边界含 cutoff 时刻自身（now-ts == window 算窗口内重复）——锚 Go
-    /// `!ts.Before(cutoff)`。
+    /// 边界含 cutoff 时刻自身（now-ts == window 算窗口内重复，即 `ts >= cutoff`）。
     pub fn seen(&self, key: u64, now_ms: u64) -> bool {
         let mut inner = self.inner.lock().unwrap();
         let cutoff = now_ms.saturating_sub(DEDUP_WINDOW_MS);
@@ -375,7 +373,7 @@ impl Default for Dedup {
     }
 }
 
-/// 算 frame 的 dedup 哈希（锚 Go `dedupKey`）。
+/// 算 frame 的 dedup 哈希。
 ///
 /// key = src_ip(4B BE) ^ (src_port(2B) << 32) ^ FNV-1a(payload[0:min(len, 64)])。
 pub fn dedup_key(src_ip: [u8; 4], src_port: u16, payload: &[u8]) -> u64 {
@@ -385,7 +383,7 @@ pub fn dedup_key(src_ip: [u8; 4], src_port: u16, payload: &[u8]) -> u64 {
     hash ^ ip_bits ^ ((src_port as u64) << 32)
 }
 
-/// FNV-1a 64-bit（锚 Go `hash/fnv.New64a`）。
+/// FNV-1a 64-bit。
 fn fnv1a_64(data: &[u8]) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -398,7 +396,7 @@ fn fnv1a_64(data: &[u8]) -> u64 {
 }
 
 // ===========================================================================
-// Subscribe 订阅模型（锚 Go listener.go Subscribe/dispatchToSubs/dispatchOne）
+// Subscribe 订阅模型
 // ===========================================================================
 
 /// 单订阅者的 filter 类型：在 dispatch 路径上同步调用判断是否投递。
@@ -407,17 +405,17 @@ fn fnv1a_64(data: &[u8]) -> u64 {
 /// 不影响其它订阅者或 listener 主循环。
 pub type SubFilter = Box<dyn Fn(&DetectedFrame) -> bool + Send + Sync>;
 
-/// `subscribe()` 返回给调用方的句柄（锚 Go `Subscription{Ch, Cancel}`）。
+/// `subscribe()` 返回给调用方的句柄（持 `ch` + `cancel`）。
 ///
 /// `ch` 在 filter 通过的 frame 到达时收到投递（buffered 8 防止 dispatch 短暂卡住
 /// listener 主循环）。`cancel()` 释放订阅；cancel 后再投递被 silent drop，再次
 /// cancel 是 no-op。
 ///
 /// 调用方仍可在 bye-watch / 消费者退出时显式 `cancel()`（清晰表意）；此外 `Subscription`
-/// 实现 **`Drop`-on-drop 自动 cancel** 作安全网（design.md「可选 Drop guard」分支）：
-/// 当 `Subscription` 被 drop 而**未**显式 cancel 时（如 `spawn_consumer` 把 sub move 进
-/// 失败的线程闭包、闭包随即 drop），Drop 兜底 cancel，避免 listener 残留 orphan SubEntry
-/// 持续跑 filter/try_send。cancel 幂等（id 找不到即 no-op），故显式 + Drop 双触发安全。
+/// 实现 **`Drop`-on-drop 自动 cancel** 作安全网：当 `Subscription` 被 drop 而**未**显式
+/// cancel 时（如 `spawn_consumer` 把 sub move 进失败的线程闭包、闭包随即 drop），Drop
+/// 兜底 cancel，避免 listener 残留 orphan SubEntry 持续跑 filter/try_send。cancel 幂等
+/// （id 找不到即 no-op），故显式 + Drop 双触发安全。
 pub struct Subscription {
     /// filter 通过的 frame 投递目的 channel（buffered 8）。
     pub ch: Receiver<DetectedFrame>,
@@ -440,20 +438,19 @@ impl Drop for Subscription {
     }
 }
 
-/// 运行时订阅注册缝（锚 Go `Subscribe(filter) *Subscription`）。
+/// 运行时订阅注册缝（`subscribe(filter) -> Subscription`）。
 ///
-/// 这是 **组 F（unlock 核心）的依赖缝**：`executeUnlock` 的 bye 早停依赖
-/// `subscribe(filterReq708ForTarget(...))`。把它抽象成 trait 让 unlock 能注入 mock
-/// 实现（无真 PF_PACKET listener 也能 e2e 测早停）；Go 侧 `Listener==nil` →
-/// `byeCh` nil-channel select 永不命中，Rust 端等价于持有 `Option<&dyn Subscribable>`
-/// 为 `None` 时不订阅。形状镜像 Go `Subscribe`，宁窄勿宽。
+/// 这是 **unlock 核心的依赖缝**：`execute_unlock` 的 bye 早停依赖
+/// `subscribe(filter_req708_for_target(...))`。把它抽象成 trait 让 unlock 能注入 mock
+/// 实现（无真 PF_PACKET listener 也能 e2e 测早停）；持有 `Option<&dyn Subscribable>`
+/// 为 `None` 时不订阅、bye channel 永不命中。形状宁窄勿宽。
 pub trait Subscribable: Send + Sync {
     /// 注册一个运行时订阅者。`filter` 返回 true 的 frame 投到 `Subscription.ch`
-    /// （buffered 8）。`filter == None` 视为「全通过」（锚 Go `filter == nil`）。
+    /// （buffered 8）。`filter == None` 视为「全通过」。
     fn subscribe(&self, filter: Option<SubFilter>) -> Subscription;
 }
 
-/// 单个 subscribe() 调用对应的内部条目（锚 Go `subscription`）。
+/// 单个 subscribe() 调用对应的内部条目。
 struct SubEntry {
     /// 订阅唯一 id（cancel 时按 id 移除，避免比较 fn 指针）。
     id: usize,
@@ -464,22 +461,21 @@ struct SubEntry {
 }
 
 /// 订阅者列表的共享句柄。`Listener` 持有它、`subscribe()` 返回的 cancel 闭包也捕获
-/// 它的克隆——这样 cancel 不依赖 `Listener` 本体存活（对齐 Go 闭包捕获 `*Listener`
-/// 但用 `Arc` 显式管理共享所有权）。
+/// 它的克隆——这样 cancel 不依赖 `Listener` 本体存活（用 `Arc` 显式管理共享所有权）。
 type SubsHandle = Arc<Mutex<Vec<SubEntry>>>;
 
 // ===========================================================================
-// Listener（锚 Go listener.go）
+// Listener
 // ===========================================================================
 
-/// frame 检测回调（锚 Go `Listener.OnDetect`）。收到合法 anjubao 18022 wire 帧时调用。
+/// frame 检测回调。收到合法 anjubao 18022 wire 帧时调用。
 pub type OnDetect = Box<dyn Fn(&DetectedFrame) + Send + Sync>;
 
 /// 可选 log hook 签名。
 pub type LogFn = Box<dyn Fn(&str) + Send + Sync>;
 
 /// 监听一组物理 slave 接口上的 TCP 18022 wire 帧，按 anjubao 协议解析后调 `on_detect`
-/// 回调 + 投递给 `subscribe()` 订阅者（锚 Go `Listener`）。
+/// 回调 + 投递给 `subscribe()` 订阅者。
 ///
 /// 跨平台部分（`dispatch_with_dedup` / Subscribe / 回调）所有平台可用；`run` 仅
 /// Linux 实现（PF_PACKET + BPF），非 Linux stub 返错。
@@ -545,7 +541,7 @@ impl Listener {
     }
 
     /// 测试用 hook：绕过 PROMISC PF_PACKET 真抓帧路径直接驱动 dispatch（on_detect 回调
-    /// + subscribe 订阅者投递）（锚 Go `DispatchForTest`）。
+    /// + subscribe 订阅者投递）。
     ///
     /// 仅供跨包测试使用（如 unlock 验证重试期间收到 req=708 bye 早停）；生产代码不应调用。
     pub fn dispatch_for_test(
@@ -559,7 +555,7 @@ impl Listener {
         self.dispatch_with_dedup(src_ip, dst_ip, src_port, dst_port, payload);
     }
 
-    /// 多 slave 模式用 dedup 去重后再 dispatch；单 slave 直触发（锚 Go `dispatchWithDedup`）。
+    /// 多 slave 模式用 dedup 去重后再 dispatch；单 slave 直触发。
     pub fn dispatch_with_dedup(
         &self,
         src_ip: [u8; 4],
@@ -596,14 +592,14 @@ impl Listener {
         self.dispatch_to_subs(&frame);
     }
 
-    /// 把 frame 投递给所有 filter 通过的活跃订阅者（锚 Go `dispatchToSubs`/`dispatchOne`）。
+    /// 把 frame 投递给所有 filter 通过的活跃订阅者。
     ///
     /// 每个订阅者 filter 调用用 `catch_unwind` 隔离 panic（不影响其它订阅者或主循环）。
     /// chan 满（buffered 8 已堵）时 `try_send` 失败即 silent drop。cancel 后的订阅在
     /// 锁内被二次检查 `closed` 跳过（cancel 与 dispatch 之间的 race）。
     fn dispatch_to_subs(&self, frame: &DetectedFrame) {
         // 锁内逐个评估并投递。先取需要的 (filter eval) 在锁内做 closed 二次检查
-        // （对齐 Go dispatchOne 的锁内 closed 检查 + select try-send）。
+        // （锁内 closed 检查 + try-send）。
         let subs = self.subs.lock().unwrap();
         if subs.is_empty() {
             return;
@@ -631,7 +627,7 @@ impl Listener {
         }
     }
 
-    /// 启动监听主循环（Linux PF_PACKET 实现，非 Linux 立即返错；锚 Go `Run`）。
+    /// 启动监听主循环（Linux PF_PACKET 实现，非 Linux 立即返错）。
     ///
     /// 阻塞直到 `shutdown` 置位；返回时清理所有 slave socket。
     ///
@@ -646,10 +642,10 @@ impl Listener {
 }
 
 impl Subscribable for Listener {
-    /// 注册运行时订阅者（锚 Go `Subscribe`）。`filter == None` → 全通过。buffered 8。
+    /// 注册运行时订阅者。`filter == None` → 全通过。buffered 8。
     ///
     /// cancel 闭包捕获 `subs` 共享句柄克隆 + 本订阅 id：cancel 时按 id 标记 closed 并
-    /// 移除（锚 Go cancel 闭包先置 `sub.closed=true` 再从切片删除 + close chan）。
+    /// 移除（先置 `sub.closed=true` 再从切片删除 + drop tx）。
     /// 多次 cancel no-op（按 id 找不到即返回）。
     fn subscribe(&self, filter: Option<SubFilter>) -> Subscription {
         let filter: SubFilter = filter.unwrap_or_else(|| Box::new(|_| true));
@@ -673,7 +669,7 @@ impl Subscribable for Listener {
             let mut subs = subs_handle.lock().unwrap();
             if let Some(pos) = subs.iter().position(|s| s.id == id && !s.closed) {
                 // 标记 closed（dispatch 锁内二次检查会跳过）再移除（drop tx → rx 端
-                // 后续 recv 得到 Disconnected，等价 Go close(sub.ch)）。多次 cancel：
+                // 后续 recv 得到 Disconnected）。多次 cancel：
                 // 第二次 position 找不到（已移除）即 no-op。
                 subs[pos].closed = true;
                 subs.remove(pos);
@@ -689,7 +685,7 @@ impl Subscribable for Listener {
 pub enum ListenerError {
     /// `slaves` 为空。
     NoSlaves,
-    /// PF_PACKET 仅 Linux 支持（非 Linux stub 路径，对齐 Go `listener_other.go`）。
+    /// PF_PACKET 仅 Linux 支持（非 Linux stub 路径）。
     Unsupported,
     /// 某个 slave socket 阶段失败（携带 slave 名 + 底层 FFI 错误）。
     Slave(String, crate::ffi::FfiError),
@@ -710,7 +706,7 @@ impl core::fmt::Display for ListenerError {
 
 impl std::error::Error for ListenerError {}
 
-// --- Linux PF_PACKET recv 循环（锚 Go listener_linux.go runPlatform/runSlave）---
+// --- Linux PF_PACKET recv 循环 ---
 
 #[cfg(target_os = "linux")]
 impl Listener {
@@ -809,7 +805,7 @@ impl Listener {
     }
 }
 
-// --- 非 Linux stub（对齐 Go listener_other.go）---
+// --- 非 Linux stub ---
 
 #[cfg(not(target_os = "linux"))]
 impl Listener {
@@ -888,7 +884,7 @@ mod tests {
         frame
     }
 
-    // --- parse_frame（5.1） ---
+    // --- parse_frame ---
 
     #[test]
     fn parse_frame_extracts_req_and_body() {
@@ -926,12 +922,12 @@ mod tests {
 
     #[test]
     fn parse_frame_rejects_non_wire() {
-        // 纯 TCP 控制帧残留（空 / 随机），ParseFrame 失败 → None。
+        // 纯 TCP 控制帧残留（空 / 随机），parse_frame 失败 → None。
         assert!(parse_frame(&[]).is_none());
         assert!(parse_frame(&[0x00; 4]).is_none());
     }
 
-    // --- infer_direction / format_log（3.4a，golden 对照 Go parser_test.go）---
+    // --- infer_direction / format_log（golden 向量）---
 
     #[test]
     fn infer_direction_outdoor_to_indoor() {
@@ -1121,7 +1117,7 @@ mod tests {
 
     #[test]
     fn extract_tcp_payload_empty_payload_ok() {
-        // 纯 SYN/ACK（无 payload）→ Some + 空 payload（双层防御，对齐 Go ok=true）。
+        // 纯 SYN/ACK（无 payload）→ Some + 空 payload（双层防御）。
         let frame = build_l2_tcp([1, 2, 3, 4], [5, 6, 7, 8], 1, 18022, &[]);
         let (got, ..) = extract_tcp_payload(&frame).unwrap();
         assert!(got.is_empty());
@@ -1183,7 +1179,7 @@ mod tests {
         assert_eq!(fnv1a_64(b"a"), 0xaf63_dc4c_8601_ec8c);
     }
 
-    // --- Subscribe（5.2）/ DispatchForTest（5.3） ---
+    // --- Subscribe / dispatch_for_test ---
 
     /// fake clock：固定时刻。
     struct FakeClock(AtomicUsize);
@@ -1307,7 +1303,7 @@ mod tests {
 
     #[test]
     fn subscribable_trait_object_usable() {
-        // 组 F 注入缝：经 &dyn Subscribable 订阅（验证 trait 对象安全）。
+        // 注入缝：经 &dyn Subscribable 订阅（验证 trait 对象安全）。
         let l = Listener::new(vec!["eth0".into()], None);
         let s: &dyn Subscribable = &l;
         let sub = s.subscribe(Some(Box::new(|f| f.req == 708)));
@@ -1315,7 +1311,7 @@ mod tests {
         assert_eq!(sub.ch.try_recv().unwrap().req, 708);
     }
 
-    // --- run（5.4 platform） ---
+    // --- run（platform） ---
 
     #[test]
     fn run_rejects_empty_slaves_or_unsupported() {

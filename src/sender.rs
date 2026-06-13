@@ -1,7 +1,7 @@
-//! Phase2 最小 `Sender` trait + mock impl（`/unlock` 薄切，ExecuteUnlock 边界）。
+//! 最小 `Sender` trait + mock impl（`/unlock` 薄切，execute_unlock 边界）。
 //!
-//! 语义对齐 Go `http8080.Server.ExecuteUnlock`——**不是**叶子 `wire18022.Sender.SendContext`。
-//! retry / bye / 错误分类属 Phase 3，不在此 trait 暴露。
+//! 这是 `/unlock` HTTP 入口的方法边界——**不是**叶子 wire send（`wire_sender::Sender::send_context`）。
+//! retry / bye / 错误分类由真实现承担，不在此 trait 暴露。
 
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -16,7 +16,7 @@ pub struct UnlockCall {
     pub target_port: u16,
 }
 
-/// Phase 2 最小 sender 错误；Phase 3 真 wire impl 可扩展变体。
+/// 最小 sender 错误；真 wire impl 可扩展变体。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SenderError {
     Wire(String),
@@ -32,9 +32,9 @@ impl core::fmt::Display for SenderError {
 
 impl std::error::Error for SenderError {}
 
-/// Go `ExecuteUnlock` 方法边界：caller=外机(to BCD)，callee=室内机(from BCD)。
+/// `execute_unlock` 方法边界：caller=外机(to BCD)，callee=室内机(from BCD)。
 pub trait Sender: Send + Sync {
-    /// `cancel` 预留 Phase 3 ctx 取消；Phase 2 mock 忽略。
+    /// `cancel` 预留 ctx 取消；mock 忽略。
     fn execute_unlock(
         &self,
         caller_bcd: [u8; 4],
@@ -68,7 +68,7 @@ impl MockSender {
         })
     }
 
-    /// 可注入 wire 失败变体；handler 薄切层映射为 `result=-1`（无 Phase 3 错误分类）。
+    /// 可注入 wire 失败变体；handler 薄切层映射为 `result=-1`（mock 路径无错误分类）。
     pub fn wire_err(msg: impl Into<String>) -> Arc<Self> {
         Arc::new(Self {
             outcome: Err(SenderError::Wire(msg.into())),
@@ -106,7 +106,7 @@ impl Sender for MockSender {
 }
 
 // ===========================================================================
-// WireSenderAdapter（Phase 3 真 impl，组 F）：把 `trait Sender::execute_unlock`
+// WireSenderAdapter（真 impl）：把 `trait Sender::execute_unlock`
 // 接到 unlock 核心（`unlock::execute_unlock`）+ wire_sender::Sender 真发帧。
 // ===========================================================================
 
@@ -118,17 +118,17 @@ use crate::unlock::{
 use crate::wire18022;
 use crate::wire_sender::{self, WireError};
 
-/// `trait Sender` 的真实现（替换 Phase2 [`MockSender`]，组 F）。
+/// `trait Sender` 的真实现（替换 [`MockSender`]）。
 ///
-/// 把 Phase2 `ExecuteUnlock` 边界接到 unlock 核心：HTTP `/unlock` 路径
+/// 把 `execute_unlock` 边界接到 unlock 核心：HTTP `/unlock` 路径
 /// （`per_attempt_timeout=None` / `retry_interval=1s` / 总 cap=10s）。持
-/// `post_wire_mu`（postMu+wireMutex 等价）守 wire 出站串行（HTTP /unlock 与
-/// self-unlock 不交错）。bye 早停经可选 `listener`（`trait Subscribable`）。
+/// `post_wire_mu` 守 wire 出站串行（HTTP /unlock 与 self-unlock 不交错）。
+/// bye 早停经可选 `listener`（`trait Subscribable`）。
 ///
-/// **范围红线**：本 adapter 只暴露 HTTP `/unlock` 入口（`ExecuteUnlock` 边界）。ring
-/// 触发的 self-unlock（`per_attempt_timeout=800ms` fail-fast probe + asyncPush + 测量）
-/// 是 Phase 4——其 per-attempt probe 机制已由 unlock 核心 [`unlock::run_unlock_with_retry`]
-/// 实现，Phase 4 只需以 `Some(SELF_UNLOCK_PROBE_TIMEOUT)` 调它。
+/// **范围红线**：本 adapter 只暴露 HTTP `/unlock` 入口（`execute_unlock` 边界）。ring
+/// 触发的 self-unlock（`per_attempt_timeout=800ms` fail-fast probe + async push + 测量）
+/// 的 per-attempt probe 机制已由 unlock 核心 [`unlock::run_unlock_with_retry`]
+/// 实现，self-unlock 路径只需以 `Some(SELF_UNLOCK_PROBE_TIMEOUT)` 调它。
 pub struct WireSenderAdapter {
     wire: wire_sender::Sender,
     post_wire_mu: Mutex<()>,
@@ -153,7 +153,7 @@ impl WireSenderAdapter {
 }
 
 /// 把 [`wire_sender::WireError`] 映射为 unlock 核心的 [`WireKind`] 分类
-/// （锚 Go `wire18022.IsRetryableError` + `classifyWireErr` 的输入分类）。
+/// （wire 错误分类 → 重试/超时/其它的输入分类）。
 fn map_wire_kind(err: &WireError) -> WireKind {
     match err {
         WireError::SilentFin => WireKind::SilentFin,
@@ -171,15 +171,14 @@ fn map_wire_kind(err: &WireError) -> WireKind {
 }
 
 impl UnlockWire for WireSenderAdapter {
-    /// 单次三步握手 710→711→518→519（锚 Go `tryUnlockOnce`）。
+    /// 单次三步握手 710→711→518→519。
     ///
     /// `per_attempt_cap`：`Some` 时（ring fail-fast probe）每步上限为该值（让未就绪外机挂住的
     /// 连接到点切断）；`None` 用 sender 默认 5s（[`wire_sender::DEFAULT_TIMEOUT`]）。
-    /// `deadline`：总 cap——710/518 两步**共享**这同一个递减的剩余 cap（修复 bugbot #1：对齐 Go
-    /// 两次 `SendContext(ctx,...)` 传同一 ctx），故每步在 **send 前**重算
+    /// `deadline`：总 cap——710/518 两步**共享**这同一个递减的剩余 cap，故每步在 **send 前**重算
     /// `op_timeout = min(per_attempt_cap_or_default, deadline.remaining())`，使第二步预算 =
     /// `min(cap, 第一步消耗后剩余)`，两步合计 ≤ 剩余 cap、不超 2×。`deadline.remaining()` 为 None
-    /// （NeverExpire/无 cap）时每步仅用 per_attempt_cap_or_default，不施 cap 层。
+    /// （无 cap）时每步仅用 per_attempt_cap_or_default，不施 cap 层。
     #[allow(clippy::too_many_arguments)]
     fn try_once(
         &self,
@@ -256,10 +255,10 @@ impl UnlockWire for WireSenderAdapter {
 }
 
 impl Sender for WireSenderAdapter {
-    /// HTTP `/unlock` 边界（锚 Go `ExecuteUnlock`）：调 unlock 核心走 retry/bye/分类，
+    /// HTTP `/unlock` 边界：调 unlock 核心走 retry/bye/分类，
     /// 返回最终 result code。`per_attempt_timeout=None`、`retry_interval=1s`、cap=10s。
     ///
-    /// 与 Go `ExecuteUnlock` 一致：无论成功/业务错/wire 失败都返 `Ok(result_code)`
+    /// 无论成功/业务错/wire 失败都返 `Ok(result_code)`
     /// （HTTP 200 + `{result:<code>}`），不返 `Err`——wire 失败已由 unlock 核心
     /// classify 成 -103/-5/-1。`SenderError` 仅保留给将来真正无法编码的入参错（不发生）。
     fn execute_unlock(
@@ -292,13 +291,13 @@ impl Sender for WireSenderAdapter {
 }
 
 // ===========================================================================
-// tests（组 E，task 8.2）：map_wire_kind 私有，golden errclass 的 result_code 列
+// tests：map_wire_kind 私有，golden errclass 的 result_code 列
 // 在此覆盖——验 WireError → WireKind → classify_wire_err(i32) 的端到端映射。
 // （tests/golden_listeners.rs 只能验公开 is_retryable_error 的 retryable bool。）
 // ===========================================================================
 
 // ===========================================================================
-// tests（修复 bugbot #1）：try_once 两步共享递减剩余 cap，合计不超 2×单步上限。
+// tests：try_once 两步共享递减剩余 cap，合计不超 2×单步上限。
 // ===========================================================================
 
 #[cfg(test)]
@@ -530,7 +529,7 @@ mod golden_errclass_tests {
     }
 
     /// 验 wire_sender.txt 的 errclass result_code 列：
-    /// WireError → map_wire_kind → classify_wire_err 必等于 Go classifyWireErr 导出值
+    /// WireError → map_wire_kind → classify_wire_err 必等于 committed golden 值
     /// （silent_fin→-103 / timeout→-5 / 其它→-1）。
     #[test]
     fn golden_errclass_result_code() {

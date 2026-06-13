@@ -1,11 +1,11 @@
-//! codec 模块 golden parity 回归（组 C，tasks 3.4）。
+//! codec 模块 golden parity 回归。
 //!
 //! 读 `testdata/golden/{bcd.txt,uri.txt,results.txt}` 逐项断言：
 //!   - BCD 双向逐字节 + 长度错/格式错两 sentinel 可区分
 //!   - URI 字段精确 + 各拒绝 case 归到四 sentinel（Format/NameLen/IPv4Only/Port）
 //!   - result 码逐值相等
 //!
-//! D1：只断言错误**分类**（sentinel 级）与 Go 对应，不断言 message 字面。
+//! 只断言错误**分类**（sentinel 级），不断言 message 字面。
 
 use std::fs;
 use std::path::PathBuf;
@@ -121,7 +121,7 @@ fn results_golden() {
     }
 }
 
-/// golden 名 → Rust 常量值。逐值相等是断言目标本身（tasks 3.3）。
+/// golden 名 → Rust 常量值。逐值相等是断言目标本身。
 fn result_by_name(name: &str) -> Option<i32> {
     use codec::result::*;
     Some(match name {
@@ -159,7 +159,7 @@ fn result_by_name(name: &str) -> Option<i32> {
     })
 }
 
-/// 额外断言错误**分类**可区分（D1 / tasks 3.4）：
+/// 额外断言错误**分类**可区分：
 /// BCD 两 sentinel、URI 四 sentinel 互不相等。不断言 message 字面。
 #[test]
 fn error_sentinels_distinguishable() {

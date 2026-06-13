@@ -1,7 +1,7 @@
-//! HTTP 层 golden parity（port-rust-http-control G7 / tasks 10.2）。
+//! HTTP 层 golden parity。
 //!
-//! 读 `testdata/golden/http/*.txt`（Go `export_golden_test.go` 导出）对 Rust 实现断言。
-//! fixture 缺失时跳过（编排者 `go test -tags export` 生成后再跑）。
+//! 读 committed golden 向量 `testdata/golden/http/*.txt` 对 Rust 实现断言。
+//! fixture 缺失时跳过。
 
 use std::fs;
 use std::io::{Cursor, Read, Write};

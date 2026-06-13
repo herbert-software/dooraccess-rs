@@ -1,16 +1,15 @@
-//! config 模块 golden parity 回归（组 E，tasks 5.5）。
+//! config 模块 golden parity 回归。
 //!
 //! 读 `testdata/golden/config.txt` 逐 CASE 断言：
 //!   - 解析结果逐字段（INI 怪癖：inline 注释 / 未闭合 quote / `[]string` trim /
 //!     `[section "subname"]` slice append / 同 subname 合并）
 //!   - unknown key / section → warning（精确字面）+ warnings 计数
 //!   - deprecated 检测、validate_uri accept/reject
-//!   - `ValidationError` / 缺字段错误**分类**与 Go 对应（sentinel 级，不断言 message 字面）
+//!   - `ValidationError` / 缺字段错误**分类**（sentinel 级，不断言 message 字面）
 //!
-//! golden 文件只钉**期望输出**，不含输入 INI；输入在本测试内显式重列（与 Go
-//! `iniparser_test.go` / `config_test.go` 同款 case，即 Go-behavior-verified 语料）。
-//! 因 Rust 去反射（D4）：INI 怪癖 case 用一个 `TestCfg` sink（镜像 Go 局部 `testCfg`）
-//! 走**同一个**解析引擎，故怪癖行为与 Config 路径共享、与 Go reflect 路径外部等价。
+//! golden 文件只钉**期望输出**，不含输入 INI；输入在本测试内显式重列（committed
+//! 行为已验证的语料）。INI 怪癖 case 用一个 `TestCfg` sink（轻量标量 sink）走
+//! **同一个**解析引擎，故怪癖行为与 Config 路径共享、外部等价。
 
 use std::collections::BTreeMap;
 
@@ -49,7 +48,7 @@ fn parse_golden_cases(text: &str) -> Vec<(String, Vec<String>)> {
 }
 
 // ---------------------------------------------------------------------------
-// 输入语料（与 Go iniparser_test.go / config_test.go 同款 case）
+// 输入语料（committed 行为已验证的 case）
 // ---------------------------------------------------------------------------
 
 const PROD_SHAPE: &str = "
@@ -123,7 +122,7 @@ sip = a@1.1.1.1:1
 rtsp_url = rtsp://a
 ";
 
-/// 完整 happy-path（含 v0.1 旧 deprecated 字段 + [automation] 旧整数 key），对应 Go `validBody`。
+/// 完整 happy-path（含 v0.1 旧 deprecated 字段 + [automation] 旧整数 key）。
 const VALID_BODY: &str = "
 brand = anjubao
 sip = 12345678@10.0.0.20:18022
@@ -161,7 +160,7 @@ cache_path =
 ";
 
 // ---------------------------------------------------------------------------
-// 测试用 sink：镜像 Go 局部 testCfg（Name/Count/Enabled/Tags）
+// 测试用 sink：轻量标量字段 sink（Name/Count/Enabled/Tags）
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
@@ -265,7 +264,7 @@ fn conf_get(cfg: &Config, path: &str) -> String {
         "automation.auto_unlock" => bool_str(cfg.automation.auto_unlock),
         "automation.auto_hangup" => bool_str(cfg.automation.auto_hangup),
         "deprecated" => {
-            // deprecated 是集合语义；golden 按字母序列，排序后比较（Go 导出端亦排序）。
+            // deprecated 是集合语义；golden 按字母序列，排序后比较（golden 向量亦排序）。
             let mut d: Vec<String> = cfg.deprecated_fields().to_vec();
             d.sort();
             d.join(",")
@@ -485,7 +484,7 @@ fn check_validateuri(case: &str, lines: &[String]) {
 }
 
 // ---------------------------------------------------------------------------
-// ValidationError / 缺字段错误**分类**与 Go 对应（D1 / tasks 5.5；不断言 message 字面）
+// ValidationError / 缺字段错误**分类**（不断言 message 字面）
 // ---------------------------------------------------------------------------
 
 /// 构造一个带单个合法 station 的 Config（Config 有私有字段，外部不能用结构字面量构造，
@@ -554,7 +553,7 @@ fn validation_error_classification() {
     }
 }
 
-/// load_config 缺文件 → ConfigError::NotFound 分类（Go ErrConfigNotFound 对应）。
+/// load_config 缺文件 → ConfigError::NotFound 分类。
 #[test]
 fn load_config_missing_file_classified() {
     match config::load_config("/nonexistent/dooraccess-go/config.ini") {
@@ -563,8 +562,8 @@ fn load_config_missing_file_classified() {
     }
 }
 
-// ── int 宽度 / 溢出回归（代码 review round 1：#14 octet panic / #9 conv_int int32）──
-// 差分测试发现：Go 平台 int=int32（部署目标 GOARCH=mips），Rust i64/u32 在此分叉。
+// ── int 宽度 / 溢出回归（octet panic / conv_int int32）──
+// 部署目标 MIPS 的整数宽度按 32 位对齐：conv_int 须把超出 i32 范围的值判溢出拒绝。
 
 #[test]
 fn validate_uri_overlong_octet_rejected_no_panic() {
@@ -577,11 +576,11 @@ fn validate_uri_overlong_octet_rejected_no_panic() {
 
 #[test]
 fn conv_int_int32_range_aligns_go_mips() {
-    // Go-MIPS int=int32 + OverflowInt：超 i32 范围拒。
+    // MIPS int 宽度 = 32 位 + 溢出检测：超 i32 范围拒。
     assert!(config::conv_int("3000000000", "port").is_err());
     assert!(config::conv_int("2147483648", "port").is_err());
     assert_eq!(config::conv_int("2147483647", "port"), Ok(2147483647));
-    // 负边界（Go int32 min=-2147483648；OverflowInt 拒 min-1）。
+    // 负边界（i32 min=-2147483648；溢出检测拒 min-1）。
     assert_eq!(config::conv_int("-2147483648", "port"), Ok(-2147483648));
     assert!(config::conv_int("-2147483649", "port").is_err());
     assert_eq!(config::conv_int("18022", "port"), Ok(18022));

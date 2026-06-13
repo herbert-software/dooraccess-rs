@@ -1,5 +1,4 @@
-//! daemon 编排 helper（纯逻辑接线，从 `main.rs` 上移到 lib crate，`port-rust-daemon-skeleton`
-//! G4 FIX 问题 B）。
+//! daemon 编排 helper（纯逻辑接线，从 `main.rs` 上移到 lib crate）。
 //!
 //! 这些是 `run()` 的**纯逻辑 orchestration 接线**——automation flag 三级优先级加载、OnDetect
 //! 门铃 builder、号码查询 callback builder、手动 unlock → wire-worker 派发缝。从 binary-private
@@ -26,7 +25,7 @@ use crate::unlock::{UnlockOutcome, WireKind, UNLOCK_RETRY_INTERVAL};
 use crate::wire_sender;
 
 // ---------------------------------------------------------------------------
-// load_automation_flags（§5.1/5.2/5.3，锚 Go loadAutomationFlags）
+// load_automation_flags
 // ---------------------------------------------------------------------------
 
 /// 读 state 文件字节，解析出两 bool。文件不存在返 `Ok(None)`（降级到 config 不 warn）；
@@ -41,7 +40,7 @@ pub fn load_state_file(path: &str) -> Result<Option<automation_state::State>, St
     }
 }
 
-/// 按优先级解析 auto_unlock/auto_hangup 初值并返回来源（锚 Go `loadAutomationFlags`）。
+/// 按优先级解析 auto_unlock/auto_hangup 初值并返回来源。
 ///
 /// 优先级：
 ///   ① `state` 文件存在且可解析出两 bool → 用之（来源 "state"）。
@@ -49,7 +48,7 @@ pub fn load_state_file(path: &str) -> Result<Option<automation_state::State>, St
 ///   ③ 否则 env `DOORACCESS_EXPERIMENTAL_AUTO_*`（来源 "env"，退役 fallback）。
 ///
 /// state 存在但空/半写/非法/缺 key → log warning + 整文件丢弃降级到②（禁 crash、禁部分恢复）。
-/// env 被②config 压掉时若 env 有设值 log 一行提示（§5.3）。
+/// env 被②config 压掉时若 env 有设值 log 一行提示。
 pub fn load_automation_flags(
     state_path: &str,
     cfg: &Config,
@@ -60,7 +59,7 @@ pub fn load_automation_flags(
         Ok(Some(st)) => return (st.auto_unlock, st.auto_hangup, "state"),
         Ok(None) => {} // 不存在：静默降级
         Err(msg) => {
-            // 存在但解析失败 → log warning + 降级，禁 crash（§5.2）。
+            // 存在但解析失败 → log warning + 降级，禁 crash。
             logf(&format!(
                 "automation.state load failed, falling back to config defaults: {msg}"
             ));
@@ -68,7 +67,7 @@ pub fn load_automation_flags(
     }
 
     // ② config.ini [automation]（config.ini 已成功加载即此层级命中）。
-    // env 被 config 压掉时提示（§5.3）。
+    // env 被 config 压掉时提示。
     if std::env::var_os("DOORACCESS_EXPERIMENTAL_AUTO_UNLOCK").is_some()
         || std::env::var_os("DOORACCESS_EXPERIMENTAL_AUTO_HANGUP").is_some()
     {
@@ -82,10 +81,10 @@ pub fn load_automation_flags(
 }
 
 // ---------------------------------------------------------------------------
-// build_listen18022 + OnDetect（§3.4，锚 Go buildListen18022/onRingDetected）
+// build_listen18022 + OnDetect
 // ---------------------------------------------------------------------------
 
-/// 从 `cfg.stations` 构造 IP → 外机 SIP URI 反向映射（纯函数；锚 Go `parseStationsToIPMap`）。
+/// 从 `cfg.stations` 构造 IP → 外机 SIP URI 反向映射（纯函数）。
 pub fn parse_stations_to_ip_map(cfg: &Config) -> std::collections::HashMap<String, String> {
     let mut m = std::collections::HashMap::with_capacity(cfg.stations.len());
     for st in &cfg.stations {
@@ -96,17 +95,16 @@ pub fn parse_stations_to_ip_map(cfg: &Config) -> std::collections::HashMap<Strin
     m
 }
 
-/// 构造 listen18022 Listener 并安装 `OnDetect`（§3.4）。slaves 为空返 `None`（不启动，
-/// 与 Go `buildListen18022` 一致）。
+/// 构造 listen18022 Listener 并安装 `OnDetect`。slaves 为空返 `None`（不启动）。
 ///
-/// OnDetect 两件事（锚 Go `buildListen18022`/`onRingDetected`）：
+/// OnDetect 两件事：
 ///   ① 每帧 `format_log` syslog（含 req/方向/src-dst）。
 ///   ② req=704 + src∈cfg.Stations + dst==本机室内机 → 门铃 `event=ring` detached push。
-///      to(roomURI) 默认 cfg.SIP；dst≠indoorIP 时按 Go 重建 `indoorName@dst_ip:18022`；
+///      to(room_uri) 默认 cfg.SIP；dst≠indoor_ip 时重建 `indoor_name@dst_ip:18022`；
 ///      src 不在 cfg.Stations 则 log dropped 不 push。
 ///
-/// **范围红线**：只做 FormatLog + event=ring push，**绝不**含 filter+debounce→Unlock job
-/// 自动产出（那属姊妹 change ②）。
+/// 只做 format_log + event=ring push，**绝不**含 filter+debounce→Unlock job 自动产出
+/// （那属 self-unlock 消费者）。
 pub fn build_listen18022(
     cfg: &Config,
     slaves: Vec<String>,
@@ -124,7 +122,7 @@ pub fn build_listen18022(
         Err(_) => (String::new(), None),
     };
 
-    // 外机 IP → SIP 反查 + daemon/outdoor IPs（InferDirection 用）。
+    // 外机 IP → SIP 反查 + daemon/outdoor IPs（infer_direction 用）。
     let outdoor_by_ip = parse_stations_to_ip_map(cfg);
     let outdoor_ips: Vec<[u8; 4]> = outdoor_by_ip.keys().filter_map(|s| parse_ipv4(s)).collect();
     // daemon IP：从 iface 读（与 wire_sender::get_iface_ip 同源）。
@@ -138,7 +136,7 @@ pub fn build_listen18022(
 
     let cfg_sip = cfg.sip.clone();
     let on_detect: listen18022::OnDetect = Box::new(move |d: &DetectedFrame| {
-        // ① 每帧 FormatLog syslog。
+        // ① 每帧 format_log syslog。
         let dir =
             listen18022::infer_direction(d.src_ip, d.dst_ip, daemon_ip, indoor_ip, &outdoor_ips);
         log_line(&listen18022::format_log(
@@ -159,7 +157,7 @@ pub fn build_listen18022(
                 return;
             }
         };
-        // roomURI 默认 cfg.SIP；dst≠indoorIP（罕见配置错位）→ 重建 indoorName@dst_ip:18022。
+        // room_uri 默认 cfg.SIP；dst≠indoor_ip（罕见配置错位）→ 重建 indoor_name@dst_ip:18022。
         let mut room_uri = cfg_sip.clone();
         if let Some(iip) = indoor_ip {
             if iip != d.dst_ip && !indoor_name.is_empty() {
@@ -184,20 +182,20 @@ pub fn build_listen18022(
 }
 
 // ---------------------------------------------------------------------------
-// UDP 6672 号码查询响应 callback（§8.1/8.2，锚 Go handleNumberQuery main.go:463）
+// UDP 6672 号码查询响应 callback
 // ---------------------------------------------------------------------------
 
-/// 构造 listen6672 `on_number_query` 回调（§8.1/8.2）。返 `None` 时不安装（cfg.sip 解析失败 →
+/// 构造 listen6672 `on_number_query` 回调。返 `None` 时不安装（cfg.sip 解析失败 →
 /// 无本机号码可比对，整体不响应任何号码查询）。
 ///
-/// 回调逻辑（锚 Go `handleNumberQuery`）：
-///   ① `DecodeBCD(frame.target_bcd) == myNum`（cfg.SIP 的 monitor 号码）→ 命中；否则安静 drop。
-///   ② 本机门禁网 IPv4 解析优先级（Go **代码**分支，main.go:473-485）：
-///        `sender.LocalIP`（本骨架 wire_sender::Sender.local_ip=None，故此层不命中）
-///        → `GetIfaceIP(cfg.iface)` → drop（注释提的"srcIP 网段推导"代码无此分支，不实现）。
+/// 回调逻辑：
+///   ① `decode_bcd(frame.target_bcd) == my_num`（cfg.SIP 的 monitor 号码）→ 命中；否则安静 drop。
+///   ② 本机门禁网 IPv4 解析优先级：
+///        `sender.local_ip`（本实现 wire_sender::Sender.local_ip=None，故此层不命中）
+///        → `get_iface_ip(cfg.iface)` → drop（"srcIP 网段推导"无此分支，不实现）。
 ///      本机 IP 在 setup 期解析一次（iface 固定，运行期不变）；解析失败 → 回调内 drop。
 ///   ③ `build_number_query_response` 构帧 → `send_udp_response` 单播回 srcIP 本机门禁网 IPv4
-///      （NBO 由 SocketAddrV4/[u8;4] 原语承载，§8.0 已处理，不手写移位）。
+///      （NBO 由 SocketAddrV4/[u8;4] 原语承载，不手写移位）。
 pub fn build_number_query_callback(cfg: &Config) -> Option<listen6672::FrameCallback> {
     // cfg.SIP 的 monitor 号码（本机号码）；解析失败 → 不安装回调。
     let my_num = match codec::parse_uri(&cfg.sip) {
@@ -208,7 +206,7 @@ pub fn build_number_query_callback(cfg: &Config) -> Option<listen6672::FrameCall
         }
     };
 
-    // 本机门禁网 IPv4（Go 代码分支 sender.LocalIP→GetIfaceIP→drop；local_ip=None → 走 GetIfaceIP）。
+    // 本机门禁网 IPv4（解析链 sender.local_ip→get_iface_ip→drop；local_ip=None → 走 get_iface_ip）。
     // setup 期解析一次（iface 固定）；None → 回调内每次 drop（无本机 IP 可回）。
     let our_ip: Option<[u8; 4]> = if cfg.iface.is_empty() {
         None
@@ -247,14 +245,14 @@ pub fn build_number_query_callback(cfg: &Config) -> Option<listen6672::FrameCall
 }
 
 // ---------------------------------------------------------------------------
-// WorkerUnlockDispatch：control.rs /unlock handler → wire-worker 队列（决策 5 / §4.1/4.2）
+// WorkerUnlockDispatch：control.rs /unlock handler → wire-worker 队列
 // ---------------------------------------------------------------------------
 
 /// 手动 unlock 派发缝：HTTP `/unlock` handler 经此投 [`Job::Unlock`] 到单 wire-worker 队列、
 /// 阻塞等 worker 经一次性 reply channel 回灌 [`UnlockOutcome`]，再由 handler 做 4 分支 HTTP
-/// 映射（决策 5：手动 unlock 经 worker、消解 wireMu）。
+/// 映射（手动 unlock 经 worker、消解 wire 互斥锁）。
 ///
-/// **失活解锁不变量（决策 8）**：
+/// **失活解锁不变量**：
 ///   - 投 job 容忍 `SendError`（worker 已退则返退化 wire-failure，禁 unwrap）。
 ///   - 等 reply：worker 正常跑完回灌真 outcome；worker panic → 其持有的 `UnlockJob`（含 reply
 ///     sender）teardown drop → 本处 `recv()` 收 `RecvError` → 退化 wire-failure（不永等）。
@@ -282,12 +280,12 @@ impl UnlockDispatch for WorkerUnlockDispatch {
             per_attempt_timeout: None,
             retry_interval: UNLOCK_RETRY_INTERVAL,
         });
-        // 投 job：容忍 SendError（worker 已退 → 退化 wire-failure，禁 unwrap，决策 8）。
+        // 投 job：容忍 SendError（worker 已退 → 退化 wire-failure，禁 unwrap）。
         if daemon::submit_job(&self.job_tx, job).is_err() {
             return worker_unavailable_outcome();
         }
         // 等 worker 回灌：正常 → 真 outcome；worker panic（reply sender drop）→ RecvError →
-        // 退化 wire-failure（不永等，决策 8 worker-death）。
+        // 退化 wire-failure（不永等，worker-death）。
         match reply_rx.recv() {
             Ok(outcome) => outcome,
             Err(_) => worker_unavailable_outcome(),
