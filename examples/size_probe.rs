@@ -1,8 +1,8 @@
-// size_probe — Phase1 体型测量辅助（非生产）。
+// size_probe — 体型测量辅助（非生产）。
 //
 // 用 black_box 实际调用 codec/wire18022/config/automation_state 四模块的代表函数，
 // 阻止 dead-code elimination 剥除 lib，使交叉编译出的 MIPS binary 字节数反映
-// 「Phase1 模块真正链入时的体型」（probe binary 因 main 不 use lib 测不出增量）。
+// 「协议核心模块真正链入时的体型」（probe binary 因 main 不 use lib 测不出增量）。
 // 仅用于 `cargo build --example size_probe`，不进生产路径。
 //
 // 体型探针里把线程/socket-spawn 的骨架入口（run_worker/spawn_push/build_listen18022 等）
@@ -25,7 +25,7 @@ fn main() {
     )));
     black_box(&uri_ok);
 
-    // --- Phase2 模块链入（httpx / control / info / ha_push）---
+    // --- httpx / control / info / ha_push 模块链入 ---
     use dooraccess_rs::httpx::json::{encode_struct, JsonOptions, JsonValue};
     let body = black_box(encode_struct(
         black_box(&[
@@ -58,8 +58,8 @@ fn main() {
     ));
     black_box(&url);
 
-    // --- Phase3 模块链入（ffi / bpf / listen6672 / listen18022 / wire_sender / unlock）---
-    // 只引代表性纯函数（不开真 socket），black_box 防 DCE，使 MIPS binary 反映 Phase3 体型。
+    // --- ffi / bpf / listen6672 / listen18022 / wire_sender / unlock 模块链入 ---
+    // 只引代表性纯函数（不开真 socket），black_box 防 DCE，使 MIPS binary 反映这些模块的体型。
 
     // ffi: htons + BPF fprog 头构造。
     let net = black_box(dooraccess_rs::ffi::htons(black_box(0x0003)));
@@ -125,8 +125,8 @@ fn main() {
     )));
     black_box(&bye_filter);
 
-    // --- Phase4 骨架模块链入（daemon worker/job/push + orchestration + Persister）---
-    // 本 change 新增/移植的代表函数。线程/socket-spawn 的入口（run_worker/spawn_push 等）
+    // --- daemon 骨架模块链入（daemon worker/job/push + orchestration + Persister）---
+    // 新增/移植的代表函数。线程/socket-spawn 的入口（run_worker/spawn_push 等）
     // 取函数指针经 black_box 防 DCE（不在体型探针里真起线程）；纯函数直接调用。
 
     // daemon: PushTracker 运行期回收 + 取消/排空骨架函数指针。
@@ -200,12 +200,12 @@ fn main() {
     ) -> std::io::Result<()> = dooraccess_rs::automation_state::write_atomic;
     black_box(write_atomic_fp as usize);
 
-    // --- Phase4 ② self-unlock 模块链入（port-rust-self-unlock-consumer 组 D / task 6.2）---
-    // 链入本 change 新增/移植的代表函数，使 MIPS binary 反映 ② 真正链入时的体型增量。
+    // --- self-unlock 模块链入 ---
+    // 链入新增/移植的代表函数，使 MIPS binary 反映 self-unlock 真正链入时的体型增量。
     // 纯函数（build_stop_frame）直接调用；线程/socket-spawn 入口（spawn_consumer）取函数指针。
 
-    // wire18022::build_stop_frame —— ② 唯一新增 wire-encode 代码（preview-stop req=708 帧，
-    // 移植 Go video.BuildStopFrame）。须确实链入体型基线（其字节正确性另由 golden 单测守）。
+    // wire18022::build_stop_frame —— self-unlock 唯一新增 wire-encode 代码（preview-stop req=708 帧）。
+    // 须确实链入体型基线（其字节正确性另由 golden 单测守）。
     let stop = black_box(dooraccess_rs::wire18022::build_stop_frame(
         black_box([0x06, 0x02, 0x00, 0x00]),
         black_box([0x06, 0x02, 0x11, 0x03]),
@@ -232,7 +232,7 @@ fn main() {
     ));
     black_box(&hangup_job);
 
-    // --- Phase5 video 模块链入（port-rust-video-forward / task 7.3）---
+    // --- video 模块链入 ---
     // 链入 video 全栈代表函数，使 MIPS binary 反映 video 真正链入时的体型增量。
     // 纯函数（wire start 帧 / FLV 静态构造 / RTCP 构造 / RTP+codec 解析）直接调用；
     // 线程/socket-spawn 入口（RtpReceiver::run / RtcpSender::run / PreviewClient /

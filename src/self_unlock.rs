@@ -1,9 +1,8 @@
-//! ring 触发 self-unlock 消费者主体（Phase 4 ②，`port-rust-self-unlock-consumer` 组 B）。
+//! ring 触发 self-unlock 消费者主体。
 //!
-//! 对标 Go `consumeSelfUnlock`（main.go:538）/ `scheduleOutdoorHangup`（:681）/
-//! `ExecuteUnlockFromRing`（handlers.go:266）。
+//! 组成：self-unlock 消费者 / auto-hangup 计时线程 / ring 触发自开锁包装。
 //!
-//! ## 并发模型（design 决策 1/2）
+//! ## 并发模型
 //!
 //! listen18022 dispatch 是 **per-slave 多线程**（`run_platform` thread::scope），`on_detect`
 //! 是 `Fn + Send + Sync` 跨 slave 并发调用——把 debounce 状态放其中既数据竞争又编译不过。故
@@ -13,10 +12,10 @@
 //!
 //! ## per-ring 失败隔离（防御式编码，非 catch_unwind）
 //!
-//! release profile `panic="abort"` 下 `catch_unwind` 是 no-op，故 Go 的 inner-closure
-//! `defer recover()` 不可直译。消费者用防御式编码：可失败操作返 `Result` → log + 跳过该 ring
+//! release profile `panic="abort"` 下 `catch_unwind` 是 no-op，故 panic-recover 式隔离
+//! 不可用。消费者用防御式编码：可失败操作返 `Result` → log + 跳过该 ring
 //! 继续 drain；ring 处理路径禁 `unwrap`/`expect`/越界/`panic!`。debounce 写在可失败操作之前
-//! （起步即写，对齐 main.go:645）。
+//! （起步即写）。
 //!
 //! ## shutdown 集成（recv_timeout 轮询，非裸 recv）
 //!
@@ -49,9 +48,9 @@ use crate::unlock::{
 };
 
 // ---------------------------------------------------------------------------
-// test-tunable 形态（参 Go `var selfUnlockDebounceMargin` / `var selfUnlockHangupDelay`）
+// test-tunable 形态（debounce margin / hangup delay 可在测试期缩短）
 //
-// Rust 侧 UNLOCK_TOTAL_CAP 是 const（不可运行时改），故 margin/delay 用 static AtomicU32(ms)
+// UNLOCK_TOTAL_CAP 是 const（不可运行时改），故 margin/delay 用 static AtomicU32(ms)
 // + setter 让 mock-e2e 缩到 ms 级；生产值 ~2s（勿改）。
 //
 // **用 AtomicU32 而非 AtomicU64**：目标 32-bit MIPS（mips-unknown-linux-musl）无原生 64-bit
@@ -101,14 +100,14 @@ pub fn set_hangup_delay_ms_for_test(ms: u64) -> u64 {
 
 /// self-unlock 消费者运行所需依赖（构造期解析的不可变 ring 参数 + 运行时缝）。
 ///
-/// 经 [`try_new`] 构造（构造期解析 outdoor_by_ip / callee_bcd / indoor_ip；calleeBCD 或
-/// indoorIP 解析失败返 `None` = self-unlock 禁用）。`job_tx` 既投 `Job::Unlock`（worker 执行
+/// 经 [`try_new`] 构造（构造期解析 outdoor_by_ip / callee_bcd / indoor_ip；callee BCD 或
+/// indoor IP 解析失败返 `None` = self-unlock 禁用）。`job_tx` 既投 `Job::Unlock`（worker 执行
 /// 自开锁）又投 `Job::Hangup`（auto-hangup）；`push_client`/`tracker`/`shutdown` 经
 /// `daemon::spawn_push` 发 `event=unlock`；`automation` 是运行时 flag gate 的 atomic 读源。
 pub struct SelfUnlockDeps {
     /// IP → 外机 SIP URI 反查表（filter + 触发用，构造期解析、运行期只读）。
     outdoor_by_ip: HashMap<String, String>,
-    /// 室内机 BCD（cfg.SIP，作 callee；hangup 的 monitorBCD/callerBCD 槽）。
+    /// 室内机 BCD（cfg.SIP，作 callee；hangup 的 monitor_bcd / caller 槽）。
     callee_bcd: [u8; 4],
     /// 本机室内机 IPv4（filter dst 收紧）。
     indoor_ip: [u8; 4],
@@ -127,8 +126,8 @@ pub struct SelfUnlockDeps {
 
 impl SelfUnlockDeps {
     /// 构造消费者依赖。构造期解析 outdoor_by_ip / callee_bcd / indoor_ip 各一次；
-    /// calleeBCD 或 indoorIP 解析失败 → 返 `None`（self-unlock 禁用，消费者不启动），
-    /// log 一行、不 panic、不部分启动（锚 Go main.go:555-576）。
+    /// callee BCD 或 indoor IP 解析失败 → 返 `None`（self-unlock 禁用，消费者不启动），
+    /// log 一行、不 panic、不部分启动。
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         cfg: &Config,
@@ -184,7 +183,7 @@ impl SelfUnlockDeps {
     }
 
     /// filter 闭包（只读不可变捕获 indoor_ip/outdoor_by_ip）：`req==704 && dst==本机室内机IP
-    /// && src∈outdoorByIP`（锚 Go main.go:581-590）。在多线程 dispatch 路径同步跑、无状态。
+    /// && src∈outdoor_by_ip`。在多线程 dispatch 路径同步跑、无状态。
     fn make_filter(&self) -> SubFilter {
         let indoor_ip = self.indoor_ip;
         // 仅捕获 IP 集合（cheap），不捕 URI map（filter 只判 src 是否在集）。
@@ -203,13 +202,13 @@ impl SelfUnlockDeps {
 }
 
 // ---------------------------------------------------------------------------
-// 消费者线程主体（决策 1：单消费者 drain + debounce + flag gate + 产 Job）
+// 消费者线程主体：单消费者 drain + debounce + flag gate + 产 Job
 // ---------------------------------------------------------------------------
 
 /// 注册订阅 + 起独立单消费者线程。返回消费者线程 `Some(JoinHandle)`（钉死排序里 listener-join
 /// 之后、`Job::Shutdown` 哨兵之前 join）；spawn 失败返 `None`（self-unlock 静默禁用，best-effort）。
 ///
-/// **调用方契约**（钉死 shutdown 排序新增插步，design 决策 1）：
+/// **调用方契约**（钉死 shutdown 排序新增插步）：
 ///   - listener 线程 join 之后 join 本 handle（保证「哨兵后无新 Unlock job 入队」关窗不变量）；
 ///   - `Job::Shutdown` 哨兵之前 join 本 handle；
 ///   - 返 `None` 时调用方无 handle 可 join，跳过（self-unlock 未启动，不影响排序）。
@@ -234,7 +233,7 @@ pub fn spawn_consumer(
             Some(h)
         }
         Err(e) => {
-            // spawn 失败极罕见（线程资源耗尽）；按骨架 best-effort 纪律不 panic。返 `None`
+            // spawn 失败极罕见（线程资源耗尽）；按 best-effort 纪律不 panic。返 `None`
             // 而非裸 `std::thread::spawn` 占位——后者在同一资源耗尽下也会失败并**panic**
             // （`panic=abort` 即 abort daemon），违背本模块 no-panic 防御纪律。此时 sub 随
             // 失败闭包 drop → `Subscription` 的 `Drop` guard 兜底 cancel（清 orphan SubEntry，
@@ -250,16 +249,16 @@ pub fn spawn_consumer(
 /// 消费者 drain 主循环（recv_timeout 轮询 + 防御式 per-ring 处理）。
 fn run_consumer(sub: crate::listen18022::Subscription, deps: &SelfUnlockDeps) {
     let window = debounce_window();
-    // debounce 状态：消费者线程单线程访问，无锁（决策 1）。
+    // debounce 状态：消费者线程单线程访问，无锁。
     let mut last_triggered: HashMap<String, Instant> = HashMap::new();
-    // channel-drop 对账（dequeue − triggered = debounce_skips，锚 Go main.go:597/604）。
+    // channel-drop 对账（dequeue − triggered = debounce_skips）。
     let mut dequeue_count: u64 = 0;
     let mut triggered_count: u64 = 0;
 
     loop {
         match sub.ch.recv_timeout(CONSUMER_POLL) {
             Ok(frame) => {
-                // 取帧 Instant = t_ms 起点（锚 Go ringAt main.go:621）。recv_timeout 帧到达
+                // 取帧 Instant = t_ms 起点。recv_timeout 帧到达
                 // 立即返回，t_ms 精度不受 poll 影响。
                 let ring_at = Instant::now();
                 dequeue_count = dequeue_count.saturating_add(1);
@@ -292,9 +291,9 @@ fn run_consumer(sub: crate::listen18022::Subscription, deps: &SelfUnlockDeps) {
     sub.cancel();
 }
 
-/// 单个 ring 的防御式处理：flag gate → debounce → ExecuteUnlockFromRing → auto-hangup。
+/// 单个 ring 的防御式处理：flag gate → debounce → execute_unlock_from_ring → auto-hangup。
 ///
-/// **处理顺序钉死**（spec「flag gate」）：dequeue → 读 flag（off 即 return 不写 debounce）→
+/// **处理顺序钉死**：dequeue → 读 flag（off 即 return 不写 debounce）→
 /// debounce 检查 → debounce 写（起步即写）→ 解析外机 URI（失败 log+跳过）→ 触发。
 /// 所有可失败操作返 `Result`/`Option` + log + return（不 panic）。
 fn handle_ring(
@@ -326,7 +325,7 @@ fn handle_ring(
             return;
         }
     }
-    // 起步即写（在任何可失败操作之前，对齐 main.go:645）。
+    // 起步即写（在任何可失败操作之前）。
     last_triggered.insert(outdoor_uri.clone(), ring_at);
 
     // 解析外机 BCD/IP/port（一次；失败 log+跳过不 panic）。
@@ -345,7 +344,7 @@ fn handle_ring(
         "[auto_unlock] trigger src={outdoor_uri} (dequeue-triggered=debounce_skips)"
     ));
 
-    // ExecuteUnlockFromRing：经 worker 跑自开锁 + t_ms 测量 + 成功 push event=unlock。
+    // execute_unlock_from_ring：经 worker 跑自开锁 + t_ms 测量 + 成功 push event=unlock。
     let outcome = execute_unlock_from_ring(
         deps,
         caller_bcd,
@@ -361,8 +360,8 @@ fn handle_ring(
         schedule_outdoor_hangup(
             deps.job_tx.clone(),
             Arc::clone(&deps.shutdown),
-            caller_bcd,      // outdoor_bcd（BuildStopFrame 首参 / calleeBCD 槽）
-            deps.callee_bcd, // monitor_bcd（= 室内机 BCD，callerBCD 槽，锚 Go main.go:563/697）
+            caller_bcd,      // outdoor_bcd（build_stop_frame 首参 / callee 槽）
+            deps.callee_bcd, // monitor_bcd（= 室内机 BCD，caller 槽）
             target_ip,
             target_port,
         );
@@ -370,11 +369,11 @@ fn handle_ring(
 }
 
 // ---------------------------------------------------------------------------
-// ExecuteUnlockFromRing 包装（task 3.1/3.2，锚 Go handlers.go:266）
+// ring 触发自开锁包装
 // ---------------------------------------------------------------------------
 
-/// ring 触发自开锁：经骨架 worker（`Job::Unlock`）跑 unlock 核心 + t_ms 测量（起点 = ring_at
-/// dequeue Instant）+ 仅成功 push `event=unlock`（失败不 push，锚 Go handlers.go:288）。
+/// ring 触发自开锁：经 wire-worker（`Job::Unlock`）跑 unlock 核心 + t_ms 测量（起点 = ring_at
+/// dequeue Instant）+ 仅成功 push `event=unlock`（失败不 push）。
 ///
 /// 投 `Job::Unlock` + 等一次性 reply（同 `WorkerUnlockDispatch` 模式）：worker 已退/panic →
 /// SendError/RecvError → 退化 wire-failure outcome（不永等、不 panic）。
@@ -395,7 +394,7 @@ fn execute_unlock_from_ring(
         target_port,
         reply: reply_tx,
         // ring 路径 fail-fast probe 计时（headline ~1.3s 成因）：per-attempt 800ms 切断首帧
-        // 阻塞假象 + 200ms 重探（非 HTTP 1s 退避），锚 Go handlers.go:283。
+        // 阻塞假象 + 200ms 重探（非 HTTP 1s 退避）。
         per_attempt_timeout: Some(SELF_UNLOCK_PROBE_TIMEOUT),
         retry_interval: SELF_UNLOCK_PROBE_INTERVAL,
     });
@@ -415,7 +414,7 @@ fn execute_unlock_from_ring(
         outcome.result, outcome.retries
     ));
 
-    // §5.1：仅成功 push event=unlock（失败不 push，保持 Stage 1 现状）。best-effort detached。
+    // 仅成功 push event=unlock（失败不 push，保持 Stage 1 现状）。best-effort detached。
     if outcome.result == codec::result::OK {
         daemon::spawn_push(
             &deps.tracker,
@@ -443,7 +442,7 @@ fn worker_unavailable_outcome() -> UnlockOutcome {
 }
 
 // ---------------------------------------------------------------------------
-// auto-hangup detached 计时线程（task 4.1/4.3，决策 2，锚 Go scheduleOutdoorHangup）
+// auto-hangup detached 计时线程
 // ---------------------------------------------------------------------------
 
 /// 起一次性 detached 计时线程：分片轮询延迟 ~2s（Instant 累计，可中断）后投**即时**
@@ -451,9 +450,9 @@ fn worker_unavailable_outcome() -> UnlockOutcome {
 ///
 /// - **可中断延迟**：`park_timeout(20ms)` 轮询 + `start.elapsed() >= delay` 单调判据（非分片
 ///   计数——park_timeout spurious 提前会让计数法误判早发）；shutdown 置位即放弃（不投不发）。
-/// - **不发 wire**：仅 `submit_job(Job::Hangup)`，req=708 仍由 worker 唯一发（守 M1.5）。
+/// - **不发 wire**：仅 `submit_job(Job::Hangup)`，req=708 仍由 worker 唯一发（守 wire 出站单点）。
 /// - **best-effort**：投 `Job::Hangup` 的 SendError 容忍禁 unwrap；晚于哨兵到 worker 则丢弃，
-///   daemon 不为它延迟 shutdown / 不绕 worker 直发（锚 Go main.go:680/691-694）。
+///   daemon 不为它延迟 shutdown / 不绕 worker 直发。
 /// - **不触碰 debounce**：按值持 BCD/IP（消费者线程的 last_triggered 够不到）。
 fn schedule_outdoor_hangup(
     job_tx: Sender<Job>,
@@ -464,8 +463,8 @@ fn schedule_outdoor_hangup(
     outdoor_port: u16,
 ) {
     let delay = hangup_delay();
-    // 有意 detach：不加入 shutdown 排空集；靠 shutdown AtomicBool 兜底放弃（决策 2 / 骨架
-    // spec:108 非排空契约口）。spawn 失败仅 log（best-effort）。
+    // 有意 detach：不加入 shutdown 排空集；靠 shutdown AtomicBool 兜底放弃（非排空契约）。
+    // spawn 失败仅 log（best-effort）。
     let spawned = std::thread::Builder::new()
         .name("self-unlock-hangup".into())
         .spawn(move || {
@@ -504,7 +503,7 @@ fn schedule_outdoor_hangup(
 // 小工具
 // ---------------------------------------------------------------------------
 
-/// 解析外机 URI → (callerBCD, targetIP, targetPort)（等价 Go `ParseURIBCD`）。
+/// 解析外机 URI → (caller_bcd, target_ip, target_port)。
 fn parse_outdoor_uri(uri: &str) -> Result<([u8; 4], String, u16), String> {
     let (name, ip, port) = codec::parse_uri(uri).map_err(|_| "uri parse".to_string())?;
     let bcd = codec::encode_bcd(&name).map_err(|_| "bcd encode".to_string())?;
@@ -550,7 +549,7 @@ mod tests {
 }
 
 // ===========================================================================
-// 组 C — mock-e2e 测试（tasks §5；行为锚 Go selfunlock 测试集）
+// mock-e2e 测试
 //
 // 测试缝：消费者主体（`run_consumer`/`spawn_consumer`）的依赖经 `SelfUnlockDeps::try_new`
 // 构造（公开 API），filter 经 `make_filter`（私有，本模块可见）注册到一个真 `Listener`，
@@ -559,7 +558,7 @@ mod tests {
 // Job::Hangup 携 `build_stop_frame` 字节、debounce/flag-gate/失败隔离/shutdown 不死锁。
 //
 // 沙箱：纯进程内同步原语（mpsc / Listener / 线程），无 socket bind——沙箱内外皆可跑。
-// 唯一例外是 5.8 的 push 断言（经 `daemon::spawn_push`→`HaPushClient` 需 loopback HTTP
+// 唯一例外是 push 断言（经 `daemon::spawn_push`→`HaPushClient` 需 loopback HTTP
 // capture server，须沙箱外；bind 失败静默跳过，仿 daemon_e2e t10_9）。
 // ===========================================================================
 
@@ -733,10 +732,10 @@ mod e2e {
         cond()
     }
 
-    // ---- 5.1 ring 触发自开锁 e2e -------------------------------------------
+    // ---- ring 触发自开锁 e2e ------------------------------------------------
 
     /// mock 外机 req=704 → 经 subscribe → 消费者产 Job::Unlock → worker 跑自开锁
-    /// （wire 被调一次）。锚 Go `main_listen18022_ring_test.go`。
+    /// （wire 被调一次）。
     #[test]
     fn t5_1_ring_triggers_self_unlock_through_worker() {
         let cfg = e2e_cfg();
@@ -768,7 +767,7 @@ mod e2e {
         worker.join().unwrap();
     }
 
-    // ---- 5.2 debounce e2e ---------------------------------------------------
+    // ---- debounce e2e -------------------------------------------------------
 
     /// 窗口内重复 ring 仅触发首次（debounce 单线程顺序判定）。
     #[test]
@@ -808,7 +807,7 @@ mod e2e {
         set_debounce_margin_ms_for_test(old);
     }
 
-    // ---- 5.3 flag gate e2e --------------------------------------------------
+    // ---- flag gate e2e ------------------------------------------------------
 
     /// auto_unlock off → ring 跳过不触发、不写 debounce；随后拨 on 同外机仍能触发
     /// （证 off 未污染 debounce 窗口）。
@@ -912,10 +911,9 @@ mod e2e {
         assert_eq!(calls.load(Ordering::SeqCst), 1, "在飞那次跑完");
     }
 
-    // ---- 5.4 双触发消除（daemon 单边）e2e ----------------------------------
+    // ---- 双触发消除（daemon 单边）e2e --------------------------------------
 
     /// 无 HACS `/unlock` 时 ring 单次自开锁（daemon 侧不引入第二触发源）。**不**声称端到端。
-    /// 锚 Go `main_selfunlock_test.go`。
     #[test]
     fn t5_4_single_self_unlock_without_hacs_callback() {
         let cfg = e2e_cfg();
@@ -947,10 +945,10 @@ mod e2e {
         worker.join().unwrap();
     }
 
-    // ---- 5.5 auto-hangup e2e ------------------------------------------------
+    // ---- auto-hangup e2e ----------------------------------------------------
 
     /// result=0 + auto_hangup on → 计时线程延迟投 Job::Hangup → worker 发 req=708
-    /// preview-stop 帧逐字节对齐 Go `BuildStopFrame(outdoorBCD, monitorBCD)`。
+    /// preview-stop 帧逐字节等于 `build_stop_frame(outdoor_bcd, monitor_bcd)`。
     #[test]
     fn t5_5_auto_hangup_sends_stop_frame_byte_exact() {
         let old = set_hangup_delay_ms_for_test(30); // 缩到 30ms
@@ -981,7 +979,7 @@ mod e2e {
         assert_eq!(ip, "172.16.106.152", "发往外机目标 IP");
         assert_eq!(*port, 18022);
 
-        // 逐字节对齐 build_stop_frame(outdoorBCD, monitorBCD)（仿 Go selfunlock_test.go:246）。
+        // 逐字节对齐 build_stop_frame(outdoor_bcd, monitor_bcd)。
         let outdoor_bcd = codec::encode_bcd("06020000").unwrap();
         let monitor_bcd = codec::encode_bcd("06021103").unwrap();
         let want = crate::wire18022::build_stop_frame(outdoor_bcd, monitor_bcd);
@@ -1094,7 +1092,7 @@ mod e2e {
         set_hangup_delay_ms_for_test(old);
     }
 
-    // ---- 5.6 dst 收紧 e2e ---------------------------------------------------
+    // ---- dst 收紧 e2e -------------------------------------------------------
 
     /// 非本机室内机 dst / 未配置 src 不触发（filter 收紧）。
     #[test]
@@ -1145,7 +1143,7 @@ mod e2e {
         worker.join().unwrap();
     }
 
-    // ---- 5.7 多 slave 并发 debounce e2e ------------------------------------
+    // ---- 多 slave 并发 debounce e2e ----------------------------------------
 
     /// ≥2 std::thread 并发调 `dispatch_for_test` 共享同一 Listener → 同一外机 ring 仅一个
     /// Job::Unlock（debounce 在单消费者线程顺序判定，无 TOCTOU 双触发）。
@@ -1199,7 +1197,7 @@ mod e2e {
         set_debounce_margin_ms_for_test(old);
     }
 
-    // ---- 5.8 包装层 × 失败分支 e2e（push / no-push）-------------------------
+    // ---- 包装层 × 失败分支 e2e（push / no-push）----------------------------
 
     /// loopback HTTP capture server：accept 一个连接、读 body、回 200，记 body。bind 失败
     /// （沙箱）返 None。仿 daemon_e2e `start_capture_server`。
@@ -1268,8 +1266,7 @@ mod e2e {
         cfg
     }
 
-    /// 成功（result=0）→ push event=unlock（from/to/result）；逐字段断言（锚 Go
-    /// `TestExecuteUnlockFromRing_SuccessPushesUnlockEvent`）。
+    /// 成功（result=0）→ push event=unlock（from/to/result）；逐字段断言。
     #[test]
     fn t5_8_success_pushes_unlock_event() {
         let Some((host, port, captured, srv_thread)) = start_capture_server() else {
@@ -1307,8 +1304,7 @@ mod e2e {
         worker.join().unwrap();
     }
 
-    /// 非 OK（wire-failure → ERR+Some(Other)）→ 不 push（锚 Go
-    /// `TestExecuteUnlockFromRing_FailureNoPush`）。
+    /// 非 OK（wire-failure → ERR+Some(Other)）→ 不 push。
     #[test]
     fn t5_8_failure_does_not_push() {
         let Some((host, port, captured, srv_thread)) = start_capture_server() else {
@@ -1346,7 +1342,7 @@ mod e2e {
         worker.join().unwrap();
     }
 
-    // ---- 5.9 per-ring 失败隔离 e2e -----------------------------------------
+    // ---- per-ring 失败隔离 e2e ---------------------------------------------
 
     /// 单 ring 解析失败（注入 malformed outdoor URI）→ 消费者经 Result 分支 log+跳过，
     /// 后续 ring 仍处理（防御式编码，非 panic-recover）。
@@ -1451,7 +1447,7 @@ mod e2e {
         set_debounce_margin_ms_for_test(old);
     }
 
-    // ---- 5.10 shutdown 不死锁 e2e（关键）-----------------------------------
+    // ---- shutdown 不死锁 e2e（关键）----------------------------------------
 
     /// 消费者 park 在 recv_timeout 等帧时触发 shutdown → 消费者在有限时间内 join 完成、
     /// 不死锁（验 recv_timeout 唤醒路径）。**关键**：裸 recv() 会死锁。
@@ -1499,7 +1495,7 @@ mod e2e {
         drop(listener);
     }
 
-    // ---- 5.11 Job::Hangup 晚于哨兵 e2e -------------------------------------
+    // ---- Job::Hangup 晚于哨兵 e2e ------------------------------------------
 
     /// 计时线程在 worker 已读 Job::Shutdown 后投 Job::Hangup → SendError 被容忍、daemon
     /// 不 panic/不延迟 shutdown（best-effort 丢弃）。

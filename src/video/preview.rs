@@ -1,21 +1,19 @@
-//! preview：preview 信令客户端（移植 Go `internal/video/preview.go` 的
-//! PreviewClient / ValidateStartAck / ValidateStopAck）。
+//! preview：preview 信令客户端。
 //!
-//! req=704 start / req=708 stop 帧 builder 在 [`crate::wire18022`]（design D1：
-//! 与 `build_stop_frame` 同居，共用 `assemble_frame` 与 golden 基建——本模块禁止
+//! req=704 start / req=708 stop 帧 builder 在 [`crate::wire18022`]（与
+//! `build_stop_frame` 同居，共用 `assemble_frame` 与 golden 基建——本模块禁止
 //! 重复帧拼装）。
 //!
-//! 行为等价纪律（spec「preview 信令字节与行为等价」）：
+//! 行为纪律：
 //!   - 每帧独立 TCP socket 直拨 outdoor:18022，**不经骨架 wire-worker**
-//!     （授权见 `rust-daemon-skeleton` MODIFIED delta）
-//!   - 超时结构等价 Go：dial 5s + 连接上独立 deadline 5s（**两段**，最坏总时长
-//!     ~10s，禁合并成单一 5s 总闸）——连接段对齐 Go `conn.SetDeadline(now+5s)`
-//!     的**绝对** deadline 语义（write+read 共享剩余额度）
+//!   - 超时结构：dial 5s + 连接上独立 deadline 5s（**两段**，最坏总时长 ~10s，
+//!     禁合并成单一 5s 总闸）——连接段是**绝对** deadline 语义（write+read 共享
+//!     剩余额度）
 //!   - ack 读取是**单次 read（64B buffer，不循环读、不 read-to-EOF）**：首段含
 //!     magic+req 即过；read 返回 0 字节（对端 FIN）按 silent-FIN 错误分类
 //!   - ack 校验 magic + req 文本匹配、长度宽松（外机不同固件 echo body 可能微差）
 //!
-//! 超时错误是可判别变体（[`PreviewError::Timeout`]），上层（组 F handler）据此
+//! 超时错误是可判别变体（[`PreviewError::Timeout`]），上层 HTTP handler 据此
 //! 映射 503。
 
 use std::io::{self, Read, Write};
@@ -25,7 +23,7 @@ use std::time::{Duration, Instant};
 use super::LogFn;
 use crate::wire18022::{build_start_frame, build_stop_frame};
 
-/// dial 与连接 deadline 的默认值（锚 Go `previewDialTimeout` 5s；两段独立取值）。
+/// dial 与连接 deadline 的默认值（5s；两段独立取值）。
 pub const PREVIEW_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// preview 帧 magic 高/低字节（07 b8）。
@@ -33,19 +31,19 @@ const PREVIEW_MAGIC_HI: u8 = 0x07;
 const PREVIEW_MAGIC_LO: u8 = 0xb8;
 /// 帧头长度（magic 2 + length 2 + reserved 2）。
 const PREVIEW_HEADER_SIZE: usize = 6;
-/// ack 单次 read 的 buffer 上限（锚 Go `buf := make([]byte, 64)`，不循环读）。
+/// ack 单次 read 的 buffer 上限（64B，不循环读）。
 const ACK_READ_BUF: usize = 64;
 
 /// preview 信令错误。
 ///
-/// [`PreviewError::Timeout`] 是可判别哨兵——HTTP 层据此映射 503（spec 场景
-/// 「preview 超时分类」）；[`PreviewError::SilentFin`] 对应 read 0 字节 + EOF
+/// [`PreviewError::Timeout`] 是可判别哨兵——HTTP 层据此映射 503；
+/// [`PreviewError::SilentFin`] 对应 read 0 字节 + EOF
 /// （外机 FIN 不回数据）。
 #[derive(Debug)]
 pub enum PreviewError {
-    /// ack 字节级校验失败（magic / req 文本 / 长度过短）。锚 Go `ErrPreviewBadAck`。
+    /// ack 字节级校验失败（magic / req 文本 / 长度过短）。
     BadAck(String),
-    /// read 返回 0 字节（对端 FIN 不回数据）。锚 Go "empty response (silent FIN)"。
+    /// read 返回 0 字节（对端 FIN 不回数据）。
     SilentFin,
     /// dial / write / read 任一阶段 deadline 击中。
     Timeout {
@@ -97,14 +95,14 @@ fn wrap_timeout(err: io::Error, stage: &'static str) -> PreviewError {
     }
 }
 
-/// 校验 req=705 start ack 帧。锚 Go `ValidateStartAck`。
+/// 校验 req=705 start ack 帧。
 ///
 /// 仅严校 magic + req 文本，长度宽松（echo body 字段长度外机固件可能微差）。
 pub fn validate_start_ack(b: &[u8]) -> Result<(), PreviewError> {
     validate_preview_ack(b, "req=705")
 }
 
-/// 校验 req=709 stop ack 帧。锚 Go `ValidateStopAck`。
+/// 校验 req=709 stop ack 帧。
 pub fn validate_stop_ack(b: &[u8]) -> Result<(), PreviewError> {
     validate_preview_ack(b, "req=709")
 }
@@ -127,15 +125,14 @@ fn validate_preview_ack(b: &[u8], want_text: &str) -> Result<(), PreviewError> {
     Ok(())
 }
 
-/// preview 信令客户端：短连接 dial 18022 + 单次读 ack。锚 Go `PreviewClient`。
+/// preview 信令客户端：短连接 dial 18022 + 单次读 ack。
 ///
 /// 设计：每帧独立 socket（与 wire_sender 一致），避免 connection 复用 race。
 /// 不绑定 source IP——video 流量必须从 br-door 走，外机 IP 在 br-door 子网内，
 /// OS 路由表自动选对接口；与 wire_sender 不同，不需要 SO_BINDTODEVICE。
 ///
 /// `timeout`：test-tunable 注入口（None → 5s）。dial 与连接 deadline **各自独立**
-/// 取该值（两段；组 E teardown 的 best-effort StopPreview 以 3s 构造即得 Go
-/// `context.WithTimeout(3s)` 的等价裁短）。
+/// 取该值（两段；teardown 的 best-effort StopPreview 以 3s 构造裁短）。
 #[derive(Default)]
 pub struct PreviewClient {
     /// 可选 log hook。
@@ -151,7 +148,7 @@ impl PreviewClient {
         }
     }
 
-    /// dial outdoor:18022 发 req=704 + 等 req=705 ack。锚 Go `StartPreview`。
+    /// dial outdoor:18022 发 req=704 + 等 req=705 ack。
     pub fn start_preview(
         &self,
         ip: &str,
@@ -170,7 +167,7 @@ impl PreviewClient {
         Ok(())
     }
 
-    /// dial outdoor:18022 发 req=708 + 等 req=709 ack。锚 Go `StopPreview`。
+    /// dial outdoor:18022 发 req=708 + 等 req=709 ack。
     ///
     /// best-effort：失败让 Manager teardown 决定是否 fatal（一般不 fatal）。
     pub fn stop_preview(
@@ -191,10 +188,10 @@ impl PreviewClient {
         Ok(())
     }
 
-    /// dial + write 帧 + **单次** read ack。锚 Go `dialAndExchange`。
+    /// dial + write 帧 + **单次** read ack。
     ///
     /// 超时两段：dial 独立 `timeout`；连接建立后取**绝对** deadline = now + `timeout`
-    /// （对齐 Go `conn.SetDeadline`，write 与 read 共享剩余额度）。
+    /// （write 与 read 共享剩余额度）。
     fn dial_and_exchange(
         &self,
         ip: &str,
@@ -211,11 +208,11 @@ impl PreviewClient {
         })?;
         let target = SocketAddr::new(addr, port);
 
-        // 第一段：dial 独立 5s（锚 Go net.Dialer{Timeout: 5s}）。
+        // 第一段：dial 独立 5s。
         let mut stream =
             TcpStream::connect_timeout(&target, timeout).map_err(|e| wrap_timeout(e, "dial"))?;
 
-        // 第二段：连接上独立绝对 deadline（锚 Go conn.SetDeadline(now+5s)）。
+        // 第二段：连接上独立绝对 deadline（now + 5s）。
         let deadline = Instant::now() + timeout;
 
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -244,14 +241,13 @@ impl PreviewClient {
         let n = stream.read(&mut buf).map_err(|e| wrap_timeout(e, "read"))?;
         if n == 0 {
             // std read Ok(0) = EOF（对端 FIN 不回数据）→ silent FIN 分类。
-            // 锚 Go：`if n == 0 { if err == nil || err == io.EOF { silent FIN } }`。
             return Err(PreviewError::SilentFin);
         }
         Ok(buf[..n].to_vec())
     }
 }
 
-// ── 单测（mock 18022 server；移植 Go preview_test.go + 任务点名用例）─────────────
+// ── 单测（mock 18022 server + 补充用例）───────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -278,7 +274,7 @@ mod tests {
         hex("07b8180000007265713d3730392671756572792a00008000000002000001")
     }
 
-    // --- validate（移植 Go TestValidateStartAck_* / TestValidateStopAck_*）---
+    // --- validate（start/stop ack 校验用例）---
 
     #[test]
     fn validate_start_ack_accepts() {
@@ -335,7 +331,7 @@ mod tests {
         (addr.ip().to_string(), addr.port())
     }
 
-    /// 成功路径（移植 Go TestPreviewClient_RoundTrip）：mock 收 req=704 帧回 705 ack。
+    /// 成功路径：mock 收 req=704 帧回 705 ack。
     #[test]
     fn start_preview_round_trip() {
         let (frame_tx, frame_rx) = mpsc::channel::<Vec<u8>>();
@@ -476,8 +472,7 @@ mod tests {
         );
     }
 
-    /// dial 失败（移植 Go TestPreviewClient_DialFailReturnsError）：关死端口 → 错误
-    /// （refused 是 Io，非 BadAck/SilentFin）。
+    /// dial 失败：关死端口 → 错误（refused 是 Io，非 BadAck/SilentFin）。
     #[test]
     fn start_preview_dial_fail() {
         let ln = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -501,8 +496,8 @@ mod tests {
         );
     }
 
-    /// 慢速分段送达：单次 read 读到多少算多少——首段含 magic+req 即过（spec 场景
-    /// 「ack 单次 read 语义」）。mock 先送含 req=705 的首段，停顿后再送剩余字节；
+    /// 慢速分段送达：单次 read 读到多少算多少——首段含 magic+req 即过。
+    /// mock 先送含 req=705 的首段，停顿后再送剩余字节；
     /// 客户端不等第二段。
     #[test]
     fn start_preview_single_read_first_segment_suffices() {

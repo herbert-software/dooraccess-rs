@@ -1,14 +1,11 @@
-//! 烤好的 BPF filter 常量（组 A，task 6.1）。
+//! 烤好的 BPF filter 常量。
 //!
-//! 两个 filter 静态（"udp dst port 6672" / "tcp port 18022"），Go 运行时
-//! `bpf.Assemble`（listener.go buildBPFFilter）是纯浪费——这里烤成 `const [SockFilter; N]`，
-//! **不移植汇编器**（design D-D）。
+//! 两个 filter 静态（"udp dst port 6672" / "tcp port 18022"）烤成 `const [SockFilter; N]`，
+//! 运行时不跑 BPF 汇编器（纯浪费）。
 //!
-//! **真相来源（SoT）= Go `bpf.Assemble()` 导出 golden**。下面的字节值由
-//! `golang.org/x/net/bpf.Assemble` 对 `listen6672/listener.go buildBPFFilter`(126 起) 与
-//! `listen18022/listener.go buildBPFFilter`(224 起) 的 `[]bpf.Instruction` 逐指令汇编得到
-//! （2026-06-08 经 scratch dump 验证）。后续组 E 会用 `testdata/golden/bpf.txt` golden 逐字段
-//! 验证字节一致；改 filter 须先改 Go（有 Assemble 越界兜底）再重导。
+//! **真相来源 = committed golden 字节**。下面的字节值是这两个 filter 的
+//! `[]bpf.Instruction` 逐指令汇编结果（经 scratch dump 验证）。`testdata/golden/bpf.txt`
+//! golden 逐字段验证字节一致；改 filter 须同步更新 golden 再重导。
 //!
 //! 字段：`code:u16, jt:u8, jf:u8, k:u32`（= `libc::sock_filter`）。
 
@@ -21,7 +18,7 @@ const fn ins(code: u16, jt: u8, jf: u8, k: u32) -> SockFilter {
 
 /// "udp dst port 6672" filter（11 条）。
 ///
-/// 对照 Go `listen6672 buildBPFFilter` → `bpf.Assemble` 输出：
+/// 汇编后的指令序列：
 /// ```text
 /// [ 0] op=0x0028 jt=0 jf=0 k=0x0000000c   LoadAbsolute off=12 size=2 (ethertype)
 /// [ 1] op=0x0015 jt=0 jf=8 k=0x00000800   JEQ 0x0800 ? next : drop(10)
@@ -51,7 +48,7 @@ pub const BPF_6672: [SockFilter; 11] = [
 
 /// "tcp port 18022" filter（13 条；src 或 dst = 18022 都接受）。
 ///
-/// 对照 Go `listen18022 buildBPFFilter` → `bpf.Assemble` 输出：
+/// 汇编后的指令序列：
 /// ```text
 /// [ 0] op=0x0028 jt=0  jf=0  k=0x0000000c  LoadAbsolute off=12 size=2 (ethertype)
 /// [ 1] op=0x0015 jt=0  jf=10 k=0x00000800  JEQ 0x0800 ? next : drop(12)
@@ -98,8 +95,8 @@ pub fn as_fprog(filter: &'static [SockFilter]) -> SockFprog {
 mod tests {
     use super::*;
 
-    /// task 6.3 sanity：每条 jump 指令的 jt/jf 偏移不越界（≤ len-1-idx）。
-    /// 抓手抄 const 笔误（组 E 后续补对 Go golden 的逐字段断言）。
+    /// sanity：每条 jump 指令的 jt/jf 偏移不越界（≤ len-1-idx）。
+    /// 抓手抄 const 笔误（另有对 golden 字节的逐字段断言）。
     fn assert_jumps_in_bounds(prog: &[SockFilter]) {
         let len = prog.len();
         for (idx, f) in prog.iter().enumerate() {

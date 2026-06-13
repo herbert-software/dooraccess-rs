@@ -1,10 +1,10 @@
-//! HTTP/1.1 response writer（复刻 Go `response.go`）。
+//! HTTP/1.1 response writer。
 
 use std::io::{self, BufWriter, Write};
 
 use super::{status_text, Header, ResponseWriter, STATUS_OK};
 
-/// 具体 `ResponseWriter` 实现（内部 `BufWriter`，与 Go `bufio.Writer` 对齐）。
+/// 具体 `ResponseWriter` 实现（内部 `BufWriter`）。
 pub struct ResponseWriterImpl<W: Write> {
     bw: BufWriter<W>,
     headers: Header,
@@ -69,7 +69,7 @@ impl<W: Write> ResponseWriter for ResponseWriterImpl<W> {
 
         // 按 key 排序后写,保证输出确定性（`Header` 内部是 HashMap,iter 序随机会让
         // HTTP 响应 header 顺序每次不同；HTTP 语义与顺序无关、HACS 按名解析,但 byte-exact
-        // golden / 跨语言 parity 需确定序）。与 Go `httpx/response.go` 的 sort.Strings 对齐。
+        // golden / 跨语言 parity 需确定序）。
         let mut entries: Vec<(&String, &Vec<String>)> = self.headers.iter().collect();
         entries.sort_by(|a, b| a.0.cmp(b.0));
         for (k, vals) in entries {

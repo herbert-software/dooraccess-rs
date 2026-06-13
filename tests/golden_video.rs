@@ -1,6 +1,6 @@
-//! video golden parity 回归（组 C 协议字节层 + 组 D preview ack / RTCP）。
+//! video golden parity 回归（协议字节层 + preview ack / RTCP）。
 //!
-//! 读 Go 侧导出的三份 golden：
+//! 读 committed 的三份 golden 向量：
 //!   - `testdata/golden/video_wire.txt`：req=704 start / req=708 stop 帧（多组 BCD）
 //!     与 start_stop_diff 行 + **ack_ok/ack_err 行**（`validate_start_ack` /
 //!     `validate_stop_ack` 接受/拒绝集）。
@@ -9,9 +9,9 @@
 //!     两个 NIL 边界）/ seq_header_tag / nalu_tag×4。
 //!
 //!   - `testdata/golden/video_rtcp.txt`：rr / sdes / rrsdes / bye ×3 组 SSRC
-//!     逐字节（CNAME 字面 `"dooraccess-go"`，design D7 golden 纪律）。
+//!     逐字节（CNAME 字面 `"dooraccess-go"`）。
 //!
-//! Rust CI 不依赖 Go：向量已 committed，本测试只读静态文件。
+//! 向量已 committed，本测试只读静态文件。
 
 use std::fs;
 use std::path::PathBuf;
@@ -160,7 +160,7 @@ fn golden_video_wire_frames() {
 }
 
 /// video_rtcp.txt：RR / SDES / RR+SDES 复合 / BYE 复合逐字节 golden
-/// （×3 组 SSRC；CNAME 字面 `"dooraccess-go"`——design D7 禁改名）。
+/// （×3 组 SSRC；CNAME 字面 `"dooraccess-go"`——禁改名）。
 #[test]
 fn golden_video_rtcp() {
     let text = load_golden("video_rtcp.txt");

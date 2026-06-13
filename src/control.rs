@@ -1,6 +1,6 @@
-//! 控制面 HTTP 中间件链 + JSON 响应 helper（Phase2 G4）。
+//! 控制面 HTTP 中间件链 + JSON 响应 helper。
 //!
-//! 复刻 Go `internal/http8080/json_helpers.go` 中间件字节契约；endpoint handler 由 G5/G6 填充。
+//! 中间件字节契约（method/content-type/stations 守卫 + JSON 响应组装）。
 
 #[allow(unused_imports)]
 use std::io::{self, Read, Write};
@@ -27,24 +27,24 @@ use crate::video::session::{
 use crate::video::transmux::StreamWriter;
 use crate::video::SharedLogFn;
 
-/// Go `httpx.StatusUnsupportedMedia`（`types.go`）；`httpx/mod.rs` 未导出，本模块自用。
+/// HTTP 415 Unsupported Media Type；`httpx/mod.rs` 未导出，本模块自用。
 const STATUS_UNSUPPORTED_MEDIA: u16 = 415;
 
-/// Go `httpx.StatusServiceUnavailable`（503）；wire-failure 默认分支（Timeout/其它下游故障）
-/// 用之（锚 Go `respondWireFailure` handlers.go:708）。`httpx/mod.rs` 未导出，本模块自用。
+/// HTTP 503 Service Unavailable；wire-failure 默认分支（Timeout/其它下游故障）
+/// 用之。`httpx/mod.rs` 未导出，本模块自用。
 const STATUS_SERVICE_UNAVAILABLE: u16 = 503;
 
-/// Go `httpx.StatusConflict`（409）；/video/start 单 active session 冲突分支用。
+/// HTTP 409 Conflict；/video/start 单 active session 冲突分支用。
 const STATUS_CONFLICT: u16 = 409;
 
-/// Go `httpx.StatusGatewayTimeout`（504）；stream.flv no-keyframe / missing-SPS-PPS 分支用。
+/// HTTP 504 Gateway Timeout；stream.flv no-keyframe / missing-SPS-PPS 分支用。
 const STATUS_GATEWAY_TIMEOUT: u16 = 504;
 
-/// handler 层 JSON body 读取上限（Go `parseJSONBody` `LimitReader(1MB)`）。
+/// handler 层 JSON body 读取上限（1MB）。
 pub const MAX_JSON_BODY_BYTES: u64 = 1024 * 1024;
 
 // ---------------------------------------------------------------------------
-// JSON 响应 helper（Go `json_helpers.go` writeJSON / errorJSON / parseJSONBody）
+// JSON 响应 helper（write_json / error_json / parse_json_body）
 // ---------------------------------------------------------------------------
 
 /// 写 HTTP JSON 响应：`Content-Type: application/json` + `Content-Length` + struct marshal body。
@@ -79,7 +79,7 @@ pub fn error_json(w: &mut dyn ResponseWriter, status: u16, msg: &str) {
 ///
 /// **注**：`httpx::Request.body` 为已缓冲的 `Vec<u8>`（parser 按 Content-Length 读入内存）。
 /// handler 仅持 `&Request` 时经 `read_request_body` 以 `&[u8]`（impl Read）读取，无需 unsafe。
-/// 本函数仍接受 `&mut dyn Read` 与 Go `parseJSONBody(r.Body)` 对齐（reader 抽象保留）。
+/// 本函数仍接受 `&mut dyn Read`（reader 抽象保留，便于复用与测试）。
 pub fn parse_json_body(reader: &mut dyn Read) -> Result<Vec<u8>, String> {
     let raw = read_json_body(reader)?;
     if raw.is_empty() {
@@ -296,8 +296,7 @@ impl<'a> JsonParser<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// 中间件（Go `json_helpers.go` methodGuard / requireJSONContentType /
-// requireStationsConfigured）
+// 中间件（method_guard / require_json_content_type / require_stations_configured）
 // ---------------------------------------------------------------------------
 
 /// method 校验中间件：不匹配 → 405 + `Allow` + JSON error body。
@@ -357,7 +356,7 @@ impl<H: Handler> Handler for RequireJsonContentType<H> {
     }
 }
 
-/// 大小写不敏感校验 media type 是否为 `application/json`（Go `isJSONMediaType`）。
+/// 大小写不敏感校验 media type 是否为 `application/json`。
 pub fn is_json_media_type(ct: &str) -> bool {
     if ct.is_empty() {
         return false;
@@ -399,13 +398,12 @@ impl<H: Handler> Handler for RequireStationsConfigured<H> {
 }
 
 // ---------------------------------------------------------------------------
-// 中间件链组合（G6 mux 注册用）
+// 中间件链组合（mux 注册用）
 // ---------------------------------------------------------------------------
 
 /// 业务 endpoint 标准链：`POST` + JSON Content-Type + stations guard → inner。
 ///
-/// 对齐 Go `server.go`：
-/// `methodGuardPOST(requireJSONContentType(s.requireStationsConfigured(handler)))`
+/// 即 `method_guard_post(require_json_content_type(require_stations_configured(handler)))`。
 pub fn chain_business_post<H: Handler>(
     cfg: Arc<Config>,
     inner: H,
@@ -417,20 +415,20 @@ pub fn chain_business_post<H: Handler>(
 
 /// 控制面 POST endpoint 链：`POST` + JSON Content-Type（无 stations guard）。
 ///
-/// 对齐 Go `/auto_unlock` `/auto_hangup` 注册。
+/// `/auto_unlock` `/auto_hangup` 注册用之。
 pub fn chain_control_post<H: Handler>(inner: H) -> MethodGuard<RequireJsonContentType<H>> {
     method_guard_post(require_json_content_type(inner))
 }
 
 // ---------------------------------------------------------------------------
-// 运行时 automation flag + 持久化 / push hook（G6）
+// 运行时 automation flag + 持久化 / push hook
 // ---------------------------------------------------------------------------
 
-/// daemon 自开锁/挂断两个运行时可变 flag（对齐 Go `AutomationState`）。
+/// daemon 自开锁/挂断两个运行时可变 flag。
 ///
 /// 内部两 flag 用 `Arc<AtomicBool>` 持有，故 [`AutomationState::share`] 可派生**共享同一组
 /// 原子真值**的第二个 handle——daemon 同一份 state 既注入 HTTP server（handler 拨动）又供
-/// Persister value_source 读运行时真值（Phase 4 G3a 接线 §5.4/§6.4：单一 state 不分叉）。
+/// Persister value_source 读运行时真值（单一 state 不分叉）。
 pub struct AutomationState {
     auto_unlock: Arc<AtomicBool>,
     auto_hangup: Arc<AtomicBool>,
@@ -448,8 +446,7 @@ impl AutomationState {
     ///
     /// daemon 用它把同一份 automation state 既给 HTTP server（handler `store_*` 拨动）又给
     /// Persister value_source（`load_*` 读运行时真值）——两 handle 背后是同一对
-    /// `Arc<AtomicBool>`，endpoint 拨动后 persister 立即读到翻转值（不分叉，对齐 Go 单一
-    /// `automationState` 注入两处）。
+    /// `Arc<AtomicBool>`，endpoint 拨动后 persister 立即读到翻转值（不分叉，单一 state 注入两处）。
     pub fn share(&self) -> Self {
         Self {
             auto_unlock: Arc::clone(&self.auto_unlock),
@@ -480,7 +477,7 @@ impl Default for AutomationState {
     }
 }
 
-/// Phase 2 持久化 hook（`None` = no-op；真原子写盘留 Phase 4）。
+/// 持久化 hook（`None` = no-op；真原子写盘由 daemon 注入）。
 pub trait PersistHook: Send + Sync {
     fn persist(&self);
 }
@@ -494,24 +491,24 @@ impl PersistHook for FnPersistHook {
     }
 }
 
-/// 反向 push hook（`None` = no-op；对齐 Go `Pusher==nil`）。
+/// 反向 push hook（`None` = no-op）。
 pub trait Pusher: Send + Sync {
     fn push(&self, event: &str, fields: &[(&str, &str)]);
 }
 
-/// 手动 `/unlock` 经 wire-worker 的派发缝（G3b 决策 5）。
+/// 手动 `/unlock` 经 wire-worker 的派发缝。
 ///
 /// `handle_unlock` 不再 handler 局部直调 `Sender`，而是经此 trait 把 unlock 参数投到
 /// **单 wire-worker 队列**（[`crate::daemon::Job::Unlock`]）并阻塞等 worker 经一次性 reply
-/// channel 回灌 [`UnlockOutcome`]——结果含 `terminated_by_bye` / `wire_kind`，足以做 Go
-/// `handleUnlock` 的 4 分支 HTTP 映射（OK / 业务错 / bye→silent-FIN→-103 / wire-failure 503）。
+/// channel 回灌 [`UnlockOutcome`]——结果含 `terminated_by_bye` / `wire_kind`，足以做
+/// 4 分支 HTTP 映射（OK / 业务错 / bye→silent-FIN→-103 / wire-failure 503）。
 ///
-/// 与 [`Sender`] 的区别（决策 5）：`Sender::execute_unlock` 只返 `Result<i32>`（无 bye/wire_kind
+/// 与 [`Sender`] 的区别：`Sender::execute_unlock` 只返 `Result<i32>`（无 bye/wire_kind
 /// 出参，做不出 4 分支）；本 trait 返完整 `UnlockOutcome`。daemon 生产用 worker-backed 实现
-/// （main.rs），Phase 2 测试用 [`dispatch_from_sender`] 把既有 `Sender` 退化包装（无 bye/wire_kind）。
+/// （main.rs），测试用 [`dispatch_from_sender`] 把既有 `Sender` 退化包装（无 bye/wire_kind）。
 pub trait UnlockDispatch: Send + Sync {
     /// 派发一次 unlock（投 worker + 等 reply）；worker 已退 / panic → 退化 wire-failure
-    /// `UnlockOutcome`（result=-1，禁永等、禁 panic，决策 8）。
+    /// `UnlockOutcome`（result=-1，禁永等、禁 panic）。
     fn dispatch(
         &self,
         caller_bcd: [u8; 4],
@@ -521,12 +518,12 @@ pub trait UnlockDispatch: Send + Sync {
     ) -> UnlockOutcome;
 }
 
-/// 把既有 [`Sender`] 退化包装成 [`UnlockDispatch`]（Phase 2 测试 / 兼容路径）。
+/// 把既有 [`Sender`] 退化包装成 [`UnlockDispatch`]（测试 / 兼容路径）。
 ///
 /// `Sender::execute_unlock` 只返 `Result<i32>` → 退化 `UnlockOutcome`：`Ok(code)` →
 /// `{result:code, terminated_by_bye:false, wire_kind:None}`；`Err` → `{result:-1, ...None}`。
-/// 故经此适配的 `/unlock` 永不命中 4 分支里的 bye/wire-failure（503）分支——与 Phase 2
-/// 既有行为（wire_err → 200 + result=-1）逐字一致，不引入 503 回归。
+/// 故经此适配的 `/unlock` 永不命中 4 分支里的 bye/wire-failure（503）分支——与
+/// 直调 Sender 的既有行为（wire_err → 200 + result=-1）逐字一致，不引入 503 回归。
 pub fn dispatch_from_sender(sender: Arc<dyn Sender>) -> Arc<dyn UnlockDispatch> {
     Arc::new(SenderDispatch(sender))
 }
@@ -571,19 +568,19 @@ struct ServerInner {
 /// 控制面 HTTP server 依赖（cfg / automation / persist / pusher / video）。
 pub struct Server {
     inner: Arc<ServerInner>,
-    /// `/video/*` 三入口共用的 video Manager（锚 Go `Server.VideoMgr`）。
+    /// `/video/*` 三入口共用的 video Manager。
     /// `None` = `cfg.video.forward=false` → 三入口 503 nil-guard（**先于一切 body
-    /// 解析**，spec「daemon 编排接入」需求）。路由本身**无条件注册**（不随其增减）。
+    /// 解析**）。路由本身**无条件注册**（不随其增减）。
     video: Option<Arc<VideoManager>>,
-    /// video 路径专用 log hook（`video: stream writer exited: ...` 行；锚 Go `s.logf`）。
+    /// video 路径专用 log hook（`video: stream writer exited: ...` 行）。
     video_logf: Option<SharedLogFn>,
 }
 
 impl Server {
-    /// 用既有 [`Sender`] 构造（Phase 2 兼容路径；内部经 [`dispatch_from_sender`] 退化包装）。
+    /// 用既有 [`Sender`] 构造（兼容路径；内部经 [`dispatch_from_sender`] 退化包装）。
     ///
     /// daemon 生产路径用 [`Server::with_dispatch`] 注入 worker-backed [`UnlockDispatch`]
-    /// （决策 5：手动 unlock 经 wire-worker）。
+    /// （手动 unlock 经 wire-worker）。
     pub fn new(
         cfg: Config,
         version: impl Into<String>,
@@ -602,7 +599,7 @@ impl Server {
         )
     }
 
-    /// 用 worker-backed [`UnlockDispatch`] 构造（决策 5：`/unlock` 投 wire-worker 队列、
+    /// 用 worker-backed [`UnlockDispatch`] 构造（`/unlock` 投 wire-worker 队列、
     /// 经 reply channel 等 [`UnlockOutcome`]、做 4 分支 HTTP 映射）。
     pub fn with_dispatch(
         cfg: Config,
@@ -633,14 +630,14 @@ impl Server {
         self.video_logf = logf;
     }
 
-    /// 同步触发 push；`pusher` 为 `None` 时 no-op（无 WG 跟踪，Phase 4 再补）。
+    /// 同步触发 push；`pusher` 为 `None` 时 no-op（无 WG 跟踪）。
     pub fn maybe_push(&self, event: &str, fields: &[(&str, &str)]) {
         if let Some(p) = &self.inner.pusher {
             p.push(event, fields);
         }
     }
 
-    /// 注册控制面 + 元信息 endpoint 的 `ServeMux` handler（path 对齐 Go `server.go`）。
+    /// 注册控制面 + 元信息 endpoint 的 `ServeMux` handler。
     pub fn handler(&self) -> MuxHandler {
         let inner = Arc::clone(&self.inner);
         let business_cfg = Arc::new(inner.cfg.clone());
@@ -710,10 +707,10 @@ impl Server {
             mux.handle("/unlock", Some(Box::new(h)));
         }
 
-        // 视频转发 endpoints（锚 Go server.go:202-206）：**无条件注册**——不随
+        // 视频转发 endpoints：**无条件注册**——不随
         // cfg.video.forward 增减；forward=false 时 Manager 缺位 → handler 首判
-        // nil-guard 503（先于一切 body 解析）。start/stop 走与 Go 等价的中间件链
-        // methodGuardPOST + requireJSONContentType（405/415）；动态路径用前缀匹配派发。
+        // nil-guard 503（先于一切 body 解析）。start/stop 走中间件链
+        // method_guard_post + require_json_content_type（405/415）；动态路径用前缀匹配派发。
         {
             let st = Arc::clone(&inner);
             let mgr = self.video.clone();
@@ -885,20 +882,20 @@ fn handle_unlock(st: &ServerInner, w: &mut dyn ResponseWriter, r: &Request) {
         }
     };
 
-    // 决策 5：投 wire-worker 队列、阻塞等 worker 经 reply channel 回灌 UnlockOutcome
-    // （worker 已退/panic 时 dispatch 返退化 wire-failure outcome，不永等不 panic，决策 8）。
+    // 投 wire-worker 队列、阻塞等 worker 经 reply channel 回灌 UnlockOutcome
+    // （worker 已退/panic 时 dispatch 返退化 wire-failure outcome，不永等不 panic）。
     let outcome = st
         .dispatch
         .dispatch(caller_bcd, callee_bcd, &target_ip, target_port);
     respond_unlock_outcome(st, w, "unlock", &outcome, &from, &to);
 }
 
-/// 把 [`UnlockOutcome`] 映射成 4 分支 HTTP 响应（锚 Go `handleUnlock` handlers.go:195-209）：
+/// 把 [`UnlockOutcome`] 映射成 4 分支 HTTP 响应：
 ///   ① `result==OK` → 200（OK 不 push：`respond_business_result` 仅 result≠OK 时 push）。
 ///   ② `result==ERR && wire_kind==None`（genuine 业务错：外机响应但 body 校验失败，不重试）
 ///      → 200 + business push。wire 失败折叠成 ERR 但 wire_kind=Some 的落分支④ → 503。
 ///   ③ `terminated_by_bye`（ring session 已结束）→ silent-FIN 语义 → 200 + result=-103 push。
-///   ④ 默认（重试耗尽）→ 据 `wire_kind` 分类（锚 Go `respondWireFailure`）：
+///   ④ 默认（重试耗尽）→ 据 `wire_kind` 分类（见 [`respond_wire_failure`]）：
 ///        SilentFin → 200 + result=-103（业务，daemon 健康）；
 ///        Timeout/其它 → 503 + result（下游故障，daemon 健康）。
 fn respond_unlock_outcome(
@@ -921,8 +918,8 @@ fn respond_unlock_outcome(
         return;
     }
     if outcome.terminated_by_bye {
-        // ③ bye → ring session 已结束 → 业务级 no-ring（-103）最合适（传 lastWireErr 可能是
-        //    timeout，会误导成 503/-104，锚 Go handlers.go:201-204）。
+        // ③ bye → ring session 已结束 → 业务级 no-ring（-103）最合适（传末次 wire err 可能是
+        //    timeout，会误导成 503/-104）。
         respond_wire_failure(st, w, event, Some(WireKind::SilentFin), from, to);
         return;
     }
@@ -930,10 +927,10 @@ fn respond_unlock_outcome(
     respond_wire_failure(st, w, event, outcome.wire_kind, from, to);
 }
 
-/// wire-failure 翻译成 HTTP status + result（锚 Go `respondWireFailure` handlers.go:691）：
+/// wire-failure 翻译成 HTTP status + result：
 ///   - SilentFin → 200 + result=-103（业务：外机 ring 状态机拒绝，daemon 健康，走 push）。
 ///   - Timeout → 503 + result=-5（下游失败，daemon 健康）。
-///   - None（无 wire 错，cancel/cap 在首次尝试前命中）→ 503 + result=0（锚 Go classifyWireErr(nil)=OK）。
+///   - None（无 wire 错，cancel/cap 在首次尝试前命中）→ 503 + result=0（无 wire 错分类为 OK）。
 ///   - 其它 → 503 + result=-1。
 fn respond_wire_failure(
     st: &ServerInner,
@@ -945,11 +942,11 @@ fn respond_wire_failure(
 ) {
     let result_code = classify_wire_kind(wire_kind);
     if result_code == result::NO_RING {
-        // SilentFin 是业务结果（外机协议层拒绝）→ 200 + push（锚 Go handlers.go:693-696）。
+        // SilentFin 是业务结果（外机协议层拒绝）→ 200 + push。
         respond_business_result(st, w, event, result_code, from, to);
         return;
     }
-    // Timeout / 其它 → 503 + push（HTTP 状态反映下游故障，锚 Go handlers.go:698-708）。
+    // Timeout / 其它 → 503 + push（HTTP 状态反映下游故障）。
     push_business_fields(st, event, result_code, from, to);
     write_json(
         w,
@@ -958,14 +955,14 @@ fn respond_wire_failure(
     );
 }
 
-/// wire 分类 → result code（锚 Go `classifyWireErr` handlers.go:714）。
+/// wire 分类 → result code。
 fn classify_wire_kind(wire_kind: Option<WireKind>) -> i32 {
     match wire_kind {
         Some(WireKind::SilentFin) => result::NO_RING,
         Some(WireKind::Timeout) => result::TIMEOUT,
-        // 无 wire 错（cancel/cap 在首次尝试前命中）→ OK(0)，锚 Go classifyWireErr(nil)=ResultOK。
+        // 无 wire 错（cancel/cap 在首次尝试前命中）→ OK(0)。
         None => result::OK,
-        // Retryable（耗尽后）/ Other → -1（下游故障，锚 Go classifyWireErr 末 ResultErr）。
+        // Retryable（耗尽后）/ Other → -1（下游故障）。
         Some(WireKind::Retryable) | Some(WireKind::Other) => result::ERR,
     }
 }
@@ -988,9 +985,9 @@ fn respond_business_result(
     );
 }
 
-/// business-result push（非 OK 时；锚 Go `respondBusinessResult`/`respondWireFailure` 的
-/// `asyncPush` from/to 取舍）。经注入的 [`Pusher`]（daemon 生产是 detached `spawn_push`，CR-M1）
-/// 发——本函数只组字段，detached 与否由 Pusher 实现决定（决策 3：business push 属骨架 IN、off worker）。
+/// business-result push（非 OK 时）：按 from/to 是否为空组装字段。经注入的 [`Pusher`]
+/// （daemon 生产是 detached `spawn_push`）发——本函数只组字段，detached 与否由 Pusher
+/// 实现决定（business push off worker）。
 fn push_business_fields(st: &ServerInner, event: &str, result_code: i32, from: &str, to: &str) {
     let code = result_code.to_string();
     match (from.is_empty(), to.is_empty()) {
@@ -1017,8 +1014,8 @@ fn maybe_push_inner(st: &ServerInner, event: &str, fields: &[(&str, &str)]) {
 
 fn parse_unlock_body(raw: &[u8]) -> Result<(String, String), String> {
     if raw.is_empty() {
-        // Go parseJSONBody 查 RAW len==0 → 返 nil → body 零值（To/From=""）→ 落到 caller
-        // 的 `to.is_empty()` → "missing 'to' field"。复刻之（非 "empty body" 错）。
+        // 空 body（RAW len==0）→ body 零值（to/from=""）→ 落到 caller 的 `to.is_empty()`
+        // → "missing 'to' field"（非 "empty body" 错）。
         return Ok((String::new(), String::new()));
     }
     let trimmed = trim_ascii_whitespace(raw);
@@ -1084,7 +1081,7 @@ fn extract_json_string_field(input: &[u8], want_key: &str) -> Result<String, &'s
     if pos < bytes.len() && bytes[pos] == b'}' {
         return Err("missing field"); // {}
     }
-    // 扫到末尾、保留**最后**一次匹配（Go json.Unmarshal 重复 key 取 last-wins）。
+    // 扫到末尾、保留**最后**一次匹配（重复 key 取 last-wins）。
     let mut last: Option<String> = None;
     loop {
         skip_json_ws(bytes, &mut pos);
@@ -1124,10 +1121,10 @@ fn read_request_body(r: &Request) -> Result<Vec<u8>, String> {
 }
 
 fn parse_auto_toggle_body(raw: &[u8]) -> Result<bool, String> {
-    // Go json.Unmarshal 到 autoToggleBody{On bool}：空 body / `{}` / 缺 on 字段 / `null`
-    // / `{"on":null}` 均留零值 On=false（非错误）→ 200。仅非法 JSON → 400。
-    // **关键**：Go parseJSONBody 查 **RAW 字节** `len(raw)==0`（非 trim 后），故纯空白
-    // body（"   "）非空 → 交 Unmarshal → 报错 → 400（不是零值 200）。复刻该边界。
+    // 解析 `{"on":bool}`：空 body / `{}` / 缺 on 字段 / `null` / `{"on":null}` 均留零值
+    // on=false（非错误）→ 200。仅非法 JSON → 400。
+    // **关键**：空判断查 **RAW 字节** `len(raw)==0`（非 trim 后），故纯空白
+    // body（"   "）非空 → 交解析 → 报错 → 400（不是零值 200）。
     if raw.is_empty() {
         return Ok(false);
     }
@@ -1135,7 +1132,7 @@ fn parse_auto_toggle_body(raw: &[u8]) -> Result<bool, String> {
     if trimmed == b"null" {
         return Ok(false);
     }
-    // 纯空白（raw 非空、trimmed 空）落到 extract → "expected object" → Err → 400（同 Go）。
+    // 纯空白（raw 非空、trimmed 空）落到 extract → "expected object" → Err → 400。
     match extract_json_bool_field(trimmed, "on") {
         Ok(v) => Ok(v),
         Err("missing field") => Ok(false),
@@ -1153,7 +1150,7 @@ fn extract_json_bool_field(input: &[u8], want_key: &str) -> Result<bool, &'stati
     if pos < bytes.len() && bytes[pos] == b'}' {
         return Err("missing field"); // {}
     }
-    // 扫到末尾、保留**最后**一次匹配（Go json.Unmarshal 重复 key 取 last-wins）。
+    // 扫到末尾、保留**最后**一次匹配（重复 key 取 last-wins）。
     let mut last: Option<bool> = None;
     loop {
         skip_json_ws(bytes, &mut pos);
@@ -1214,7 +1211,7 @@ fn read_json_bool(bytes: &[u8], pos: &mut usize) -> Result<bool, &'static str> {
         *pos += 5;
         return Ok(false);
     }
-    // Go json.Unmarshal：`{"on":null}` 把 bool 字段留零值（false）、不报错。复刻之。
+    // `{"on":null}` 把 bool 字段留零值（false）、不报错。
     if bytes[*pos..].starts_with(b"null") {
         *pos += 4;
         return Ok(false);
@@ -1343,19 +1340,19 @@ fn expect_json_literal(bytes: &[u8], pos: &mut usize, lit: &str) -> Result<(), &
 }
 
 // ---------------------------------------------------------------------------
-// /video/* endpoint（组 F，锚 Go `video_handlers.go` 全部 + `server.go:202-206`）
+// /video/* endpoint
 // ---------------------------------------------------------------------------
 
-/// stream.flv 等首 IDR 的超时上限（毫秒）。锚 Go `streamStartupTimeoutNs`（5s）。
+/// stream.flv 等首 IDR 的超时上限（毫秒；默认 5s）。
 ///
-/// test-tunable：D8 套路但 **`AtomicU32` 毫秒**（MIPS32 禁 64-bit 原子）；
+/// test-tunable **`AtomicU32` 毫秒**（MIPS32 禁 64-bit 原子）；
 /// 跨测试切换值经 atomic（多测试并行下无 data race）。
 static STREAM_STARTUP_TIMEOUT_MS: AtomicU32 = AtomicU32::new(5_000);
 
-/// 长连接 stream consumer 的 TTL 心跳间隔（毫秒）。锚 Go `ttlRefreshPeriodNs`（30s）。
+/// 长连接 stream consumer 的 TTL 心跳间隔（毫秒；默认 30s）。
 static TTL_REFRESH_PERIOD_MS: AtomicU32 = AtomicU32::new(30_000);
 
-/// 改写 stream 首 IDR 等待超时（返旧值；测试压缩用，锚 Go `setTestStartupTimeout`）。
+/// 改写 stream 首 IDR 等待超时（返旧值；测试压缩用）。
 pub fn set_stream_startup_timeout_ms(ms: u32) -> u32 {
     STREAM_STARTUP_TIMEOUT_MS.swap(ms, Ordering::SeqCst)
 }
@@ -1373,16 +1370,16 @@ fn ttl_refresh_period() -> Duration {
     Duration::from_millis(u64::from(TTL_REFRESH_PERIOD_MS.load(Ordering::SeqCst)))
 }
 
-/// nil-guard 503 body 字面（锚 Go `video_handlers.go` 三处入口 + `server.go:50`）。
+/// nil-guard 503 body 字面（/video/* 三处入口共用）。
 const VIDEO_NOT_ENABLED: &str = "video forward not enabled";
 
-/// outdoor URI 必须精确匹配 `cfg.Stations[*].SIP` 之一（SSRF 防护 allowlist，
-/// 锚 Go `isOutdoorAllowed`；stations 空集时恒 false = 安全失败）。
+/// outdoor URI 必须精确匹配 `cfg.stations[*].sip` 之一（SSRF 防护 allowlist；
+/// stations 空集时恒 false = 安全失败）。
 fn is_outdoor_allowed(st: &ServerInner, uri: &str) -> bool {
     st.cfg.stations.iter().any(|s| s.sip == uri)
 }
 
-/// [`VideoParseError`] → Go `ParseOutdoor` 错误字面（handler 400 body 嵌入用；
+/// [`VideoParseError`] → outdoor 解析错误字面（handler 400 body 嵌入用；
 /// `session::ParseError` 自身 Display 是诊断格式，HTTP 字面走本路径）。
 fn video_parse_err_msg(e: &VideoParseError, uri: &str) -> String {
     match e {
@@ -1393,11 +1390,10 @@ fn video_parse_err_msg(e: &VideoParseError, uri: &str) -> String {
 
 /// 解析 `/video/start`・`/video/stop` 请求 body，提取 `outdoor` 字段。
 ///
-/// 锚 Go `parseJSONBody` + `json.Unmarshal(videoStartBody)`：
+/// 解析 `{"outdoor":"..."}` body：
 ///   - raw 空（0 字节）→ 零值（outdoor=""，调用方落 missing-outdoor 400）
-///   - 语法非法 → `parse JSON body: <Go scanner 字面>`（错误字面即契约，golden 逐字）
-///   - 字段缺失 / 非 string 值 → 零值（缺失对齐 Go；非 string 值 Go 会报 unmarshal
-///     type error，本实现退化为零值——超出 golden 集的已知差异，登记于组 F 报告）
+///   - 语法非法 → `parse JSON body: <scanner 错误字面>`（错误字面即契约，逐字）
+///   - 字段缺失 / 非 string 值 → 零值（非 string 值本实现退化为零值，是已知边界）
 fn parse_video_body(raw: &[u8]) -> Result<String, String> {
     if raw.is_empty() {
         return Ok(String::new());
@@ -1409,16 +1405,15 @@ fn parse_video_body(raw: &[u8]) -> Result<String, String> {
     Ok(extract_json_string_field(trimmed, "outdoor").unwrap_or_default())
 }
 
-/// 处理 `POST /video/start`。锚 Go `handleVideoStart`。
+/// 处理 `POST /video/start`。
 ///
-/// 判定顺序（spec「HTTP video endpoint 字节契约等价」）：nil-guard 503 **先于一切
+/// 判定顺序（HTTP video endpoint 字节契约）：nil-guard 503 **先于一切
 /// body 解析**（坏 JSON + forward=false 返 503 非 400）→ 400×4（bad JSON / 缺
 /// outdoor / URI 非法 / allowlist）→ Manager.start → 409 conflict / 503（preview
 /// 超时与其它失败同走 `err.to_string()` body）/ 200 struct 声明序。
 ///
-/// 超时语义：Go 以 10s ctx 包 `VideoMgr.Start`；Rust `Manager::start` 内部各段
-/// 自带 deadline（bind 即时 + preview dial 5s + 连接 5s ≈ 最坏 ~10s），无 handler
-/// 级总闸——最接近形态，差异登记于组 F 报告。
+/// 超时语义：`Manager::start` 内部各段自带 deadline（bind 即时 + preview dial 5s +
+/// 连接 5s ≈ 最坏 ~10s），无 handler 级总闸。
 fn handle_video_start(
     st: &ServerInner,
     video: Option<&Arc<VideoManager>>,
@@ -1475,8 +1470,8 @@ fn handle_video_start(
             ]),
         ),
         Err(e) if e.is_conflict() => error_json(w, STATUS_CONFLICT, &e.to_string()),
-        // preview 超时与其它失败同映射 503 + err 字面 body（锚 Go 两分支同写法；
-        // 分型保留显式以对齐 spec「start 503 三类」枚举）。
+        // preview 超时与其它失败同映射 503 + err 字面 body（分型保留显式以
+        // 区分 start 503 三类枚举）。
         Err(e) if e.is_preview_timeout() => {
             error_json(w, STATUS_SERVICE_UNAVAILABLE, &e.to_string())
         }
@@ -1484,12 +1479,12 @@ fn handle_video_start(
     }
 }
 
-/// 处理 `POST /video/stop`。锚 Go `handleVideoStop`。
+/// 处理 `POST /video/stop`。
 ///
 /// idempotent：无 active session 也 200 + `{"result":0}`；`Manager::stop` 返 `()`
 /// （teardown 内部失败仅由 Manager 自身 log）——**503 仅 nil-guard 一种**，禁把
-/// Stop 失败映射 503。超时语义：Go 的 8s handler ctx 由 `Manager::stop` 自带的
-/// 8s teardown 总预算（`stop_budget`，session.rs）等价覆盖，handler 层无需再包。
+/// Stop 失败映射 503。超时语义：由 `Manager::stop` 自带的 8s teardown 总预算
+/// （`stop_budget`，session.rs）覆盖，handler 层无需再包。
 fn handle_video_stop(
     st: &ServerInner,
     video: Option<&Arc<VideoManager>>,
@@ -1536,15 +1531,14 @@ fn handle_video_stop(
 }
 
 /// 处理 `GET /video/<session_id>/{stream.flv,snapshot.jpg}` 动态路由。
-/// 锚 Go `handleVideoDynamic`。
 ///
-/// 判定顺序（钉死，spec）：nil-guard 503 **最先** → malformed path（拆不出
+/// 判定顺序（钉死）：nil-guard 503 **最先** → malformed path（拆不出
 /// `<uuid>/<res>` 两段）404 → UUID 36 字符校验失败 400（**先于 method**：POST +
 /// 坏 UUID 得 400 非 405）→ 非 GET 405+Allow → session not found 404 → 资源派发
 /// （stream.flv / snapshot.jpg / 其它 404）。
 ///
-/// 此处**不**刷 TTL：只有 stream.flv 且三件套齐（流真的活）才刷（锚 Go 注释——
-/// 否则空 session 的 client retry 会把唯一 active slot 钉死）。
+/// 此处**不**刷 TTL：只有 stream.flv 且三件套齐（流真的活）才刷——否则空 session 的
+/// client retry 会把唯一 active slot 钉死。
 fn handle_video_dynamic(
     video: Option<&Arc<VideoManager>>,
     logf: Option<&SharedLogFn>,
@@ -1593,7 +1587,7 @@ fn handle_video_dynamic(
 /// 把 `&mut dyn ResponseWriter` 适配为 `std::io::Write`（StreamWriter 输出端）。
 ///
 /// per-tag flush：[`StreamWriter`] 每 tag 写后调 `flush()` → 经此适配落到
-/// `ResponseWriter::flush` → chunk 边界即出（锚 Go flushAdapter；flush 错误吞，
+/// `ResponseWriter::flush` → chunk 边界即出（flush 错误吞，
 /// 下一次 write 自然失败退出）。
 struct ResponseBodyWriter<'a> {
     w: &'a mut dyn ResponseWriter,
@@ -1610,9 +1604,8 @@ impl Write for ResponseBodyWriter<'_> {
 }
 
 /// 写 chunked FLV stream 直到 client 断开（write Err）或 session close。
-/// 锚 Go `serveVideoStream`。
 ///
-/// 启动顺序（重要，锚 Go 注释编号）：
+/// 启动顺序（重要）：
 ///  1. 先等首个 IDR（[`stream_startup_timeout`] 上限）：超时 → 504 + 不刷 TTL；
 ///     等待中 buffer 被 close → 503「session closed」（[`WaitIdrError`] 分型）
 ///  2. 二次竞态闸：wait 返回与写头之间被 close → 同 503
@@ -1623,7 +1616,7 @@ impl Write for ResponseBodyWriter<'_> {
 ///  6. 起 TTL refresh 线程（30s tunable 周期；`refresh_ttl` 返 false——session
 ///     消失——即停；stream 结束经 done flag 收口）
 ///  7. `StreamWriter::run`：client 断开 = write Err 退出（不写响应体），打
-///     `video: stream writer exited: ...` 行（对齐 spec stream bullet）
+///     `video: stream writer exited: ...` 行
 fn serve_video_stream(
     mgr: &Arc<VideoManager>,
     logf: Option<&SharedLogFn>,
@@ -1651,7 +1644,7 @@ fn serve_video_stream(
         return;
     }
     // 二次健康闸：起播需要 SPS+PPS+IDR 三者皆缓存；缺 → 504 + 不刷 TTL，
-    // 让 60s TTL 自然 GC 死 session（锚 Go GET 路径 regression 修复）。
+    // 让 60s TTL 自然 GC 死 session。
     if state.frame_buf.latest_idr().is_none() {
         error_json(
             w,
@@ -1690,7 +1683,7 @@ fn serve_video_stream(
 }
 
 /// 每 [`ttl_refresh_period`] 刷一次 session TTL，直到 stream 结束（done 置位）
-/// 或 session 消失（`refresh_ttl` 返 false）。锚 Go `refreshTTLLoop`。
+/// 或 session 消失（`refresh_ttl` 返 false）。
 ///
 /// 分片 park_timeout 轮询 done（≤20ms 响应 stream 收口；daemon shutdown 时
 /// video teardown close FrameBuffer → stream handler 退出 → done 置位收口本线程）。
@@ -1717,7 +1710,7 @@ fn refresh_ttl_loop(mgr: &VideoManager, session_id: &str, done: &AtomicBool) {
 }
 
 /// 处理 snapshot.jpg：503 stub（不实现 H.264 → JPEG，hAP CPU 不够；HACS 走
-/// stream-source ffmpeg fallback）。锚 Go `serveVideoSnapshot`（body 字面 golden）。
+/// stream-source ffmpeg fallback）。body 字面即契约。
 fn serve_video_snapshot(w: &mut dyn ResponseWriter) {
     error_json(
         w,
@@ -1727,18 +1720,18 @@ fn serve_video_snapshot(w: &mut dyn ResponseWriter) {
 }
 
 // ---------------------------------------------------------------------------
-// Go encoding/json 风格语法校验（/video/* body 解析路径专用）
+// encoding/json 风格语法校验（/video/* body 解析路径专用）
 //
-// 错误字面即契约（spec：errorJSON 内嵌 Go 错误字串逐字 golden）——既有最小
-// JSON 校验器（validate_json_syntax）的错误字面是 Rust 自有措辞，video golden
-// 的 bad-JSON 行要求 Go scanner 字面（如 "invalid character 'b' looking for
-// beginning of object key string"）。本节按 Go encoding/json scanner 的主要
-// 状态机消息逐字复刻；非 ASCII 字节的 quote 形态等极端差异登记于组 F 报告。
+// 错误字面即契约（error_json 内嵌的错误字串逐字契约）——既有最小
+// JSON 校验器（validate_json_syntax）的错误字面是另一套措辞，video bad-JSON 行要求
+// 此处的 scanner 字面（如 "invalid character 'b' looking for beginning of object key
+// string"）。本节按该 scanner 的主要状态机消息逐字实现；非 ASCII 字节的 quote 形态等
+// 极端差异是已知边界。
 // ---------------------------------------------------------------------------
 
 const GO_JSON_EOF: &str = "unexpected end of JSON input";
 
-/// Go `quoteChar`：错误消息中的字符引用形态。
+/// 错误消息中的字符引用形态。
 fn go_quote_char(c: u8) -> String {
     match c {
         b'\'' => r#"'\''"#.to_string(),
@@ -1992,7 +1985,7 @@ impl<'a> GoJsonScan<'a> {
     }
 }
 
-/// JSON 语法校验，错误字面对齐 Go `encoding/json` scanner（video body 解析专用）。
+/// JSON 语法校验，错误字面用 encoding/json scanner 风格措辞（video body 解析专用）。
 fn go_json_syntax_check(raw: &[u8]) -> Result<(), String> {
     let mut p = GoJsonScan { b: raw, i: 0 };
     p.value()?;
@@ -2090,12 +2083,12 @@ mod tests {
         cfg
     }
 
-    // --- classify_wire_kind Go-parity ---
+    // --- classify_wire_kind 分类语义 ---
 
     #[test]
     fn classify_wire_kind_none_is_ok_not_err() {
-        // 锚 Go classifyWireErr(nil)=ResultOK：cancel/cap 在首次 wire 尝试前命中（wire_kind=None）
-        // 须映射 OK(0) 非 ERR(-1)，否则 503 体 result 与 Go 不一致。
+        // 无 wire 错分类为 OK(0)：cancel/cap 在首次 wire 尝试前命中（wire_kind=None）
+        // 须映射 OK(0) 非 ERR(-1)，否则 503 体 result 不对。
         assert_eq!(classify_wire_kind(None), result::OK);
         assert_eq!(
             classify_wire_kind(Some(WireKind::SilentFin)),
@@ -2106,7 +2099,7 @@ mod tests {
         assert_eq!(classify_wire_kind(Some(WireKind::Retryable)), result::ERR);
     }
 
-    // --- 7.1 method_guard 405 字节契约 ---
+    // --- method_guard 405 字节契约 ---
 
     #[test]
     fn method_guard_post_rejects_get_with_405_allow_json() {
@@ -2140,7 +2133,7 @@ mod tests {
         }
     }
 
-    // --- 7.2 require_json_content_type 415 字节契约 ---
+    // --- require_json_content_type 415 字节契约 ---
 
     #[test]
     fn require_json_content_type_byte_contract() {
@@ -2179,7 +2172,7 @@ mod tests {
         }
     }
 
-    // --- 7.3 require_stations_configured ResultNoConfig ---
+    // --- require_stations_configured ResultNoConfig ---
 
     #[test]
     fn require_stations_configured_empty_returns_200_result_minus_100() {
@@ -2209,7 +2202,7 @@ mod tests {
         assert!(called.load(Ordering::SeqCst));
     }
 
-    // --- 7.5 chain_business_post 组合链 ---
+    // --- chain_business_post 组合链 ---
 
     #[test]
     fn chain_business_post_method_mismatch_405() {
@@ -2260,7 +2253,7 @@ mod tests {
         assert!(!called.load(Ordering::SeqCst));
     }
 
-    // --- 7.4 JSON helpers ---
+    // --- JSON helpers ---
 
     #[test]
     fn write_json_no_trailing_newline_fixed_length() {
@@ -2319,7 +2312,7 @@ mod tests {
         assert!(!is_json_media_type(""));
     }
 
-    // --- G6 控制面 + 元信息 endpoint ---
+    // --- 控制面 + 元信息 endpoint ---
 
     fn test_request_path(
         method: &str,
@@ -2370,7 +2363,7 @@ mod tests {
 
     #[test]
     fn auto_toggle_body_matches_go_unmarshal_semantics() {
-        // Go json.Unmarshal 到 autoToggleBody{On bool}：空/`{}`/缺字段/null → 零值 false（非错）；
+        // 解析 `{"on":bool}`：空/`{}`/缺字段/null → 零值 false（非错）；
         // key 大小写不敏感；只有非法 JSON → Err。
         assert_eq!(parse_auto_toggle_body(b""), Ok(false)); // 空 body → false（非 400）
         assert_eq!(parse_auto_toggle_body(b"{}"), Ok(false)); // 空对象 → false
@@ -2379,19 +2372,19 @@ mod tests {
         assert_eq!(parse_auto_toggle_body(br#"{"on":true}"#), Ok(true));
         assert_eq!(parse_auto_toggle_body(br#"{"ON":true}"#), Ok(true)); // 大小写不敏感
         assert!(parse_auto_toggle_body(b"[bad").is_err()); // 非法 JSON → Err
-                                                           // review-loop R2 修正的边界：
+                                                           // 边界用例：
         assert_eq!(parse_auto_toggle_body(br#"{"on":null}"#), Ok(false)); // null 值 → 零值（非 400）
-        assert!(parse_auto_toggle_body(b"   ").is_err()); // 纯空白（raw 非空）→ Go Unmarshal 报错 → 400
+        assert!(parse_auto_toggle_body(b"   ").is_err()); // 纯空白（raw 非空）→ 解析报错 → 400
         assert_eq!(
             parse_auto_toggle_body(br#"{"on":true,"on":false}"#),
             Ok(false)
-        ); // 重复 key → last-wins（Go json.Unmarshal）
+        ); // 重复 key → last-wins
         assert!(parse_auto_toggle_body(br#"{"on":1}"#).is_err()); // 非 bool 值 → Err → 400
     }
 
     #[test]
     fn unlock_empty_body_falls_to_missing_to() {
-        // Go handleUnlock 空 body → body 零值 To="" → "missing 'to' field"（非 "empty body"）。
+        // 空 body → body 零值 to="" → "missing 'to' field"（非 "empty body"）。
         let (from, to) = parse_unlock_body(b"").expect("empty unlock body → zero value, not Err");
         assert!(from.is_empty() && to.is_empty());
     }
@@ -2400,7 +2393,7 @@ mod tests {
     fn unlock_body_string_extractor_last_wins_and_skips_nested() {
         // extract_json_string_field 与 bool extractor 对称：重复 key last-wins、嵌套同名 key 不误入。
         let (_, to) = parse_unlock_body(br#"{"to":"a","to":"b"}"#).unwrap();
-        assert_eq!(to, "b"); // 重复 key → last-wins（Go json.Unmarshal）
+        assert_eq!(to, "b"); // 重复 key → last-wins
         let (_, to) = parse_unlock_body(br#"{"foo":{"to":"x"},"to":"y"}"#).unwrap();
         assert_eq!(to, "y"); // 嵌套对象内的 "to" 不被误当顶层（skip_json_value 跳整个 {}）
     }
@@ -2603,7 +2596,7 @@ mod tests {
         assert!(called.load(Ordering::SeqCst));
     }
 
-    // --- G5 /unlock 薄切 + mock Sender ---
+    // --- /unlock 薄切 + mock Sender ---
 
     fn unlock_body(from: &str, to: &str) -> Vec<u8> {
         format!(r#"{{"from":"{from}","to":"{to}"}}"#).into_bytes()
@@ -2742,7 +2735,7 @@ mod tests {
         assert_eq!(String::from_utf8(body).unwrap(), r#"{"result":-100}"#);
     }
 
-    // --- 组 F /video/* handler（6.1-6.3）---
+    // --- /video/* handler ---
 
     use crate::video::preview::PreviewError;
     use crate::video::rtp::{NalUnit, NAL_TYPE_IDR, NAL_TYPE_PPS, NAL_TYPE_SPS};
@@ -2992,7 +2985,7 @@ mod tests {
         assert_eq!(String::from_utf8(body).unwrap(), r#"{"result":0}"#);
     }
 
-    /// Go encoding/json scanner 错误字面（bad-JSON 400 body 是契约）。
+    /// encoding/json scanner 风格错误字面（bad-JSON 400 body 是契约）。
     #[test]
     fn go_json_syntax_check_literals() {
         assert_eq!(

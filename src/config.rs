@@ -1,29 +1,27 @@
-//! Phase1 config 模块：dooraccess 主配置 INI 的 Rust 等价实现（去反射）。
+//! config 模块：dooraccess 主配置 INI 解析（去反射）。
 //!
-//! 与 Go `local/dooraccess-go internal/config` golden parity：
-//!   - minimal INI parser（`iniparser.go`）
-//!   - schema / 默认值 / deprecated 检测 / 校验（`config.go`）
+//! 两部分：
+//!   - minimal INI parser
+//!   - schema / 默认值 / deprecated 检测 / 校验
 //!
-//! 去反射化（design D4）：Go `iniparser.go` 靠 `reflect` + `ini:"tag"` 自动分发字段。
-//! Rust 无反射，改为把解析**引擎**（注释剥离 / section header / key=value / 标量转换 /
-//! `lastSubname` 状态）与**字段分发**分离：引擎泛型于 [`IniSink`] trait，sink 用显式
-//! `match (section, key)` 把值写到已知结构字段。`Config` 实现 `IniSink`；引擎对任意 sink
-//! 复用，故 INI 怪癖（inline 注释 / 未闭合 quote / `[section "subname"]` slice append /
-//! `[]string` trim）的行为对所有目标一致——与 Go reflect 路径外部可观测等价。
+//! 去反射化：手写 `match (section, key)` 分发字段（不用 reflect）。把解析**引擎**
+//! （注释剥离 / section header / key=value / 标量转换 / `last_subname` 状态）与**字段
+//! 分发**分离：引擎泛型于 [`IniSink`] trait，sink 用显式 `match` 把值写到已知结构字段。
+//! `Config` 实现 `IniSink`；引擎对任意 sink 复用，故 INI 怪癖（inline 注释 / 未闭合
+//! quote / `[section "subname"]` slice append / `[]string` trim）的行为对所有目标一致。
 //!
-//! **不**移植 `ResolveIfaceList`（调 `net.Interfaces()` 系统调用，超 Phase1，见 design D3）。
+//! **不**实现网卡枚举类系统调用（不调 `net.Interfaces()` 类接口）。
 //!
-//! D1：结构字段值逐字段精确相等；错误**分类**（sentinel 级 `ConfigError` / `ValidationError`）
-//! 与 Go 对应，错误 message 仅语义等价、不复刻 Go `fmt.Errorf` 字面。
+//! 错误用 sentinel 级 `ConfigError` / `ValidationError` 分类；message 不属字节契约。
 
 use std::fs;
 use std::io;
 
 // ===========================================================================
-// schema（与 Go Config 字面级对齐）
+// schema
 // ===========================================================================
 
-/// 替代品支持的唯一品牌（Go `SupportedBrand` 常量）。
+/// 替代品支持的唯一品牌。
 pub const SUPPORTED_BRAND: &str = "anjubao";
 
 pub const DEFAULT_IFACE: &str = "eth0.1";
@@ -31,7 +29,7 @@ pub const DEFAULT_HASS_PORT: i64 = 8123;
 pub const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0";
 pub const DEFAULT_LISTEN_PORT: i64 = 8080;
 
-/// 主配置文件 schema（Go `Config`）。
+/// 主配置文件 schema。
 ///
 /// 顶级 key=value → `sip` / `iface` / `iface_list`；嵌套 struct → `[listen]` / `[hass]` /
 /// `[video]` / `[automation]` section；`stations` 数组 → `[station "1"]` / `[station "2"]`
@@ -40,7 +38,7 @@ pub const DEFAULT_LISTEN_PORT: i64 = 8080;
 pub struct Config {
     pub sip: String,
     pub iface: String,
-    /// 显式监听接口列表（v0.4.1 escape hatch）；为空时由 `ResolveIfaceList` 检测（不在 Phase1）。
+    /// 显式监听接口列表（v0.4.1 escape hatch）；为空时由 [`Config::resolve_iface_list`] 检测。
     pub iface_list: Vec<String>,
     pub listen: Listen,
     pub stations: Vec<Station>,
@@ -48,7 +46,7 @@ pub struct Config {
     pub video: Video,
     pub automation: Automation,
 
-    // 后处理派生（不参与解析；对应 Go 未导出字段 + accessor）。
+    // 后处理派生（不参与解析；私有字段经 accessor 暴露）。
     missing_fields: Vec<String>,
     deprecated_fields: Vec<String>,
     parser_warnings: Vec<String>,
@@ -82,7 +80,7 @@ pub struct Video {
     pub cache_path: String,
 }
 
-/// `[automation]` section 的出厂默认 flag（formalize-daemon-auto-unlock §3，v0.10.0 复活为正式 schema）。
+/// `[automation]` section 的出厂默认 flag（正式 schema）。
 ///
 /// 旧 v0.1 残留 key（`unlock` / `hangup` / `call_elev` 等整数 key）被引擎当「未知 key」收集到
 /// `parser_warnings`、**不 fatal**——只按名取 `auto_unlock` / `auto_hangup` 两 bool。
@@ -93,24 +91,23 @@ pub struct Automation {
 }
 
 // ===========================================================================
-// 错误分类（sentinel 级，D1）
+// 错误分类（sentinel 级）
 // ===========================================================================
 
-/// config 加载 / 解析 / 校验错误。分类与 Go 对应（`ErrConfigNotFound` / parse error /
-/// `ValidationError`），message 仅语义等价。
+/// config 加载 / 解析 / 校验错误。三类：not-found / parse error / 校验失败；message 不属字节契约。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
-    /// 配置文件不存在（Go `ErrConfigNotFound`）。
+    /// 配置文件不存在。
     NotFound { path: String },
     /// 读盘失败（非 NotExist，如把目录当文件 / 非 UTF-8）。
     Read { path: String, msg: String },
     /// INI 解析失败（坏 section header / 标量类型错），带行号。
     Parse { line: usize, msg: String },
-    /// 启动校验失败（Go `ValidationError`）。
+    /// 启动校验失败。
     Validation(ValidationError),
 }
 
-/// 校验失败原因（Go `ValidationError` 结构等价）。`field` 是 sentinel 级分类锚点。
+/// 校验失败原因。`field` 是 sentinel 级分类锚点。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidationError {
     pub field: String,
@@ -142,18 +139,18 @@ impl std::error::Error for ConfigError {}
 pub enum FieldOutcome {
     /// 已知字段、值已写入。
     Set,
-    /// 未知 key → 收集为 warning（不报错，与 Go 一致）。
+    /// 未知 key → 收集为 warning（不报错）。
     Unknown,
     /// 类型错（如 struct key 当标量、坏 int / bool）→ 引擎包成 `ConfigError::Parse`。
     TypeErr(String),
 }
 
-/// INI 写入目标。引擎驱动解析，sink 用显式 `match` 把值分发到已知字段（替代 Go reflect）。
+/// INI 写入目标。引擎驱动解析，sink 用显式 `match` 把值分发到已知字段（不用 reflect）。
 ///
-/// 约定与 Go `iniParser` 三个 setter + `lookupFieldByINITag` 等价：
+/// 三个 setter + 一组 section 查询约定：
 ///   - `set_top`：顶级 `key = value`（section == ""）。
 ///   - `set_section`：`[section]`（无 subname）`key = value`；引擎保证已知且是 struct section。
-///   - subsection（`[section "subname"]`）：引擎用 `subsection_len` + 内部 `lastSubname` 状态
+///   - subsection（`[section "subname"]`）：引擎用 `subsection_len` + 内部 `last_subname` 状态
 ///     决定何时 `append_subsection`，再 `set_subsection` 写当前（末）元素。
 pub trait IniSink {
     /// 顶级 `key = value`。
@@ -169,7 +166,7 @@ pub trait IniSink {
     /// `[section]` 内 `key = value`（引擎保证 `section_is_struct`）。
     fn set_section(&mut self, section: &str, key: &str, value: &str) -> FieldOutcome;
 
-    /// slice-of-struct section 当前元素个数（用于 `lastSubname` 的 `len==0` 规则）。
+    /// slice-of-struct section 当前元素个数（用于 `last_subname` 的 `len==0` 规则）。
     fn subsection_len(&self, section: &str) -> usize;
     /// 追加一个新空元素到 slice-of-struct section。
     fn append_subsection(&mut self, section: &str);
@@ -177,11 +174,10 @@ pub trait IniSink {
     fn set_subsection(&mut self, section: &str, key: &str, value: &str) -> FieldOutcome;
 }
 
-/// 解析 INI 文本，按 [`IniSink`] 分发字段。返回 unknown section / key 的 warning 列表
-/// （与 Go `ParseINI` 返回的 warnings 字面等价）。
+/// 解析 INI 文本，按 [`IniSink`] 分发字段。返回 unknown section / key 的 warning 列表。
 ///
 /// 错误约定：坏 section header / 标量类型错返 `ConfigError::Parse`；未知 key / section
-/// 只收集 warning 不报错（与 Go 一致）。
+/// 只收集 warning 不报错。
 pub fn parse_ini<S: IniSink>(input: &str, sink: &mut S) -> Result<Vec<String>, ConfigError> {
     let mut warnings: Vec<String> = Vec::new();
     let mut section = String::new();
@@ -191,8 +187,7 @@ pub fn parse_ini<S: IniSink>(input: &str, sink: &mut S) -> Result<Vec<String>, C
 
     for (idx, raw) in input.split('\n').enumerate() {
         let line_no = idx + 1;
-        // 对齐 Go `bufio.Scanner` 1<<20 token 上限（iniparser.go：超长行 → ErrTooLong → 扫描错）。
-        // Go bufio scan.go 在 `len >= maxTokenSize` 即报错，故用 `>=`（恰好 1 MiB 也拒）。
+        // 单行 1<<20 token 上限：超长行（≥ 1 MiB）即拒（用 `>=`，恰好 1 MiB 也拒）。
         if raw.len() >= (1 << 20) {
             return Err(ConfigError::Parse {
                 line: line_no,
@@ -233,7 +228,7 @@ pub fn parse_ini<S: IniSink>(input: &str, sink: &mut S) -> Result<Vec<String>, C
                 }
             }
         } else if subname.is_empty() {
-            // unknown section 在 header 时已 warn；此处静默跳过（与 Go setSectionField !ok → nil 一致）。
+            // unknown section 在 header 时已 warn；此处静默跳过。
             if !sink.section_known(&section) {
                 continue;
             }
@@ -262,7 +257,7 @@ pub fn parse_ini<S: IniSink>(input: &str, sink: &mut S) -> Result<Vec<String>, C
                     msg: format!("subsection [{section} {subname:?}] expected slice field"),
                 });
             }
-            // lazy append（Go setSubsectionField）：(section,subname) 与上次不同、或当前 slice 为空时
+            // lazy append：(section,subname) 与上次不同、或当前 slice 为空时
             // append 新元素；同 subname 内多 key 共用同元素。
             let prev = last_subname
                 .iter()
@@ -301,8 +296,8 @@ fn set_last_subname(map: &mut Vec<(String, String)>, section: &str, subname: &st
 
 /// 去行尾注释 + 前后空白。返回 `None` 表示空行 / 整行注释。
 ///
-/// 注释规则（Go `stripCommentTrim`）：`;` / `#` 行首整行注释；inline 时若其前 quote 未闭合
-/// （奇数个 `"`）则不算注释——简化实现的已知行为，复刻以保 parity。
+/// 注释规则：`;` / `#` 行首整行注释；inline 时若其前 quote 未闭合
+/// （奇数个 `"`）则不算注释——简化实现的已知行为。
 fn strip_comment_trim(s: &str) -> Option<String> {
     let s = s.trim();
     if s.is_empty() {
@@ -333,7 +328,7 @@ fn strip_comment_trim(s: &str) -> Option<String> {
     }
 }
 
-/// 解析 `[name]` 或 `[name "subname"]`，返回 (name, subname)。Go `parseSectionHeader`。
+/// 解析 `[name]` 或 `[name "subname"]`，返回 (name, subname)。
 fn parse_section_header(s: &str) -> Result<(String, String), String> {
     let bytes = s.as_bytes();
     if s.len() < 3 || bytes[s.len() - 1] != b']' {
@@ -344,7 +339,7 @@ fn parse_section_header(s: &str) -> Result<(String, String), String> {
         return Err("empty section header".to_string());
     }
     if let Some(sp) = inner.find(' ') {
-        // Go IndexByte(inner,' '); sp>0（inner 已 trim，不会前导空格）。
+        // 首个空格分隔 name 与 subname；sp>0（inner 已 trim，不会前导空格）。
         if sp > 0 {
             let name = inner[..sp].trim();
             let rest = inner[sp + 1..].trim();
@@ -359,7 +354,7 @@ fn parse_section_header(s: &str) -> Result<(String, String), String> {
     Ok((inner.to_string(), String::new()))
 }
 
-/// 解析 `key = value`；value 允许空。quoted value 自动 strip 首尾 `"`。Go `parseKeyValue`。
+/// 解析 `key = value`；value 允许空。quoted value 自动 strip 首尾 `"`。
 fn parse_key_value(s: &str) -> Result<(String, String), String> {
     let eq = s.find('=').ok_or_else(|| format!("missing '=' in {s:?}"))?;
     let key = s[..eq].trim();
@@ -375,15 +370,14 @@ fn parse_key_value(s: &str) -> Result<(String, String), String> {
 }
 
 // ---------------------------------------------------------------------------
-// 标量转换助手（sink 共用；对应 Go setScalarField 各 case）
+// 标量转换助手（sink 共用）
 // ---------------------------------------------------------------------------
 
-/// int 转换（Go `strconv.ParseInt(.,10,64)` + `OverflowInt`；空 → 0）。返回 `TypeErr` message 供 sink 透传。
+/// int 转换（base-10 解析；空 → 0）。返回 `TypeErr` message 供 sink 透传。
 ///
-/// **int 宽度对齐（部署目标 GOARCH=mips → int32）**：Go 把配置 int 字段（`Listen.Port`/
-/// `Hass.Port` 等均 `int`）经 `ParseInt(.,10,64)` 解析后用 `field.OverflowInt(n)` 按字段类型
-/// 校验，hAP 上 `int`=int32，故 `> i32` 的值 Go-MIPS **拒（startup 报错）**。Rust 字段存 `i64`，
-/// 故显式加 i32 范围检查对齐 Go-MIPS。
+/// **int 宽度上限（部署目标 MIPS → 32 位）**：配置 int 字段（`listen.port`/`hass.port`
+/// 等）在 32 位目标上须放得下 i32，故 `> i32` 的值在启动时拒。Rust 字段存 `i64`，
+/// 此处显式加 i32 范围检查以匹配 32 位目标行为。
 pub fn conv_int(value: &str, key: &str) -> Result<i64, String> {
     if value.is_empty() {
         return Ok(0);
@@ -391,7 +385,7 @@ pub fn conv_int(value: &str, key: &str) -> Result<i64, String> {
     let n = value
         .parse::<i64>()
         .map_err(|_| format!("{key:?} expects int, got {value:?}"))?;
-    // 对齐 Go-MIPS OverflowInt(int=int32)：超 int32 范围拒。
+    // 32 位目标 int 上限：超 i32 范围拒。
     if n < i32::MIN as i64 || n > i32::MAX as i64 {
         return Err(format!("{key:?} expects int, got {value:?}"));
     }
@@ -423,7 +417,7 @@ pub fn conv_string_array(value: &str) -> Vec<String> {
 }
 
 // ===========================================================================
-// Config 作为 IniSink（显式 match 分发，去反射）
+// Config 作为 IniSink（显式 match 分发，不用 reflect）
 // ===========================================================================
 
 impl IniSink for Config {
@@ -441,7 +435,7 @@ impl IniSink for Config {
                 self.iface_list = conv_string_array(value);
                 FieldOutcome::Set
             }
-            // struct field 当顶级标量 → 报错（Go setTopLevelField struct case）。
+            // struct field 当顶级标量 → 报错。
             "listen" | "hass" | "video" | "automation" => FieldOutcome::TypeErr(format!(
                 "key {key:?} is a struct field, use [{key}] section"
             )),
@@ -582,19 +576,19 @@ impl IniSink for Config {
 }
 
 // ===========================================================================
-// 默认值 / deprecated 检测 / 校验 / 读盘（Go config.go）
+// 默认值 / deprecated 检测 / 校验 / 读盘
 // ===========================================================================
 
 impl Config {
-    /// `MissingFields`：被 `apply_defaults` 替换为默认值的字段名（caller log warning）。
+    /// 被 `apply_defaults` 替换为默认值的字段名（caller log warning）。
     pub fn missing_fields(&self) -> &[String] {
         &self.missing_fields
     }
-    /// `DeprecatedFields`：存在但已被本版本忽略的字段名。
+    /// 存在但已被本版本忽略的字段名。
     pub fn deprecated_fields(&self) -> &[String] {
         &self.deprecated_fields
     }
-    /// `ParserWarnings`：INI parser 报告的 unknown section / key。
+    /// INI parser 报告的 unknown section / key。
     pub fn parser_warnings(&self) -> &[String] {
         &self.parser_warnings
     }
@@ -604,7 +598,7 @@ impl Config {
         self.parser_warnings = w;
     }
 
-    /// 填充缺省值并记录 `missing_fields`（Go `applyDefaults`）。
+    /// 填充缺省值并记录 `missing_fields`。
     pub fn apply_defaults(&mut self) {
         self.missing_fields.clear();
 
@@ -629,10 +623,10 @@ impl Config {
         }
     }
 
-    /// 扫描原始 INI 检测已废弃顶级 section / key（Go `detectDeprecated`）。
+    /// 扫描原始 INI 检测已废弃顶级 section / key。
     ///
-    /// v0.1.6 移除：`brand` / `family` / `elev` / `notification`；`automation` 自
-    /// formalize-daemon-auto-unlock §3.4 复活为正式 schema，**不**在此列表。
+    /// v0.1.6 移除：`brand` / `family` / `elev` / `notification`；`automation` 已
+    /// 复活为正式 schema，**不**在此列表。
     ///
     /// 顶级 key 检测须跟踪 `current_section`：仅 `current_section == ""` 时识别顶级 key form；
     /// section 内的同名 key 是该 section 的 unknown key（由 parser warnings 处理）。
@@ -642,7 +636,7 @@ impl Config {
         let mut current_section = String::new();
 
         for raw_line in raw.split('\n') {
-            // 去注释（; 或 # 都识别，不区分 quote——deprecated 检测精度不需那么高，与 Go 一致）。
+            // 去注释（; 或 # 都识别，不区分 quote——deprecated 检测精度不需那么高）。
             let mut s = raw_line;
             if let Some(i) = s.find([';', '#']) {
                 s = &s[..i];
@@ -687,7 +681,7 @@ impl Config {
         }
     }
 
-    /// 校验已加载配置（Go `Validate`）：sip / stations[i].sip URI 结构 + video.format 白名单。
+    /// 校验已加载配置：sip / stations[i].sip URI 结构 + video.format 白名单。
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.sip.is_empty() {
             return Err(ConfigError::Validation(ValidationError {
@@ -741,15 +735,15 @@ impl Config {
 }
 
 // ===========================================================================
-// ResolveIfaceList（Phase 4 G3a 移植，锚 Go `Config.ResolveIfaceList`）
+// resolve_iface_list
 // ===========================================================================
 
-/// listen6672 / listen18022 应监听的 PF_PACKET slave 接口解析失败原因（锚 Go sentinel）。
+/// listen6672 / listen18022 应监听的 PF_PACKET slave 接口解析失败原因（sentinel 级分类）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IfaceError {
-    /// `iface` 与 `iface_list` 都空（Go `ErrIfaceMissing`）。
+    /// `iface` 与 `iface_list` 都空。
     Missing,
-    /// `iface` 是 bridge 但 `brif/` 无 slave（Go `ErrBridgeNoSlaves`）。
+    /// `iface` 是 bridge 但 `brif/` 无 slave。
     BridgeNoSlaves { bridge: String },
     /// sysfs 读盘失败（非 NotExist）。
     Read { path: String, msg: String },
@@ -769,11 +763,11 @@ impl std::fmt::Display for IfaceError {
 
 impl std::error::Error for IfaceError {}
 
-/// sysfs 根（与 Go `sysClassNet` 等价；测试可覆写）。
+/// sysfs 根（测试可覆写）。
 const SYS_CLASS_NET: &str = "/sys/class/net";
 
 impl Config {
-    /// 算出应监听的 PF_PACKET 接口列表（逐行对齐 Go `ResolveIfaceList`）：
+    /// 算出应监听的 PF_PACKET 接口列表：
     ///
     ///   1. `iface_list` 显式非空 → 直接返回（escape hatch，跳过自动展开）。
     ///   2. `iface` 空 → `IfaceError::Missing`。
@@ -781,10 +775,8 @@ impl Config {
     ///      `brif/*` 展开成 slave 列表；空 slave → `BridgeNoSlaves`。
     ///   4. 否则（物理接口，无 bridge 目录）→ 单元素 `[iface]`。
     ///
-    /// **纯 sysfs（`std::fs`）路径**：仅 `stat` `bridge/` + `read_dir` `brif/`，**不**调
-    /// `net.Interfaces`、**不**触 ifindex/字节序——故无新 BE 面（design「桥解析若实现也碰
-    /// BE ifindex」对应的是 ifindex 读取分支，Go `ResolveIfaceList` 走 brif 名枚举不读
-    /// ifindex，本移植与其字面一致）。
+    /// **纯 sysfs（`std::fs`）路径**：仅 `stat` `bridge/` + `read_dir` `brif/`，**不**枚举
+    /// 网卡、**不**触 ifindex/字节序——故无 BE 面（走 brif 名枚举，不读 ifindex）。
     pub fn resolve_iface_list(&self) -> Result<Vec<String>, IfaceError> {
         self.resolve_iface_list_in(SYS_CLASS_NET)
     }
@@ -824,7 +816,7 @@ impl Config {
             })?;
             slaves.push(e.file_name().to_string_lossy().into_owned());
         }
-        // read_dir 顺序非确定 → 排序对齐 Go `os.ReadDir` 的确定性。
+        // read_dir 顺序非确定 → 排序得确定性输出。
         slaves.sort();
         if slaves.is_empty() {
             return Err(IfaceError::BridgeNoSlaves {
@@ -835,9 +827,9 @@ impl Config {
     }
 }
 
-/// 从 path 读盘 + 解析 + 默认值 + deprecated 检测 + 校验（Go `LoadConfig`）。
+/// 从 path 读盘 + 解析 + 默认值 + deprecated 检测 + 校验。
 ///
-/// `std::fs` 读盘属确定性范围 IN（design D3）。
+/// `std::fs` 读盘属确定性范围 IN。
 pub fn load_config(path: &str) -> Result<Config, ConfigError> {
     let raw = match fs::read(path) {
         Ok(b) => b,
@@ -853,7 +845,7 @@ pub fn load_config(path: &str) -> Result<Config, ConfigError> {
             });
         }
     };
-    // Go bufio.Scanner 对非 UTF-8 字节按原样保留；config 实际是 ASCII/UTF-8。非法 UTF-8 视为读错。
+    // config 实际是 ASCII/UTF-8。非法 UTF-8 视为读错。
     let text = match String::from_utf8(raw) {
         Ok(t) => t,
         Err(e) => {
@@ -876,18 +868,18 @@ pub fn load_config(path: &str) -> Result<Config, ConfigError> {
 }
 
 // ===========================================================================
-// validate_uri（手写字符扫描，Go config.go validateURI——与 codec.parse_uri 两套）
+// validate_uri（手写字符扫描；与 codec.parse_uri 两套独立实现）
 // ===========================================================================
 
 /// 校验 SIP URI 结构：`<8 位 hex 号码>@<IPv4>:<port>`。
 ///
-/// **手写实现**（不依赖 codec），与 Go `config.validateURI` 字符扫描逐行对齐：
+/// **手写实现**（不依赖 codec）：
 ///   - 名恰好 8 字符且全 hex（`0-9a-fA-F`）。
-///   - IPv4：4 段 0-255，**拒前导零**（CVE-2021-29923 / Go 1.17+ 对齐）；只收 `[0-9.]`
+///   - IPv4：4 段 0-255，**拒前导零**（CVE-2021-29923 缓解）；只收 `[0-9.]`
 ///     字符 → 天然**拒 IPv4-mapped IPv6**（`::ffff:1.2.3.4` 含 `:` 直接判非 IPv4）。
 ///   - port 1-65535 整数。
 ///
-/// 返回 `Err(message)`——分类只需 accept/reject（Go `validateURI` 本身不用 sentinel）。
+/// 返回 `Err(message)`——分类只需 accept/reject。
 pub fn validate_uri(uri: &str) -> Result<(), String> {
     // '@'：第一个；位置须 0 < at < len-1。
     let at = match uri.find('@') {
@@ -951,9 +943,7 @@ pub fn validate_uri(uri: &str) -> Result<(), String> {
         cur = cur * 10 + (c - b'0') as u32;
         octet_len += 1;
         // 数字循环内即拒 > 255，防累加溢出（Rust debug 构建会 panic；release `u32` 回绕到
-        // 巨值仍 > 255 拒）。等价 Go-HOST(int64) 行为（亦拒）。注：Go-MIPS(int32) 对超长 octet
-        // 会回绕到负值误「接受」——那是 int32 wrap bug、IP 之后 dial 仍失败；Rust 在此提前拒
-        // 是更安全的有意分叉（避免 panic + 匹配 Go-host 语义）。
+        // 巨值仍 > 255 拒）。在此提前拒是安全选择：避免 panic，且超长 octet 一律 reject。
         if cur > 255 {
             return Err(format!("ip {ip:?} is not IPv4"));
         }

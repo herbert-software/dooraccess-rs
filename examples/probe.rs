@@ -1,15 +1,14 @@
-//! `dooraccess-rs-probe`：hAP 真机 passive-shadow 只读探针
-//! （OpenSpec `verify-rust-listeners-on-hap` 组 A）。
+//! `dooraccess-rs-probe`：hAP 真机 passive-shadow 只读探针。
 //!
 //! 复用 `listen6672::Listener` + `listen18022::Listener` 的 PF_PACKET/recv 路径
 //! （`ffi::open_packet_socket` / `bind_to_ifindex` / `set_promisc` / `attach_filter`
-//! / `recv` —— 本变更要在大端 hAP 内核认证的就是它俩），并发跑两个 `run()`（6672 +
+//! / `recv` —— 要在大端 hAP 内核认证的就是它俩），并发跑两个 `run()`（6672 +
 //! 18022，共 4 socket = 2 listener × 2 slave），**只 log detect，不发 wire、不 unlock、
 //! 不 HA push**。
 //!
-//! 设计要点（spec / tasks 2.1）：
+//! 设计要点：
 //!   - slave 列表**显式给**（`--slaves eth1,eth0.2`，默认 `eth1,eth0.2`）——`config.rs`
-//!     不移植桥解析，探针不从 `iface=br-door` 解析（桥解析非本变更范围）。
+//!     不移植桥解析，探针不从 `iface=br-door` 解析。
 //!   - 回调与 `Listener.logf` **都**接 log-only sink：listen6672 用 `Callbacks`
 //!     （`on_ring` / `on_elevator_key` / `on_number_query` / `on_number_response`
 //!     仅 log；**`on_number_query` 只 log，不调 `build_number_query_response`、不发

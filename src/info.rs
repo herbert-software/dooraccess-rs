@@ -1,13 +1,13 @@
 //! `/info` 元信息（`SelfDesc` + `RenderJSON`）。
 //!
-//! 移植 Go `internal/info` 的 no-probe 子集：`Build(probe_ha=false)` 只构造
-//! `jsonInfo` 6 字段（daemon/version/brand/monitor/outdoor_stations/video），
-//! 不调 `resolveIfaceIP` / `discoverHassFacingIP`（结果不进 `/info` body）。
+//! no-probe 子集：`build(probe_ha=false)` 只构造 `/info` 的 6 字段
+//! （daemon/version/brand/monitor/outdoor_stations/video），不解析 iface IP /
+//! 不探测 HA-facing IP（这些结果不进 `/info` body）。
 
 use crate::config::{Config, SUPPORTED_BRAND};
 use crate::httpx::json::{encode_struct, JsonOptions, JsonValue};
 
-/// daemon self-description（与 Go `SelfDesc` 对齐；banner-only 字段本 Phase 省略）。
+/// daemon self-description（banner-only 字段省略）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelfDesc {
     pub version: String,
@@ -27,7 +27,7 @@ pub struct StationDesc {
     pub sip: String,
 }
 
-/// 反映 `cfg.video.*`（与 Go `VideoDesc` 对齐）。
+/// 反映 `cfg.video.*`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VideoDesc {
     pub forward: bool,
@@ -48,8 +48,8 @@ pub fn build(cfg: Option<&Config>, version: &str, probe_ha: bool) -> SelfDesc {
         daemon: "dooraccess-go".to_string(),
         monitor: String::new(),
         stations: Vec::new(),
-        // 默认 Video 零值（protocol=""）；Go selfdesc.go 仅在 `cfg != nil` 分支设
-        // Protocol="anjubao-h264"，nil-cfg 时 VideoDesc 零值 Protocol=""。下方 Some 分支设。
+        // 默认 Video 零值（protocol=""）；仅在 `cfg` 存在时（下方 Some 分支）设
+        // protocol="anjubao-h264"，无 cfg 时 VideoDesc 零值 protocol=""。
         video: VideoDesc {
             forward: false,
             forward_supported: false,
@@ -85,7 +85,7 @@ pub fn build(cfg: Option<&Config>, version: &str, probe_ha: bool) -> SelfDesc {
     sd
 }
 
-/// 把 `SelfDesc` 序列化成 `GET /info` 响应 JSON bytes（Go `RenderJSON` 等价）。
+/// 把 `SelfDesc` 序列化成 `GET /info` 响应 JSON bytes。
 ///
 /// struct 声明序：daemon, version, brand, monitor, outdoor_stations, video；
 /// `SetEscapeHTML(false)` + 尾随 `\n`（`JsonOptions::ENCODE`）。

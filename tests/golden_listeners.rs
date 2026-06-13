@@ -1,10 +1,10 @@
-//! listen6672 / listen18022 / wire_sender golden parity 回归（组 E，task 8.2）。
+//! listen6672 / listen18022 / wire_sender golden parity 回归。
 //!
-//! 读 committed 的 Go 导出 fixture，逐字节 / 逐字段断言 Rust 移植等价：
+//! 读 committed golden 向量，逐字节 / 逐字段断言 Rust 实现正确：
 //!   - `listen6672.txt`      parse_frame 字段 + classify（**响铃 byte19 0x8c/0x94/0x95
 //!     三值都判 ring + 呼梯 0x90 判 elevator_key**）+ numquery 响应
-//!   - `listen6672_extract.txt`  extract_udp_payload（L2 帧→payload/srcip/srcport；linux-only
-//!     Go 导出，Rust extract 跨平台，host 读静态文件即可断言）
+//!   - `listen6672_extract.txt`  extract_udp_payload（L2 帧→payload/srcip/srcport；
+//!     Rust extract 跨平台，host 读静态文件即可断言）
 //!   - `listen18022.txt`     parse_frame（req + body）
 //!   - `listen18022_extract.txt`  extract_tcp_payload（L2 帧→payload/ip/port）
 //!   - `wire_sender.txt`     sender 帧字节（Build*Frame）+ 错误分类（retryable bool）
@@ -12,7 +12,7 @@
 //! errclass 的 result_code 列（classify_wire_err → -103/-5/-1）在 src/sender.rs 内的
 //! `#[cfg(test)]`（map_wire_kind 私有）覆盖；本文件验 retryable bool（公开 API）。
 //!
-//! Rust CI 不依赖 Go：向量已 committed，本测试只读静态文件。
+//! 向量已 committed，本测试只读静态文件。
 
 use std::fs;
 use std::path::PathBuf;
@@ -99,7 +99,7 @@ fn golden_listen6672_parser() {
                 assert_eq!(frame.event_flag, want_eventflag, "event_flag {:?}", f[1]);
                 assert_eq!(frame.subtype, hex_to_bytes(f[8])[0], "subtype {:?}", f[1]);
                 assert_eq!(frame.event_id, hex_to_bytes(f[9])[0], "event_id {:?}", f[1]);
-                // ★ classify 等价：Rust EventKind.as_str() == Go kind.String()。
+                // ★ classify 等价：Rust EventKind.as_str() == golden 向量 kind 列。
                 let kind = classify(&frame);
                 assert_eq!(kind.as_str(), f[10], "classify {:?}", f[1]);
                 // 收集 byte19 多值 ring 证据。
@@ -142,7 +142,7 @@ fn golden_listen6672_parser() {
         }
     }
 
-    // ★ E9 锚点：byte19 三值 0x8c/0x94/0x95 都被判 ring（多值识别）。
+    // byte19 三值 0x8c/0x94/0x95 都被判 ring（多值识别）。
     ring_subtypes.sort_unstable();
     ring_subtypes.dedup();
     assert!(
@@ -306,7 +306,7 @@ fn golden_listen18022_extract() {
     assert!(n_reject >= 2, "too few extract_reject: {}", n_reject);
 }
 
-/// 构造一个 golden errclass 名对应的 `WireError`（与 Go export 的 5 个 case 一一对应）。
+/// 构造一个 golden errclass 名对应的 `WireError`（与 golden 向量的 5 个 case 一一对应）。
 fn make_wire_err(kind: &str) -> WireError {
     use std::io;
     match kind {

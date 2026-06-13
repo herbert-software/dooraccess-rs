@@ -1,14 +1,14 @@
-//! rtcp：RTCP keepalive sender + RR/SDES/BYE 构造（移植 Go `internal/video/rtcp.go` 全部）。
+//! rtcp：RTCP keepalive sender + RR/SDES/BYE 构造。
 //!
 //! 协议锚 `specs/anjubao-video-stream/messages/udp9881-rtcp/format.md` +
-//! observations §4；逐字节 golden 锚 Go 导出（`testdata/golden/video_rtcp.txt`）。
+//! observations §4；逐字节 golden 锚 `testdata/golden/video_rtcp.txt`。
 //!
-//! 等价纪律（spec「RTCP keepalive 与 BYE 字节等价」）：
+//! 等价纪律：
 //!   - 5s 周期向 outdoor:6671 发 RR+SDES 复合包；ticker **无 0 时刻 tick——首包
-//!     在 t≈5s**（等价 Go `time.Ticker`）
+//!     在 t≈5s**
 //!   - RR 32B（V=2/RC=1/PT=201/length 字段=7，loss/jitter 全 0）；SDES 含 CNAME
-//!     item，**CNAME 字面必须保持 `"dooraccess-go"`**（design D7：字节 golden
-//!     纪律，禁改名——待替换生产后要改走独立 change 连 golden 一起换）
+//!     item，**CNAME 字面必须保持 `"dooraccess-go"`**（字节 golden 纪律，禁改名
+//!     ——改名会让 SDES 包与 golden fixture 字节漂移）
 //!   - 外机 SSRC 未知（RTP 未到达）时跳过本轮；SSRC 取值由调用方（session 层）
 //!     仅首包锁存
 //!   - 失败模式：UDP dial 失败 → 本函数带错返回（keepalive 线程退出、**session
@@ -16,9 +16,9 @@
 //!     仅 log、继续下轮
 //!   - 全部字段 `to_be_bytes` NBO
 //!
-//! 计时套路：分片 `park_timeout` + 单调 `Instant` 判据（复刻 ② auto-hangup 计时
-//! 线程模式，`self_unlock.rs:469`——spurious wakeup 不会误判早发）；周期 ms 存
-//! `AtomicU32`（D8，MIPS32 禁 64-bit 原子），test-tunable 压缩。
+//! 计时套路：分片 `park_timeout` + 单调 `Instant` 判据（复刻 auto-hangup 计时
+//! 线程模式——spurious wakeup 不会误判早发）；周期 ms 存
+//! `AtomicU32`（MIPS32 禁 64-bit 原子），test-tunable 压缩。
 
 use std::io;
 use std::net::UdpSocket;
@@ -34,11 +34,11 @@ pub const RTCP_PT_SDES: u8 = 202; // 0xca
 /// RTCP packet type：Goodbye。
 pub const RTCP_PT_BYE: u8 = 203; // 0xcb
 
-/// SDES CNAME item 字面。锚 Go `rtcpCName`——**字节等价 golden 纪律，禁改名**
-/// （design D7：改成 dooraccess-rs 会让 SDES 包与 Go fixture 字节漂移，golden 直接红）。
+/// SDES CNAME item 字面——**字节等价 golden 纪律，禁改名**
+/// （改成 dooraccess-rs 会让 SDES 包与 golden fixture 字节漂移，golden 直接红）。
 pub const RTCP_CNAME: &str = "dooraccess-go";
 
-/// 报告周期（ms，生产 5s）。test-tunable（D8 `AtomicU32` 毫秒）。
+/// 报告周期（ms，生产 5s）。test-tunable（`AtomicU32` 毫秒）。
 static REPORT_INTERVAL_MS: AtomicU32 = AtomicU32::new(5_000);
 
 /// 分片轮询片长（援引 self_unlock HANGUP_POLL_SLICE 20ms 惯用法）。
@@ -55,11 +55,10 @@ pub fn set_report_interval_ms_for_test(ms: u64) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// packet builders（锚 Go buildRR / buildSDES / buildRRSDES / buildBYE）
+// packet builders（RR / SDES / RR+SDES / BYE）
 // ---------------------------------------------------------------------------
 
 /// 构造 32B Receiver Report：V=2 P=0 RC=1 PT=201 length=7 word（= (32-4)/4）。
-/// 锚 Go `buildRR`。
 ///
 /// 1 个报告 block，被报告 SSRC = `stream_ssrc`，loss/jitter 字段全 0
 /// （外机不响应 RTCP 反馈，填精确值无意义）。
@@ -79,7 +78,7 @@ pub fn build_rr(reporter_ssrc: u32, stream_ssrc: u32) -> Vec<u8> {
     pkt
 }
 
-/// 构造 SDES 包（含 CNAME item），长度按 4-byte align 补齐。锚 Go `buildSDES`。
+/// 构造 SDES 包（含 CNAME item），长度按 4-byte align 补齐。
 ///
 /// 结构：
 ///   - 0     V|P|SC = 0x81 (V=2 P=0 SC=1)
@@ -111,7 +110,7 @@ pub fn build_sdes(chunk_ssrc: u32) -> Vec<u8> {
     pkt
 }
 
-/// 构造周期保活 RR + SDES 复合包。锚 Go `buildRRSDES`。
+/// 构造周期保活 RR + SDES 复合包。
 pub fn build_rr_sdes(reporter_ssrc: u32, stream_ssrc: u32) -> Vec<u8> {
     let rr = build_rr(reporter_ssrc, stream_ssrc);
     let sdes = build_sdes(reporter_ssrc);
@@ -122,7 +121,7 @@ pub fn build_rr_sdes(reporter_ssrc: u32, stream_ssrc: u32) -> Vec<u8> {
 }
 
 /// 构造 session 终结复合包：空 RR (8B, SC=0) + SDES (CNAME) + BYE (8B)。
-/// 锚 Go `buildBYE`（format.md「监视段结束的 BYE 复合包」）。
+/// format.md「监视段结束的 BYE 复合包」。
 pub fn build_bye(reporter_ssrc: u32) -> Vec<u8> {
     let mut empty_rr = vec![0u8; 8];
     empty_rr[0] = 0x80; // V=2 RC=0
@@ -146,17 +145,17 @@ pub fn build_bye(reporter_ssrc: u32) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// RtcpSender（锚 Go RTCPSender.Run / SendBYE）
+// RtcpSender（周期保活 run + 终结 send_bye）
 // ---------------------------------------------------------------------------
 
-/// UDP "dial"：bind 临时端口 + connect（等价 Go `net.Dial("udp", dst)`）。
+/// UDP "dial"：bind 临时端口 + connect。
 fn udp_dial(dst: &str) -> io::Result<UdpSocket> {
     let sock = UdpSocket::bind("0.0.0.0:0")?;
     sock.connect(dst)?;
     Ok(sock)
 }
 
-/// RTCP keepalive sender：周期发 RR+SDES，session 终结发 BYE。锚 Go `RTCPSender`。
+/// RTCP keepalive sender：周期发 RR+SDES，session 终结发 BYE。
 #[derive(Default)]
 pub struct RtcpSender {
     /// 可选 log hook。
@@ -171,14 +170,13 @@ impl RtcpSender {
     }
 
     /// 周期（5s，tunable）向 `dst`（outdoor:6671）发 RR+SDES 直到 `stop` 置位。
-    /// 锚 Go `Run`（ctx → `AtomicBool` stop flag）。
     ///
     /// - `ssrc_source` 返回当前 RTP 流 SSRC（`None` = 尚未到达，跳过本轮但继续
     ///   ticker，避免空 SSRC 下发）
     /// - `reporter_ssrc` 是本端报告者 SSRC（session 生命周期内不变）
     /// - dial 失败 → 带错返回（keepalive 线程退出、session 照常活，靠 TTL 兜底）
     /// - 周期 send 失败 → 仅 log、继续下轮
-    /// - 首包在 t≈周期处（无 0 时刻 tick，等价 Go `time.Ticker`）
+    /// - 首包在 t≈周期处（无 0 时刻 tick）
     pub fn run(
         &self,
         dst: &str,
@@ -195,7 +193,7 @@ impl RtcpSender {
         let mut next_tick = Instant::now() + interval; // 无 0 时刻 tick。
         loop {
             // 分片 park_timeout 等到 next_tick 或 stop（单调 Instant 判据，
-            // spurious 提前唤醒不会误判到点——复刻 ② 计时线程模式）。
+            // spurious 提前唤醒不会误判到点——复刻计时线程模式）。
             loop {
                 if stop.load(Ordering::SeqCst) {
                     return Ok(());
@@ -220,7 +218,6 @@ impl RtcpSender {
     }
 
     /// 一次性发空 RR + SDES + BYE 复合包（session 终结，best-effort）。
-    /// 锚 Go `SendBYE`。
     pub fn send_bye(&self, dst: &str, reporter_ssrc: u32) -> io::Result<()> {
         let conn = udp_dial(dst)?;
         conn.send(&build_bye(reporter_ssrc))?;
@@ -228,7 +225,7 @@ impl RtcpSender {
     }
 }
 
-// ── 单测（移植 Go rtcp_test.go + mock UDP receiver 端到端）─────────────────────
+// ── 单测（builder 静态构造 + mock UDP receiver 端到端）─────────────────────────
 // 逐字节 golden 在 tests/golden_video.rs（video_rtcp.txt：rr/sdes/rrsdes/bye ×3 组 SSRC）。
 
 #[cfg(test)]
@@ -238,7 +235,7 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
-    /// 移植 Go `TestBuildRR_Format`。
+    /// RR 包格式校验。
     #[test]
     fn build_rr_format() {
         let pkt = build_rr(0x2238_9cb9, 0x3e4a_b183);
@@ -259,7 +256,7 @@ mod tests {
         assert!(pkt[12..].iter().all(|&b| b == 0), "loss/jitter 全 0");
     }
 
-    /// 移植 Go `TestBuildSDES_FormatAndAlign`。
+    /// SDES 包格式与 4-byte align 校验。
     #[test]
     fn build_sdes_format_and_align() {
         let pkt = build_sdes(0x2238_9cb9);
@@ -286,7 +283,7 @@ mod tests {
         );
     }
 
-    /// 移植 Go `TestBuildBYE_TripleCompound`：空 RR + SDES + BYE 三段复合。
+    /// 空 RR + SDES + BYE 三段复合包校验。
     #[test]
     fn build_bye_triple_compound() {
         let pkt = build_bye(0x2238_9cb9);
@@ -358,8 +355,7 @@ mod tests {
         set_report_interval_ms_for_test(prev);
     }
 
-    /// 移植 Go `TestRTCPSender_RunSkipsWhenSSRCUnknown`：source 返 None 不发包、
-    /// 不报错不退出。
+    /// source 返 None 不发包、不报错不退出。
     #[test]
     fn run_skips_when_ssrc_unknown() {
         let prev = set_report_interval_ms_for_test(50);
@@ -391,7 +387,7 @@ mod tests {
         set_report_interval_ms_for_test(prev);
     }
 
-    /// dial 失败（spec 场景「RTCP dial 失败不拖垮 session」的本模块面）：
+    /// dial 失败的本模块面：
     /// run 带错返回——线程退出、session 照常活由 session 层兜底。
     #[test]
     fn run_dial_failure_returns_error() {
@@ -403,7 +399,7 @@ mod tests {
         let _ = err;
     }
 
-    /// 移植 Go `TestRTCPSender_SendBYE_ReachesReceiver`：BYE 复合包到达且含三 PT。
+    /// BYE 复合包到达且含三 PT。
     #[test]
     fn send_bye_reaches_receiver() {
         let recv = UdpSocket::bind("127.0.0.1:0").expect("mock receiver");

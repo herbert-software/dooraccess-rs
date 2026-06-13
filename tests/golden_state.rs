@@ -1,10 +1,10 @@
-// golden parity 回归：automation_state parse + render，对照 committed 向量
-// testdata/golden/automation_state.txt（SoT = Go local/dooraccess-go internal/automationstate）。
+// golden parity 回归：automation_state parse + render，对照 committed golden 向量
+// testdata/golden/automation_state.txt。
 //
-// 断言粒度（per spec rust-protocol-core / D1）：
+// 断言粒度：
 //   - render 逐字节精确相等。
 //   - parse_ok：State 两 bool 逐字段相等。
-//   - parse_err：parse 返 ParseError（整文件丢弃分类与 Go ErrParse 对应，sentinel 级，
+//   - parse_err：parse 返 ParseError（整文件丢弃分类，sentinel 级，
 //     不断言 message 字面）；覆盖缺 key / 未知 key / 非法 bool / 缺 = / 空 / 半写各路径。
 
 use dooraccess_rs::automation_state::{parse, render, ParseError, State};
@@ -116,7 +116,7 @@ fn golden_automation_state() {
                 );
                 let raw = hex_decode(c.input_hex.as_deref().unwrap_or(""));
                 let got = parse(&raw);
-                // sentinel 级分类：整文件丢弃 → Err(ParseError)，与 Go ErrParse 对应。
+                // sentinel 级分类：整文件丢弃 → Err(ParseError)。
                 assert_eq!(
                     got,
                     Err(ParseError),
@@ -173,8 +173,8 @@ fn parse_discard_paths_are_errparse() {
 // parse_ok：注释/空行跳过 + 大小写不敏感 + 数字 bool + 行序无关。
 #[test]
 fn parse_ok_comments_and_bool_forms() {
-    // key 精确匹配（与 Go 一致：switch key{case "auto_hangup"} 大小写敏感）；
-    // 仅 VALUE 大小写不敏感（Go parseBool 对 value 做 ToLower）。故 key 小写、value 用大写 TRUE 验值大小写不敏感。
+    // key 精确匹配（大小写敏感）；仅 VALUE 大小写不敏感（bool 解析对 value 做小写化）。
+    // 故 key 小写、value 用大写 TRUE 验值大小写不敏感。
     let raw = b"; daemon-managed\n# header\n\nauto_hangup=TRUE\nauto_unlock=0\n";
     assert_eq!(
         parse(raw),
@@ -198,7 +198,7 @@ fn render_fixed_two_lines() {
 }
 
 // ===========================================================================
-// Persister / write_atomic（Phase4 G1，6.1-6.3）
+// Persister / write_atomic
 // ===========================================================================
 
 use std::path::PathBuf;
@@ -245,7 +245,7 @@ fn write_atomic_produces_render_bytes_no_tmp_residue() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// 拨动后原子落盘 + 重启回读一致（6.1/6.2 + spec「重启回读」）。
+// 拨动后原子落盘 + 重启回读一致。
 #[test]
 fn persist_writes_then_reload_reads_back() {
     let dir = unique_tmp_dir("rt");
@@ -333,7 +333,7 @@ fn persist_same_value_is_noop() {
 }
 
 // 落盘失败 best-effort：目录不可写（path 指向不存在的子目录）→ persist 不 panic、不阻塞，
-// log hook 收到一行错误（6.3）。
+// log hook 收到一行错误。
 #[test]
 fn persist_write_failure_is_best_effort() {
     let dir = unique_tmp_dir("fail");

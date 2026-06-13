@@ -1,18 +1,17 @@
-//! `listen6672`：门禁网 UDP 6672 事件信号监听（组 C）。
+//! `listen6672`：门禁网 UDP 6672 事件信号监听。
 //!
-//! 移植 Go `internal/listen6672`（`parser.go` / `dedup.go` / `numquery.go` /
-//! `listener.go` / `listener_linux.go` / `listener_other.go`）：
+//! 组成：
 //!   - parser `extract_udp_payload`（L2→ethertype 0x0800→IP(ihl/proto=17)→UDP→
 //!     payload+srcIP+srcPort，全 `from_be_bytes` 读 wire，untagged-only）
 //!   - `parse_frame`（21 字节定长）+ `classify`（**响铃 byte19 ∈ {0x8c,0x94,0x95}
-//!     多值，锚 Go parser.go:88** / 呼梯 0x90 仅 log / keepalive silent drop /
+//!     多值** / 呼梯 0x90 仅 log / keepalive silent drop /
 //!     号码查询 + 响应）
 //!   - dedup ringbuffer（key=srcIP^srcPort<<32^FNV-1a(payload)，64 容量 / 200ms 窗口，
 //!     **时钟注入 seam**）
 //!   - numquery 响应构造（`build_number_query_response`）
 //!   - dispatch（按 byte19 trailer 路由回调）+ `dispatch_with_dedup`
 //!   - PF_PACKET recv 循环（per slave `std::thread` + SO_RCVTIMEO=500ms wakeup +
-//!     shutdown flag `AtomicBool` + 关 fd）；非 Linux stub 返错（对齐 Go `listener_other.go`）。
+//!     shutdown flag `AtomicBool` + 关 fd）；非 Linux stub 返错。
 //!
 //! BPF const 用 `crate::bpf::BPF_6672`；socket 缝用 `crate::ffi`。
 
@@ -22,7 +21,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 // ===========================================================================
-// parser（锚 Go parser.go）
+// parser
 // ===========================================================================
 
 /// 6672 帧固定 21 字节。
@@ -51,7 +50,7 @@ pub struct Frame {
     pub raw: [u8; FRAME_SIZE],
 }
 
-/// 解析错误（锚 Go `ErrFrameSize` / `ErrFrameMagic`）。
+/// 解析错误（长度不符 / magic 不符）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
     /// payload 长度不是 21 字节。
@@ -78,8 +77,8 @@ impl std::error::Error for ParseError {}
 /// 把 21 字节 UDP payload 解析为 `Frame`。
 ///
 /// 严格模式：长度 != 21 或 byte 17-18 != 00 40 → 报错（不变量）。
-/// 锚 Go `ParseFrame`。byte 13-16 是 little-endian（与 wire BE 字段不同——这是
-/// 安居宝 6672 帧的固有 LE 字段，逐字复刻 Go `binary.LittleEndian.Uint32`）。
+/// byte 13-16 是 little-endian（与 wire BE 字段不同——这是
+/// 安居宝 6672 帧的固有 LE 字段，按 little-endian 读取）。
 pub fn parse_frame(payload: &[u8]) -> Result<Frame, ParseError> {
     if payload.len() != FRAME_SIZE {
         return Err(ParseError::FrameSize(payload.len()));
@@ -108,7 +107,7 @@ pub fn parse_frame(payload: &[u8]) -> Result<Frame, ParseError> {
     })
 }
 
-/// 6672 帧分类（锚 Go `EventKind`）。
+/// 6672 帧分类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {
     /// 未知。
@@ -126,7 +125,7 @@ pub enum EventKind {
 }
 
 impl EventKind {
-    /// 易读名（log 用），锚 Go `EventKind.String`。
+    /// 易读名（log 用）。
     pub fn as_str(&self) -> &'static str {
         match self {
             EventKind::Ring => "ring",
@@ -139,11 +138,11 @@ impl EventKind {
     }
 }
 
-/// 把已解析的 `Frame` 归入 `EventKind`（锚 Go `Classify`）。
+/// 把已解析的 `Frame` 归入 `EventKind`。
 ///
-/// **响铃 byte19 多值识别**：`subtype ∈ {0x8c, 0x94, 0x95}` 都归 `Ring`（锚 Go
-/// parser.go:88 `case 0x8c, 0x94, 0x95:`，v0.3.3 fix-doorbell-pipeline）。只认 0x94
-/// 会漏判 0x8c/0x95 的真实响铃帧——即 Go v0.3.3 已修的漏分类 bug，**禁止退回单值**。
+/// **响铃 byte19 多值识别**：`subtype ∈ {0x8c, 0x94, 0x95}` 都归 `Ring`
+/// （`case 0x8c, 0x94, 0x95:`）。只认 0x94 会漏判 0x8c/0x95 的真实响铃帧，
+/// **禁止退回单值**。
 pub fn classify(f: &Frame) -> EventKind {
     if f.flag == 0x01 {
         return EventKind::NumberResponse;
@@ -165,7 +164,7 @@ pub fn classify(f: &Frame) -> EventKind {
     }
 }
 
-/// 从 L2 帧中抽 UDP payload + src IP + src port（锚 Go `extractUDPPayload`）。
+/// 从 L2 帧中抽 UDP payload + src IP + src port。
 ///
 /// BPF 已过滤为 IPv4/UDP/dst:6672。untagged-only（slave 接口 frame 已被 kernel 剥
 /// 802.1Q tag，**不需要 VLAN-aware 双路径**）。全用 `from_be_bytes` 读 wire 多字节字段
@@ -204,13 +203,13 @@ pub fn extract_udp_payload(frame: &[u8]) -> Option<(Vec<u8>, [u8; 4], u16)> {
 }
 
 // ===========================================================================
-// numquery（锚 Go numquery.go）
+// numquery
 // ===========================================================================
 
 /// anjubao 6672 协议的标准端口。
 pub const DEFAULT_UDP_PORT: u16 = 6672;
 
-/// 构造 21 字节号码查询响应帧（锚 Go `BuildNumberQueryResponse`）。
+/// 构造 21 字节号码查询响应帧。
 ///
 /// 字段 layout：
 ///   byte 0:     0x01 (response)
@@ -236,23 +235,22 @@ pub fn build_number_query_response(req_frame: &Frame, our_ip: [u8; 4]) -> [u8; F
     out
 }
 
-/// 单播响应到 `dst_ip:DEFAULT_UDP_PORT`（锚 Go `SendUDPResponse`）。
+/// 单播响应到 `dst_ip:DEFAULT_UDP_PORT`。
 ///
-/// spec 实测邻居都是单播回应而非广播。不要求 `SO_BINDTODEVICE`：目标在门禁网，OS
+/// 实测邻居都是单播回应而非广播。不要求 `SO_BINDTODEVICE`：目标在门禁网，OS
 /// 路由表 + src IP 选择会走对的网卡。出错返 `io::Error`，调用方负责 log。
 ///
 /// 实现走 std `UdpSocket`（无需 libc——本 send 路径不在 PF_PACKET listener I/O 零改动
 /// 伞下，是**新 BE 面**：`SocketAddrV4` 内部把 port 编 NBO；`dst_ip` 已是 `[u8; 4]`
-/// 网络序字节，端口用平台无关 `Ipv4Addr`/`SocketAddrV4` 构造而非手写移位。BE 正确性
-/// dev[LE] 测不出，留 Phase 7 真机验。
+/// 网络序字节，端口用平台无关 `Ipv4Addr`/`SocketAddrV4` 构造而非手写移位）。
 pub fn send_udp_response(dst_ip: [u8; 4], payload: &[u8]) -> std::io::Result<()> {
     send_udp_response_to(dst_ip, DEFAULT_UDP_PORT, payload)
 }
 
 /// `send_udp_response` 的端口参数化内部版本（测试用任意端口替换 6672 避开 root/防火墙）。
 ///
-/// 绑定到 `0.0.0.0:0` 临时本地端口后 `connect` 目标再 `send`（等价 Go `net.DialUDP`
-/// nil laddr：内核选 src IP + 临时端口）。`SocketAddrV4` 承载端口的 NBO 编码（不手写
+/// 绑定到 `0.0.0.0:0` 临时本地端口后 `connect` 目标再 `send`（内核选 src IP +
+/// 临时端口）。`SocketAddrV4` 承载端口的 NBO 编码（不手写
 /// `v<<8|v>>8`，守平台无关字节序）。
 pub fn send_udp_response_to(dst_ip: [u8; 4], dst_port: u16, payload: &[u8]) -> std::io::Result<()> {
     use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
@@ -269,20 +267,19 @@ pub fn send_udp_response_to(dst_ip: [u8; 4], dst_port: u16, payload: &[u8]) -> s
 }
 
 // ===========================================================================
-// dedup ringbuffer（锚 Go dedup.go，时钟注入 seam）
+// dedup ringbuffer（时钟注入 seam）
 // ===========================================================================
 
-/// ringbuffer 固定容量（design.md 决策 4：一次响铃 broadcast burst 8 帧 × 2 slave =
-/// 16，4× 安全余量 = 64）。
+/// ringbuffer 固定容量（一次响铃 broadcast burst 8 帧 × 2 slave = 16，4× 安全余量 = 64）。
 pub const DEDUP_CAPACITY: usize = 64;
 
-/// 同 key 视为重复的时间窗（design.md 决策 4：200ms 覆盖 bridge forward 最坏延迟）。
+/// 同 key 视为重复的时间窗（200ms 覆盖 bridge forward 最坏延迟）。
 pub const DEDUP_WINDOW_MS: u64 = 200;
 
 /// 可注入时钟 seam：返回单调毫秒时刻。
 ///
 /// 生产用 `MonotonicClock`（包 `std::time::Instant`）；测试用固定时刻 fake clock
-/// 让时间相关 ringbuffer 行为确定（锚 Go `monotonicNow` 可注入封装）。
+/// 让时间相关 ringbuffer 行为确定（单调时刻可注入封装）。
 pub trait Clock: Send + Sync {
     /// 返回单调毫秒时刻（任意起点，仅差值有意义）。
     fn now_ms(&self) -> u64;
@@ -321,7 +318,7 @@ struct DedupEntry {
     set: bool,
 }
 
-/// 固定容量 ringbuffer，用于多 slave 模式去重相同 frame（锚 Go `Dedup`）。
+/// 固定容量 ringbuffer，用于多 slave 模式去重相同 frame。
 ///
 /// 线程安全：内部 `Mutex`。`seen` 是唯一写入路径。
 pub struct Dedup {
@@ -353,7 +350,7 @@ impl Dedup {
     /// 命中后**不**更新 ts（避免连续同 key 永久 dedup）；未命中则把当前 (key, now) 写入
     /// head 位置（环形覆盖最旧 entry）。
     ///
-    /// 边界含 cutoff 时刻自身（now-ts == window 算窗口内重复）——锚 Go `!ts.Before(cutoff)`
+    /// 边界含 cutoff 时刻自身（now-ts == window 算窗口内重复，即 `ts >= cutoff`），
     /// 让 200ms 边界 frame 也被 dedup。
     pub fn seen(&self, key: u64, now_ms: u64) -> bool {
         let mut inner = self.inner.lock().unwrap();
@@ -363,7 +360,7 @@ impl Dedup {
             if !e.set {
                 continue;
             }
-            // !ts.Before(cutoff) ≡ ts >= cutoff（含边界）。
+            // ts >= cutoff（含边界）。
             if e.key == key && e.ts_ms >= cutoff {
                 return true;
             }
@@ -385,7 +382,7 @@ impl Default for Dedup {
     }
 }
 
-/// 算 frame 的 dedup 哈希（锚 Go `dedupKey`）。
+/// 算 frame 的 dedup 哈希。
 ///
 /// key = src_ip(4B BE) ^ (src_port(2B) << 32) ^ FNV-1a(payload[0:FrameSize])。
 ///
@@ -394,12 +391,12 @@ impl Default for Dedup {
 pub fn dedup_key(src_ip: [u8; 4], src_port: u16, payload: &[u8]) -> u64 {
     let n = payload.len().min(FRAME_SIZE);
     let hash = fnv1a_64(&payload[..n]);
-    // src_ip BE → u32（锚 Go binary.BigEndian.Uint32(v4)）。
+    // src_ip BE → u32（big-endian 读取）。
     let ip_bits = u32::from_be_bytes(src_ip) as u64;
     hash ^ ip_bits ^ ((src_port as u64) << 32)
 }
 
-/// FNV-1a 64-bit（锚 Go `hash/fnv.New64a`）。无加密强度需求，仅需冲突概率 ≈ 0。
+/// FNV-1a 64-bit。无加密强度需求，仅需冲突概率 ≈ 0。
 fn fnv1a_64(data: &[u8]) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -412,7 +409,7 @@ fn fnv1a_64(data: &[u8]) -> u64 {
 }
 
 // ===========================================================================
-// dispatch / Listener（锚 Go listener.go）
+// dispatch / Listener
 // ===========================================================================
 
 /// frame 分发回调签名 `(src_ip, frame)`：`src_ip` 来自 PF_PACKET 解析，
@@ -422,8 +419,7 @@ pub type FrameCallback = Box<dyn Fn([u8; 4], &Frame) + Send + Sync>;
 /// 可选 log hook 签名。
 pub type LogFn = Box<dyn Fn(&str) + Send + Sync>;
 
-/// frame 分发回调集合（锚 Go `Listener` 的 `OnRing` / `OnElevatorKey` /
-/// `OnNumberQuery` / `OnNumberResponse` 字段）。
+/// frame 分发回调集合（响铃 / 呼梯 / 号码查询 / 号码响应 各一个回调字段）。
 ///
 /// 各回调可为 `None`。
 #[derive(Default)]
@@ -438,8 +434,7 @@ pub struct Callbacks {
     pub on_number_response: Option<FrameCallback>,
 }
 
-/// 监听一组物理 slave 接口上的 UDP 6672 帧，按 `EventKind` 分发到注册回调
-/// （锚 Go `Listener`）。
+/// 监听一组物理 slave 接口上的 UDP 6672 帧，按 `EventKind` 分发到注册回调。
 ///
 /// 跨平台部分（`dispatch` / 回调）在所有平台可用；`run` 仅 Linux 实现（PF_PACKET +
 /// BPF），非 Linux stub 返错。
@@ -496,7 +491,7 @@ impl Listener {
         }
     }
 
-    /// 把单个 frame + 源 IP 路由到对应回调（锚 Go `Dispatch`）。
+    /// 把单个 frame + 源 IP 路由到对应回调。
     ///
     /// 用于：① Linux `run` 主循环每收到一帧调用一次；② 单元测试直接喂 mock payload
     /// 绕过 PF_PACKET socket。
@@ -553,8 +548,7 @@ impl Listener {
         }
     }
 
-    /// 在多 slave 模式下用 dedup 去重后再 `dispatch`；单 slave 直 `dispatch`
-    /// （锚 Go `dispatchWithDedup`）。
+    /// 在多 slave 模式下用 dedup 去重后再 `dispatch`；单 slave 直 `dispatch`。
     pub fn dispatch_with_dedup(&self, src_ip: [u8; 4], src_port: u16, payload: &[u8]) {
         if let Some(dedup) = &self.dedup {
             let key = dedup_key(src_ip, src_port, payload);
@@ -565,7 +559,7 @@ impl Listener {
         self.dispatch(src_ip, payload);
     }
 
-    /// 启动监听主循环（Linux PF_PACKET 实现，非 Linux 立即返错；锚 Go `Run`）。
+    /// 启动监听主循环（Linux PF_PACKET 实现，非 Linux 立即返错）。
     ///
     /// 阻塞直到 `shutdown` 置位；返回时清理所有 slave socket。
     ///
@@ -584,7 +578,7 @@ impl Listener {
 pub enum ListenerError {
     /// `slaves` 为空。
     NoSlaves,
-    /// PF_PACKET 仅 Linux 支持（非 Linux stub 路径，对齐 Go `listener_other.go`）。
+    /// PF_PACKET 仅 Linux 支持（非 Linux stub 路径）。
     Unsupported,
     /// 某个 slave socket 阶段失败（携带 slave 名 + 底层 FFI 错误）。
     Slave(String, crate::ffi::FfiError),
@@ -608,7 +602,7 @@ impl core::fmt::Display for ListenerError {
 
 impl std::error::Error for ListenerError {}
 
-// --- Linux PF_PACKET recv 循环（锚 Go listener_linux.go runPlatform/runSlave）---
+// --- Linux PF_PACKET recv 循环 ---
 
 #[cfg(target_os = "linux")]
 impl Listener {
@@ -706,7 +700,7 @@ impl Listener {
     }
 }
 
-// --- 非 Linux stub（对齐 Go listener_other.go）---
+// --- 非 Linux stub ---
 
 #[cfg(not(target_os = "linux"))]
 impl Listener {
@@ -797,7 +791,7 @@ mod tests {
 
     #[test]
     fn classify_ring_multivalue() {
-        // ★ 核心：三个响铃 byte19 值都须识别为 Ring（锚 Go parser.go:88）。
+        // ★ 核心：三个响铃 byte19 值都须识别为 Ring。
         for st in [0x8c, 0x94, 0x95] {
             let f = parse_frame(&ring_frame(st)).unwrap();
             assert_eq!(
@@ -918,7 +912,7 @@ mod tests {
         assert_eq!(resp[20], req.event_id);
     }
 
-    // --- send_udp_response（8.0，loopback 单播发送原语）---
+    // --- send_udp_response（loopback 单播发送原语）---
 
     #[test]
     fn send_udp_response_loopback_roundtrip() {
@@ -927,7 +921,7 @@ mod tests {
         // 在 127.0.0.1 起一个临时 receiver，让内核选端口（避免端口占用 flaky）。
         let recv = match UdpSocket::bind("127.0.0.1:0") {
             Ok(s) => s,
-            // 沙箱可能拦 UDP bind → 跳过（非逻辑失败；BE 正确性本就留 Phase 7 真机）。
+            // 沙箱可能拦 UDP bind → 跳过（非逻辑失败）。
             Err(e) => {
                 eprintln!("send_udp_response_loopback_roundtrip skipped: bind failed: {e}"); // TEST-ONLY
                 return;

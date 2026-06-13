@@ -1,20 +1,19 @@
 // automation_state 模块（parse + render + 原子写 Persister）。
 //
-// 移植 Go `local/dooraccess-go internal/automationstate`：
-//   - Phase1：两个纯函数 `parse` / `render`。
-//   - Phase4（本组 G1）：`write_atomic`（temp + rename 原子写）+ `Persister`（自带内部锁
-//     串行化 + 纯值去重，逐行对齐 Go `Persist`）。
+//   - 两个纯函数 `parse` / `render`。
+//   - `write_atomic`（temp + rename 原子写）+ `Persister`（自带内部锁
+//     串行化 + 纯值去重）。
 //
 // 文件格式（INI 2 行）：
 //
 //     auto_unlock=true
 //     auto_hangup=false
 //
-// 解析约束（与 Go 等价）：
+// 解析约束：
 //   - 严格 2-key：必须 `auto_unlock` 与 `auto_hangup` 两个 key 都存在且都是合法 bool
 //     （`true/false/1/0`，大小写不敏感），否则**整文件丢弃**返 `ParseError`。
 //   - 缺任一 key / 空文件 / 未知 key / 非法 bool / 缺 `=` 一律整文件丢弃（**禁止**部分恢复），
-//     与 Go `ErrParse` 路径等价（单一 sentinel）。
+//     单一 `ParseError` sentinel。
 //   - `;` 与 `#` 注释行、空行被跳过。
 
 /// State 是持久文件解析出的两个 bool。
@@ -25,14 +24,14 @@ pub struct State {
 }
 
 /// ParseError 表示 state 文件存在但解析失败（空 / 半写 / 非法 bool / 缺 key / 未知 key /
-/// 缺 `=`）。整文件丢弃，禁部分恢复——与 Go `ErrParse` 同性质的单一 sentinel。
+/// 缺 `=`）。整文件丢弃，禁部分恢复——单一 sentinel。
 /// caller 须降级用 config 默认。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParseError;
 
 /// parse 解析 state 文件字节。两个 key 都须存在且合法 bool，否则整文件丢弃返 `ParseError`。
 ///
-/// 对照 Go `automationstate.parse`：非 UTF-8 输入视为损坏 → 整文件丢弃。
+/// 非 UTF-8 输入视为损坏 → 整文件丢弃。
 pub fn parse(raw: &[u8]) -> Result<State, ParseError> {
     let text = core::str::from_utf8(raw).map_err(|_| ParseError)?;
 
@@ -49,8 +48,7 @@ pub fn parse(raw: &[u8]) -> Result<State, ParseError> {
         if s.starts_with(';') || s.starts_with('#') {
             continue;
         }
-        // Go: eq := strings.IndexByte(s, '='); if eq <= 0 → ErrParse
-        // （未找到 = -1、或位于 0 意味空 key）。
+        // 找 '='；未找到或位于 0（空 key）→ ParseError。
         let eq = match s.find('=') {
             Some(i) if i > 0 => i,
             _ => return Err(ParseError),
@@ -95,7 +93,7 @@ fn parse_bool(v: &str) -> Option<bool> {
 /// render 把 State 序列化成固定 2 行 INI 字节（确定性顺序）。
 ///
 /// 输出恒为 `auto_unlock=<bool>\nauto_hangup=<bool>\n`，`<bool>` 为 `true`/`false`
-/// 字面，逐字节与 Go `render` 相等。
+/// 字面（逐字节与 committed golden 相等）。
 pub fn render(st: State) -> Vec<u8> {
     let mut out = String::new();
     out.push_str("auto_unlock=");
@@ -108,17 +106,17 @@ pub fn render(st: State) -> Vec<u8> {
 }
 
 // ===========================================================================
-// 原子写 + Persister（Phase4 G1，锚 Go `writeAtomic` / `Persister`）
+// 原子写 + Persister
 // ===========================================================================
 
 use std::path::Path;
 use std::sync::Mutex;
 
 /// temp 文件后缀（固定名覆盖写：rename 前崩留的残留下次被覆盖，禁唯一/pid 名累积
-/// 16MB flash，逐字对齐 Go `tempSuffix`）。
+/// 16MB flash）。
 const TEMP_SUFFIX: &str = ".tmp";
 
-/// 原子写：写固定名 temp（**同目录**）→ `rename` 到目标（锚 Go `writeAtomic`）。
+/// 原子写：写固定名 temp（**同目录**）→ `rename` 到目标。
 ///
 /// `path + ".tmp"` 与 `path` 必然同目录（POSIX `rename` 同文件系统内原子替换；跨 fs
 /// rename 非原子——同目录前缀拼接结构性保证同目录，无需运行时断言跨 fs）。
@@ -140,20 +138,20 @@ pub fn write_atomic(path: &Path, st: State) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 返回当前运行时两 flag 真值的回调类型（锚 Go `valueSource func() (autoUnlock, autoHangup bool)`）。
+/// 返回当前运行时两 flag 真值 `(auto_unlock, auto_hangup)` 的回调类型。
 ///
-/// `Persist` 每次调用时读它取**当前真值**（非入队/构造时快照）——保证翻转后 pending
+/// `persist` 每次调用时读它取**当前真值**（非入队/构造时快照）——保证翻转后 pending
 /// 同值写不回退翻转值。
 pub type ValueSource = Box<dyn Fn() -> (bool, bool) + Send + Sync>;
 
 /// 写失败 warning 日志钩子类型（`None` 安全）。
 pub type LogFn = Box<dyn Fn(&str) + Send + Sync>;
 
-/// 串行化 + 纯值去重地把当前 flag 值落盘（锚 Go `Persister`）。
+/// 串行化 + 纯值去重地把当前 flag 值落盘。
 ///
 /// 用法：endpoint 改运行时 atomic flag 后调 `persist()`；`persist` 读 `value_source`
 /// 当前真值（非快照）+ 只在与已落盘值不同时写（**纯值去重**：重复同值 no-op、翻转立即
-/// 落盘，**无时间窗节流**——逐行对齐 Go `Persist`）。
+/// 落盘，**无时间窗节流**）。
 ///
 /// 串行化由 `Persister` **自身的内部锁** `Mutex<PersistedState>` 保证（`persist` 由 HTTP
 /// 线程调，`/auto_unlock` 与 `/auto_hangup` 可在不同 HTTP 线程并发拨动；已删除的 wireMu
@@ -171,14 +169,14 @@ pub struct Persister {
 
 /// 已落盘状态（受 `Persister.state` 锁保护）。
 struct PersistedState {
-    /// `last` 是否有效（首次 persist 前无意义，对齐 Go `hasWrote`）。
+    /// `last` 是否有效（首次 persist 前无意义）。
     has_wrote: bool,
     /// 已成功落盘的值（去重：当前==last 则 no-op）。
     last: State,
 }
 
 impl Persister {
-    /// 构造一个 `Persister`（锚 Go `NewPersister`）。
+    /// 构造一个 `Persister`。
     ///
     ///   - `path`：state 文件绝对路径（生产 `/etc/dooraccess-go/automation.state`，落 /etc overlay）。
     ///   - `value_source`：返回当前运行时两 flag 真值 `(auto_unlock, auto_hangup)` 的回调。
@@ -207,7 +205,7 @@ impl Persister {
 
     /// 把当前 flag 真值落盘（串行化 + 纯值去重）。best-effort：写失败 log warning 不返错。
     ///
-    /// 去重语义（逐行对齐 Go `Persist`）：读当前真值，仅在与已落盘值不同时写——重复同值
+    /// 去重语义：读当前真值，仅在与已落盘值不同时写——重复同值
     /// no-op（防 flash 磨损），值翻转立即落盘（**无时间窗去抖**）。
     pub fn persist(&self) {
         // 锁住整个临界区（读真值→去重比对→写盘→更新 last），串行化并发 persist。

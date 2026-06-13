@@ -1,23 +1,21 @@
-//! transmux：H.264 NAL → FLV 静态构造 + [`StreamWriter`]（移植 Go
-//! `internal/video/transmux.go` 的 FLVHeader / PackAVCDecoderConfig /
-//! BuildAVCSequenceHeaderTag / BuildAVCNALUTag / StreamWriter.Run /
-//! relativeFLVTimestamp）。
+//! transmux：H.264 NAL → FLV 静态构造 + [`StreamWriter`]（FLV header /
+//! AVCDecoderConfigurationRecord / seq-header tag / NALU tag / 流写出 /
+//! 相对时间戳换算）。
 //!
-//! 多字节字段全部显式 BE（FLV 是 big-endian 容器格式），逐字节 golden 锚 Go 导出
-//! （`testdata/golden/video_flv.txt`）。
+//! 多字节字段全部显式 BE（FLV 是 big-endian 容器格式），逐字节 golden 锚
+//! `testdata/golden/video_flv.txt`。
 //!
-//! StreamWriter 等价纪律（spec「FLV transmux 字节等价」）：
+//! StreamWriter 纪律：
 //!   - 启动顺序：写 FLV header → 等首 IDR（**超时由 HTTP handler 侧持有**——
 //!     handler 先以自己的 deadline 调 `FrameBuffer::wait_idr`，StreamWriter 自身
 //!     **无超时**、不再造一层等待）→ SPS/PPS/IDR 三件套校验 → seq-header + 首
 //!     IDR（均 ts=0）→ 订阅增量 → 逐 tag 写 + flush
 //!   - 订阅循环**仅跳过 SPS/PPS**（重复参数集）；**IDR 不跳过——后续每个 IDR 以
-//!     keyframe tag（0x17）写出**（Go transmux.go:247 实际行为；其旁陈旧注释
-//!     「跳过 SPS/PPS/IDR」禁抄——只有 IDR 持续写出，HA stream/HLS 才能切段与恢复）
+//!     keyframe tag（0x17）写出**（只有 IDR 持续写出，HA stream/HLS 才能切段与恢复）
 //!   - ts 换算 RTP 90kHz → FLV 1ms：`wrapping_sub` 32-bit 回绕安全后 /90，
 //!     **base 取种子 IDR 的 RTP ts**（非订阅到的首 NAL）
-//!   - `SnapshotFLV` **不移植**（Go 生产死代码：`serveVideoSnapshot` 直接 503
-//!     stub、无生产调用方——design 非目标登记的有意省略）
+//!   - `SnapshotFLV` **不实现**（`serveVideoSnapshot` 直接 503 stub、无调用方
+//!     ——有意省略）
 
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -47,7 +45,6 @@ const FLV_VERSION: u8 = 0x01;
 const FLV_FLAGS_VIDEO: u8 = 0x01;
 
 /// 返 13B FLV 头部块 = 9B header（仅 video flag）+ 4B PreviousTagSize0。
-/// 锚 Go `FLVHeader()`（一次返回）。
 ///
 /// 字节布局：
 ///   - 0-2   "FLV" signature
@@ -66,12 +63,10 @@ pub fn flv_header() -> [u8; FLV_HEADER_SIZE + 4] {
 }
 
 /// 把 SPS+PPS 打包成 AVCDecoderConfigurationRecord（ISO 14496-15）。
-/// 锚 Go `PackAVCDecoderConfig`。
 ///
 /// SPS/PPS 不含 Annex-B 前缀（`extract_nals_annexb` 已剥），从 NAL header byte 开始。
 ///
-/// **`sps.len() < 4` 或 `pps` 空（<1B）返 `None`**——与 Go
-/// `len(sps)<4 || len(pps)<1` 返 nil 等价；下游照 Go 静默写无 seq-header 的流
+/// **`sps.len() < 4` 或 `pps` 空（<1B）返 `None`**；下游静默写无 seq-header 的流
 /// （已知行为保持）。
 ///
 /// 字段：configurationVersion=1 / profile=sps[1] / profile_compat=sps[2] /
@@ -100,10 +95,9 @@ pub fn pack_avc_decoder_config(sps: &[u8], pps: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// 构造 FLV video tag 携带 AVCDecoderConfigurationRecord（AVC sequence header）。
-/// 锚 Go `BuildAVCSequenceHeaderTag`。
 ///
 /// 必须是流首个 video tag（HA stream component / ffplay 解码必读）。
-/// config 打包失败（SPS/PPS 边界）时返 `None`（Go 返 nil，下游静默跳过）。
+/// config 打包失败（SPS/PPS 边界）时返 `None`（下游静默跳过）。
 pub fn build_avc_sequence_header_tag(sps: &[u8], pps: &[u8], ts: u32) -> Option<Vec<u8>> {
     let cfg = pack_avc_decoder_config(sps, pps)?;
     // AVC payload 头：1 (frametype+codec) + 1 (avcPacketType) + 3 (composition time)。
@@ -115,11 +109,11 @@ pub fn build_avc_sequence_header_tag(sps: &[u8], pps: &[u8], ts: u32) -> Option<
     Some(wrap_tag(FLV_TAG_TYPE_VIDEO, ts, &body))
 }
 
-/// 构造 FLV video tag 携带一个或多个 H.264 NAL 单元。锚 Go `BuildAVCNALUTag`。
+/// 构造 FLV video tag 携带一个或多个 H.264 NAL 单元。
 ///
 /// frameType：任一 NAL type==5（IDR）→ keyframe 0x17，否则 inter 0x27。
 /// 每个 NAL 用 4 字节 big-endian length 前缀打包（lengthSizeMinusOne=3）；
-/// 多 NAL 可拼到同一 tag。`nals` 空时返 `None`（Go 返 nil）。
+/// 多 NAL 可拼到同一 tag。`nals` 空时返 `None`。
 pub fn build_avc_nalu_tag(nals: &[NalUnit], ts: u32) -> Option<Vec<u8>> {
     if nals.is_empty() {
         return None;
@@ -142,7 +136,7 @@ pub fn build_avc_nalu_tag(nals: &[NalUnit], ts: u32) -> Option<Vec<u8>> {
     Some(wrap_tag(FLV_TAG_TYPE_VIDEO, ts, &body))
 }
 
-/// 拼装 FLV tag header (11B) + body + PreviousTagSize (4B)。锚 Go `wrapTag`。
+/// 拼装 FLV tag header (11B) + body + PreviousTagSize (4B)。
 ///
 /// timestamp 低 24 位放 bytes 4-6（BE），高 8 位放 byte 7（extended timestamp）。
 fn wrap_tag(tag_type: u8, timestamp: u32, body: &[u8]) -> Vec<u8> {
@@ -167,15 +161,15 @@ fn wrap_tag(tag_type: u8, timestamp: u32, body: &[u8]) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// StreamWriter（锚 Go StreamWriter.Run + relativeFLVTimestamp）
+// StreamWriter（FLV 流写出 run + 相对时间戳换算）
 // ---------------------------------------------------------------------------
 
 /// StreamWriter 错误。
 #[derive(Debug)]
 pub enum StreamError {
-    /// 上游 FrameBuffer 已关 / 三件套缺失（锚 Go `ErrStreamClosed`）。
+    /// 上游 FrameBuffer 已关 / 三件套缺失。
     Closed,
-    /// `w` 写失败（典型为 client disconnect）。锚 Go 返非 nil 的 w.Write err。
+    /// `w` 写失败（典型为 client disconnect）。
     Io(io::Error),
 }
 
@@ -197,21 +191,20 @@ impl std::error::Error for StreamError {
     }
 }
 
-/// 把 [`FrameBuffer`] 的 NAL 流转封装成 FLV bytes 写到 `W`。锚 Go `StreamWriter`。
+/// 把 [`FrameBuffer`] 的 NAL 流转封装成 FLV bytes 写到 `W`。
 ///
 /// 协议时间基：RTP 90kHz → FLV 1ms；`flv_ts = wrapping_sub(base)/90`，
 /// base = 种子 IDR 的 RTP ts。
 ///
-/// flush 缝（组 F chunked HTTP 接上）：每 tag 写出后调 `w.flush()`——组 F 的
-/// chunked writer 在 `Write::flush` 里出 chunk 边界即得 per-tag flush；flush
-/// 错误被吞（对齐 Go flushAdapter 吞 Flush error——下一次 Write 自然失败退出）。
+/// flush 缝（chunked HTTP 接上）：每 tag 写出后调 `w.flush()`——chunked writer
+/// 在 `Write::flush` 里出 chunk 边界即得 per-tag flush；flush
+/// 错误被吞（下一次 Write 自然失败退出）。
 ///
-/// 等首 IDR 的 deadline/取消语义归调用方（Go `Run(ctx)` 用调用方 ctx；生产路径
-/// handler 已先行 `wait_idr`，Run 内部等待立即返——`video_handlers.go:247`）：
-/// Rust 形态为 [`StreamWriter::run`] **不等待**，调用方必须先以自己的 deadline
-/// 完成 `FrameBuffer::wait_idr` 再调 run；run 只做 closed / 三件套校验。
+/// 等首 IDR 的 deadline/取消语义归调用方（生产路径 handler 已先行 `wait_idr`，
+/// run 内部等待立即返）：[`StreamWriter::run`] **不等待**，调用方必须先以自己的
+/// deadline 完成 `FrameBuffer::wait_idr` 再调 run；run 只做 closed / 三件套校验。
 pub struct StreamWriter<W: Write> {
-    /// 输出目标（组 F：chunked HTTP body writer）。
+    /// 输出目标（chunked HTTP body writer）。
     pub w: W,
     /// 0 点基准：priming 取**种子 IDR** 的 RTP 时间戳（非订阅到的首 NAL）。
     base_rtp_timestamp: u32,
@@ -228,31 +221,31 @@ impl<W: Write> StreamWriter<W> {
         }
     }
 
-    /// 阻塞写流直到 buffer 关闭（含订阅 channel 断开）或写失败。锚 Go `Run`。
+    /// 阻塞写流直到 buffer 关闭（含订阅 channel 断开）或写失败。
     ///
     /// 前置：调用方已用自己的 deadline 完成 `buf.wait_idr(...)`（超时/closed 由
     /// 调用方映射 504/503，**不进入本方法**）。
     ///
     /// 返回：
     ///   - `Ok(())` 正常退出（buffer close → consumer channel 断开；或进入时已 close）
-    ///   - `Err(StreamError::Closed)` 三件套缺失（等价 Go `ErrStreamClosed`）
+    ///   - `Err(StreamError::Closed)` 三件套缺失
     ///   - `Err(StreamError::Io)` w 写失败（client disconnect）
     pub fn run(&mut self, buf: &Arc<FrameBuffer>) -> Result<(), StreamError> {
         self.w.write_all(&flv_header()).map_err(StreamError::Io)?;
         self.flush();
 
-        // 等首 IDR 归调用方（见 struct 文档）；此处对齐 Go LatestIDR 判序：
+        // 等首 IDR 归调用方（见 struct 文档）；此处的 latest_idr 判序：
         // close 保留三件套缓存 → closed 竞态下 latest_idr 仍返 Some → 照常写种子帧
         // （退化为单帧可解码 FLV 而非零帧空流）；三件套缺失 → ErrStreamClosed。
         let Some((sps, pps, idr)) = buf.latest_idr() else {
             return Err(StreamError::Closed);
         };
 
-        // 0 点基准 = 种子 IDR 的 RTP ts（Go transmux.go:219）。
+        // 0 点基准 = 种子 IDR 的 RTP ts。
         self.base_rtp_timestamp = idr.timestamp;
         self.base_rtp_set = true;
         // AVC sequence header（流首 tag，ts=0）；打包失败（SPS/PPS 边界）静默跳过
-        // ——与 Go nil 分支等价（已知行为保持）。
+        // （已知行为保持）。
         if let Some(seq) = build_avc_sequence_header_tag(&sps.data, &pps.data, 0) {
             self.w.write_all(&seq).map_err(StreamError::Io)?;
         }
@@ -262,12 +255,12 @@ impl<W: Write> StreamWriter<W> {
         }
         self.flush();
 
-        // 订阅后续 NAL stream（种子与订阅起点之间的间隙是 Go 已知行为）。
+        // 订阅后续 NAL stream（种子与订阅起点之间的间隙是已知行为）。
         let (rx, _sub) = buf.subscribe();
         loop {
             let n = match rx.recv() {
                 Ok(n) => n,
-                // channel 断开 = buffer close / 退订 → 正常退出（Go !ok → nil）。
+                // channel 断开 = buffer close / 退订 → 正常退出。
                 Err(_) => return Ok(()),
             };
             // 仅跳过 SPS/PPS（重复参数集，已在 sequence header 中）；IDR 不跳过
@@ -283,10 +276,10 @@ impl<W: Write> StreamWriter<W> {
         }
     }
 
-    /// RTP 90kHz timestamp → FLV 1ms 相对值。锚 Go `relativeFLVTimestamp`。
+    /// RTP 90kHz timestamp → FLV 1ms 相对值。
     ///
     /// 32-bit `wrapping_sub` 自然处理回绕；未 priming 直接调用时退化为首个 NAL
-    /// ts 作基准（Go 同分支）。
+    /// ts 作基准。
     fn relative_flv_timestamp(&mut self, rtp_ts: u32) -> u32 {
         if !self.base_rtp_set {
             self.base_rtp_timestamp = rtp_ts;
@@ -296,13 +289,13 @@ impl<W: Write> StreamWriter<W> {
         rtp_ts.wrapping_sub(self.base_rtp_timestamp) / 90
     }
 
-    /// per-tag flush（错误吞——锚 Go flushAdapter；下一次 Write 自然失败退出）。
+    /// per-tag flush（错误吞——下一次 Write 自然失败退出）。
     fn flush(&mut self) {
         let _ = self.w.flush();
     }
 }
 
-// ── 单测（移植 Go transmux_test.go 静态构造用例）──────────────────────────────
+// ── 单测（FLV 静态构造用例）──────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -317,7 +310,7 @@ mod tests {
         }
     }
 
-    /// 移植 Go `TestFLVHeader_Format`。
+    /// FLV header 块格式校验。
     #[test]
     fn flv_header_format() {
         let h = flv_header();
@@ -337,7 +330,7 @@ mod tests {
         );
     }
 
-    /// 移植 Go `TestPackAVCDecoderConfig_HasSPSAndPPS`。
+    /// AVCDecoderConfigurationRecord 含 SPS 与 PPS。
     #[test]
     fn pack_avc_decoder_config_has_sps_and_pps() {
         let sps = [0x67, 0x64, 0xc0, 0x16, 0xac, 0x1b];
@@ -361,8 +354,7 @@ mod tests {
         );
     }
 
-    /// 移植 Go `TestPackAVCDecoderConfig_BadInput` + PPS 空边界
-    /// （NIL 边界与 Go `len(sps)<4 || len(pps)<1` 等价）。
+    /// 坏输入 + PPS 空边界（`sps.len() < 4 || pps 空` → None）。
     #[test]
     fn pack_avc_decoder_config_bad_input() {
         assert!(
@@ -379,7 +371,7 @@ mod tests {
         assert!(build_avc_sequence_header_tag(&[0x67], &[0x68], 0).is_none());
     }
 
-    /// 移植 Go `TestBuildAVCSequenceHeaderTag_Structure`。
+    /// AVC sequence header tag 结构校验。
     #[test]
     fn build_avc_sequence_header_tag_structure() {
         let sps = [0x67, 0x64, 0xc0, 0x16];
@@ -406,7 +398,7 @@ mod tests {
         );
     }
 
-    /// 移植 Go `TestBuildAVCNALUTag_KeyframeMarker`：IDR → 0x17 / P-frame → 0x27。
+    /// IDR → 0x17 / P-frame → 0x27 的 frameType marker 判定。
     #[test]
     fn build_avc_nalu_tag_keyframe_marker() {
         let idr = nal(NAL_TYPE_IDR, &[0x65, 0xaa, 0xbb]);
@@ -428,11 +420,11 @@ mod tests {
         let tag3 = build_avc_nalu_tag(&mixed, 0).expect("tag3");
         assert_eq!(tag3[FLV_TAG_HEADER_SIZE], 0x17, "any IDR → keyframe tag");
 
-        // 空 NAL 列表 → None（Go 返 nil）。
+        // 空 NAL 列表 → None。
         assert!(build_avc_nalu_tag(&[], 0).is_none());
     }
 
-    /// 移植 Go `TestBuildAVCNALUTag_LengthPrefixedNALs`：4B BE length prefix。
+    /// 每个 NAL 带 4B BE length prefix。
     #[test]
     fn build_avc_nalu_tag_length_prefixed_nals() {
         let idr = nal(NAL_TYPE_IDR, &[0x65, 0xaa, 0xbb]);
@@ -456,7 +448,7 @@ mod tests {
     }
 }
 
-// ── StreamWriter 单测（移植 Go TestStreamWriter_BasicFlow + 任务点名用例）───────
+// ── StreamWriter 单测（基本流 + 补充用例）─────────────────────────────────────
 
 #[cfg(test)]
 mod stream_writer_tests {
@@ -466,7 +458,7 @@ mod stream_writer_tests {
     use std::thread;
     use std::time::Duration;
 
-    /// 并发安全共享 sink（Go syncBuffer 等价）。
+    /// 并发安全共享 sink。
     #[derive(Clone, Default)]
     struct SharedBuf(Arc<Mutex<Vec<u8>>>);
 
@@ -529,8 +521,7 @@ mod stream_writer_tests {
         body.len() >= 2 && body[0] == 0x17 && body[1] == FLV_AVC_NALU
     }
 
-    /// 基本流（移植 Go TestStreamWriter_BasicFlow）：seq-header + 首 IDR ts=0 +
-    /// 订阅增量 P-frame ts=+1ms。
+    /// 基本流：seq-header + 首 IDR ts=0 + 订阅增量 P-frame ts=+1ms。
     #[test]
     fn basic_flow() {
         let buf = Arc::new(FrameBuffer::new());
@@ -568,7 +559,7 @@ mod stream_writer_tests {
         // 重复 SPS 被跳过（不出现第 4 个 tag）。
     }
 
-    /// 多 IDR 持续写出（spec 场景「后续 IDR 持续写出」）：订阅循环仅跳 SPS/PPS，
+    /// 多 IDR 持续写出：订阅循环仅跳 SPS/PPS，
     /// 第 2、3 个 IDR 均以 keyframe tag 0x17 写出 → 输出含 ≥2 个订阅期 keyframe tag。
     #[test]
     fn subsequent_idrs_written_as_keyframe_tags() {
@@ -598,13 +589,13 @@ mod stream_writer_tests {
             3,
             "first IDR + 2 subsequent IDRs must all be keyframe tags: {tags:?}"
         );
-        // 订阅期 keyframe tag ≥2（spec 断言下限）且 ts 单调。
+        // 订阅期 keyframe tag ≥2（断言下限）且 ts 单调。
         assert!(kf.len() > 2, "订阅期 keyframe tag 须 ≥2");
         assert_eq!(kf[1].0, 2, "IDR2 ts = (9180-9000)/90 = 2ms");
         assert_eq!(kf[2].0, 4, "IDR3 ts = (9360-9000)/90 = 4ms");
     }
 
-    /// RTP ts 回绕（spec 场景「RTP 时间戳回绕」）：base 取近 u32::MAX 的种子 IDR ts，
+    /// RTP ts 回绕：base 取近 u32::MAX 的种子 IDR ts，
     /// 后续 NAL ts 跨回绕——wrapping_sub 后 /90 单调连续，不出现跳变。
     #[test]
     fn timestamp_wraparound_is_monotonic() {
@@ -637,8 +628,7 @@ mod stream_writer_tests {
     }
 
     /// 启动 close 竞态：seed 三件套后 close → close 保留缓存 → run 仍写出
-    /// FLV header + seq-header tag + 首 IDR tag（单帧可解码 FLV），正常退出 Ok
-    /// （spec 场景「closed 后 run 写出种子帧」；对称 Go transmux_test.go close+seed 用例）。
+    /// FLV header + seq-header tag + 首 IDR tag（单帧可解码 FLV），正常退出 Ok。
     #[test]
     fn closed_after_seed_writes_seed_frame() {
         let buf = Arc::new(FrameBuffer::new());
@@ -679,7 +669,7 @@ mod stream_writer_tests {
     }
 
     /// 真 close + 无种子（buf.close() 不 seed → latest_idr 返 None）→ Err(Closed)
-    /// （spec 场景「closed 且缓存缺失」专属测试，前置 closed()==true；对称 Go 真 closed 路径）。
+    /// （closed 且缓存缺失专属测试，前置 closed()==true）。
     #[test]
     fn closed_no_seed_returns_closed_error() {
         let buf = Arc::new(FrameBuffer::new());
@@ -692,8 +682,7 @@ mod stream_writer_tests {
         assert!(matches!(err, StreamError::Closed), "err = {err:?}");
     }
 
-    /// 三件套缺失（未 close、调用方误用未先 wait）→ Err(Closed)
-    /// （等价 Go LatestIDR !ok → ErrStreamClosed）。
+    /// 三件套缺失（未 close、调用方误用未先 wait）→ Err(Closed)。
     #[test]
     fn missing_seed_returns_closed_error() {
         let buf = Arc::new(FrameBuffer::new());

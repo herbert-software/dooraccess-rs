@@ -1,32 +1,30 @@
-//! video：Go `internal/video/` 视频转发栈的 Rust 移植（`port-rust-video-forward`）。
+//! video：视频转发栈。
 //!
-//! 协议真相锚 `openspec/specs/anjubao-video-stream/`（sealed）与
-//! `samples/anjubao-video-stream/observations.md`；Go v0.10.0 为行为级 + 字节级
-//! 等价对照基线。crate gate 仅 std + libc；MIPS32 红线禁 `AtomicU64`/`AtomicI64`。
+//! 协议真相锚 `openspec/specs/anjubao-video-stream/` 与
+//! `samples/anjubao-video-stream/observations.md`。crate gate 仅 std + libc；
+//! MIPS32 红线禁 `AtomicU64`/`AtomicI64`。
 //!
 //! 子模块：
 //!   - [`rtp`]：RTP 头解析（V=2/X=0/CC=0 校验，P 位不检、PT 仅解析）+ Annex-B
 //!     NAL 提取 + receiver 主循环（`bind_udp` 同步 bind / 1s read-timeout 轮询
 //!     stop / expectSrcIP 过滤 / SSRC 首包锁存 / stats ticker 内联）
 //!   - [`reassembler`]：专有分片 frame 重组器（按 RTP seq 重组字节流再切 NAL，
-//!     禁逐包提取——expA.pcap 实证逐包会静默丢 81%）
+//!     禁逐包提取——实测逐包会静默丢 81%）
 //!   - [`frame_buffer`]：SPS/PPS/IDR 种子缓存 + `sync_channel(64)` `try_send`
 //!     fan-out（drop-newest）+ Condvar `wait_idr`（closed/timeout 分型）
 //!   - [`preview`]：preview 信令客户端（TCP 短连接直拨 18022 + ack 校验；
-//!     不经骨架 wire-worker——授权见骨架 MODIFIED delta）
+//!     不经骨架 wire-worker）
 //!   - [`rtcp`]：RR/SDES/BYE 构造 + 5s 周期 keepalive sender（CNAME 字面
-//!     `"dooraccess-go"`，design D7 golden 纪律禁改名）
+//!     `"dooraccess-go"`，字节 golden 纪律禁改名）
 //!   - [`transmux`]：FLV 静态构造（header / AVCDecoderConfigurationRecord /
-//!     seq-header tag / NALU tag）+ `StreamWriter`（订阅循环 / ts 换算 /
+//!     seq-header tag / NALU tag）+ FLV 流写出器（订阅循环 / ts 换算 /
 //!     per-tag flush）
 //!
 //!   - [`session`]：session 生命周期 Manager（单 active 互斥 / TTL
 //!     `Mutex<Instant>` + 1s monitor / detached cleanup 对账 / teardown 序列 /
 //!     UUID v4 + 随机 SSRC via `/dev/urandom`）
 //!
-//! HTTP endpoint（`/video/*`）与 main.rs 编排接入由组 F 追加。
-//!
-//! req=704/708 preview 帧 builder 在 [`crate::wire18022`]（design D1：与
+//! req=704/708 preview 帧 builder 在 [`crate::wire18022`]（与
 //! `build_stop_frame` 同居，共用 `assemble_frame` 与 golden 基建）。
 
 pub mod frame_buffer;

@@ -1,14 +1,13 @@
-//! expA fixture 跨语言 parity（任务 3.3；spec 场景「expA fixture 跨语言 parity」）。
+//! expA fixture parity。
 //!
-//! 读 `testdata/rtp-fragmentation/expA.packets.tsv`（1539 包，与 Go
-//! `dooraccess-go/tests/fixtures/rtp-fragmentation/` 同源、CI 校验双侧一致）灌入
-//! 重组器，对 `expected.json` 中 **Go 测试断言的 11 项统计字段** 逐项断言
-//! （对照 Go `TestReassembler_ExpAFixture` 的 checks 表；expected.json 共 15 字段，
+//! 读 `testdata/rtp-fragmentation/expA.packets.tsv`（1539 包）灌入
+//! 重组器，对 `expected.json` 中 **11 项统计字段** 逐项断言
+//! （expected.json 共 15 字段，
 //! `fixture/captured_at/annexb_overhead_per_nal` 不参与断言，`input_packets`
-//! 是装载前置校验——与 Go 同位）。
+//! 是装载前置校验）。
 //!
-//! 这是 v0.3.2 fix-rtp-fragmentation 的跨语言回归锚：确保 Rust 重组器吞吐
-//! 与 Go 字段级一致（frames_complete=296 / nals_total=326 等）。
+//! 字段级断言：确保重组器吞吐
+//! frames_complete=296 / nals_total=326 等。
 
 use std::fs;
 use std::path::PathBuf;
@@ -51,7 +50,7 @@ fn hex_to_bytes(s: &str) -> Vec<u8> {
         .collect()
 }
 
-/// 读取 expA.packets.tsv（锚 Go `loadPacketsTSV`）。
+/// 读取 expA.packets.tsv。
 /// TSV 列：rtp.seq \t rtp.timestamp \t rtp.marker \t rtp.payload（首行 header）。
 fn load_packets_tsv() -> Vec<RtpPacket> {
     let path = fixture_path("expA.packets.tsv");
@@ -79,14 +78,14 @@ fn load_packets_tsv() -> Vec<RtpPacket> {
     pkts
 }
 
-/// 对照 Go `TestReassembler_ExpAFixture`：1539 包灌重组器，11 项字段逐项断言。
+/// 1539 包灌重组器，11 项字段逐项断言。
 #[test]
 fn reassembler_expa_fixture_parity() {
     let exp_path = fixture_path("expected.json");
     let exp = fs::read_to_string(&exp_path).unwrap_or_else(|e| panic!("read {exp_path:?}: {e}"));
 
     let pkts = load_packets_tsv();
-    // 装载前置校验（Go：`len(pkts) != expected.InputPackets` Fatalf）。
+    // 装载前置校验：加载包数须等于 expected.json 的 input_packets。
     assert_eq!(
         pkts.len() as i64,
         json_int(&exp, "input_packets"),
@@ -122,7 +121,7 @@ fn reassembler_expa_fixture_parity() {
 
     let stats = r.stats();
 
-    // 11 项字段逐项断言（与 Go checks 表一一对应）。
+    // 11 项字段逐项断言。
     let checks: [(&str, i64, i64); 11] = [
         (
             "input_payload_bytes",
@@ -160,7 +159,7 @@ fn reassembler_expa_fixture_parity() {
         assert_eq!(got, want, "{name}: got {got}, want {want}");
     }
 
-    // 锚定关键值不被 expected.json 漂移悄悄放水（spec 场景点名的两项字面）。
+    // 锚定关键值不被 expected.json 漂移悄悄放水（两项字面）。
     assert_eq!(frames_done, 296, "frames_complete 字面锚");
     assert_eq!(nals_total, 326, "nals_total 字面锚");
 }

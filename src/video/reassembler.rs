@@ -1,31 +1,28 @@
-//! reassembler：专有分片 frame 重组器（移植 Go `internal/video/reassembler.go` 全部）。
+//! reassembler：专有分片 frame 重组器。
 //!
 //! 为什么需要这个：外机推流**不是 RFC 6184**，是 raw H.264 Annex-B 字节流按 MTU
 //! 任意切片（memory `anjubao_rtp_fragmentation_proprietary`，expA.pcap 1539 包实证：
 //! 仅 ~19% 包含起始码）。必须按 RTP seq 重组 frame 字节流后整 frame 切 NAL；
 //! 对单包独立扫 start code 会静默丢 81%。
 //!
-//! 并发模型差异（有意简化，design「RTP receiver」内联登记）：Go 用 `sync.Mutex`
-//! 保护 stats 因为 stats ticker 是独立 goroutine；Rust 侧 stats 周期日志（10s）
-//! 由 receiver 主循环**内联**触发（组 D），重组器单线程独占 —— 无锁、无原子
-//! （MIPS32 红线禁 64-bit 原子，u64 计数器走普通字段天然合规）。
+//! 并发模型：stats 周期日志（10s）由 receiver 主循环**内联**触发，重组器单线程
+//! 独占 —— 无锁、无原子（MIPS32 红线禁 64-bit 原子，u64 计数器走普通字段天然合规）。
 //! 本模块提供 [`ReassemblerStats::periodic_line`] / [`ReassemblerStats::final_line`]
-//! 纯格式化函数 + `PartialEq`（Go「仅值变化时打印」的 `s != last` 判据），
+//! 纯格式化函数 + `PartialEq`（「仅值变化时打印」的 `s != last` 判据），
 //! 周期触发与 final 行的打印时机归 receiver 主循环。
 
 use super::rtp::{extract_nals_annexb, NalUnit, RtpPacket};
 use super::LogFn;
 
-/// 排序窗口：按 seq 缓 8 个包（~80ms 容忍乱序，外机 ~99 包/s）。锚 Go
-/// `reassemblerWindowSize`。
+/// 排序窗口：按 seq 缓 8 个包（~80ms 容忍乱序，外机 ~99 包/s）。
 pub const REASSEMBLER_WINDOW_SIZE: usize = 8;
 
-/// 单 frame 累积上限 256KB，超限丢弃。锚 Go `frameMaxBytes`。
+/// 单 frame 累积上限 256KB，超限丢弃。
 pub const FRAME_MAX_BYTES: usize = 256 * 1024;
 
-/// 累积统计快照（receiver 主循环周期 log 用）。锚 Go `reassemblerStats`。
+/// 累积统计快照（receiver 主循环周期 log 用）。
 ///
-/// `PartialEq` 支撑 Go「stats 与上次相同则不打印」判据；`last_drop_reason`
+/// `PartialEq` 支撑「stats 与上次相同则不打印」判据；`last_drop_reason`
 /// 仅在 dropFrame 即时单行日志输出，不进周期行（5 项闭集）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReassemblerStats {
@@ -44,7 +41,7 @@ pub struct ReassemblerStats {
 }
 
 impl ReassemblerStats {
-    /// 周期 stats 行（10s，5 项；锚 Go RunWithConn ticker 分支格式字面）。
+    /// 周期 stats 行（10s，5 项）。
     /// 打印时机与「仅值变化时打印」判据由 receiver 主循环持有。
     pub fn periodic_line(&self) -> String {
         format!(
@@ -53,8 +50,7 @@ impl ReassemblerStats {
         )
     }
 
-    /// 退出时 final stats 行（锚 Go ctx.Done 分支格式字面；Rust 内联实现退出
-    /// 必打 final 行——比 Go racy best-effort 更确定，spec 登记为有意差异）。
+    /// 退出时 final stats 行（内联实现保证退出必打 final 行）。
     pub fn final_line(&self) -> String {
         format!(
             "video: rtp stats final packets={} nals={} frames={} dropped_frames={} max_frame_bytes={}",
@@ -64,7 +60,7 @@ impl ReassemblerStats {
 }
 
 /// frame 重组器：把外机推流的 RTP 包按 seq 累积到 frame 字节流缓冲，
-/// marker=true 时整段按 Annex-B 切 NAL 输出。锚 Go `frameReassembler`。
+/// marker=true 时整段按 Annex-B 切 NAL 输出。
 pub struct FrameReassembler {
     logf: Option<LogFn>,
 
@@ -72,9 +68,6 @@ pub struct FrameReassembler {
     frame_buf: Vec<u8>,
 
     /// frame 起始时的 RTP timestamp；M=1 时切 NAL 用作 NAL 的 ts。
-    ///
-    /// Go 另有 `frameTSSet` bool 字段，但只写从不读（vestigial）——Rust 省略，
-    /// 行为零差异（clippy dead-code 零警告纪律）。
     frame_timestamp: u32,
 
     /// 排序窗口：按 seq 升序缓 [`REASSEMBLER_WINDOW_SIZE`] 个包。
@@ -92,7 +85,7 @@ pub struct FrameReassembler {
 }
 
 impl FrameReassembler {
-    /// 构造空重组器。`logf=None` 时不 log（对齐 Go `newFrameReassembler(nil)` no-op）。
+    /// 构造空重组器。`logf=None` 时不 log。
     pub fn new(logf: Option<LogFn>) -> Self {
         FrameReassembler {
             logf,
@@ -113,7 +106,7 @@ impl FrameReassembler {
         }
     }
 
-    /// 把一个解析过的 RTP 包喂进重组器。锚 Go `Push`。
+    /// 把一个解析过的 RTP 包喂进重组器。
     ///
     /// 行为：
     ///   - 包入 pending 排序窗口（按 seq 升序，int16 差值回绕比较）
@@ -121,8 +114,7 @@ impl FrameReassembler {
     ///     frame_buf，遇 marker 即刻切 frame（保证跨 frame 边界字节流不混合）
     ///
     /// 返回 `(nals, frame_complete)`：切好的 NAL 列表（多 frame 一次完成时累计）+
-    /// 本次调用是否至少切完一 frame。NAL 字节持所有权（脱离重组 buffer，
-    /// 等价 Go cutFrame 深拷）。
+    /// 本次调用是否至少切完一 frame。NAL 字节持所有权（脱离重组 buffer 深拷）。
     ///
     /// 注（expA.pcap 实证）：外机给每个 RTP packet 独立递增 timestamp（~3600/包），
     /// **不是**标准「同 frame 多包共 timestamp」约定——timestamp 切换不能作 frame
@@ -155,7 +147,7 @@ impl FrameReassembler {
         (nals, frame_complete)
     }
 
-    /// 按 seq 升序把 pkt 插进 pending（int16 减法判先后处理 wrap）。锚 Go `insertSorted`。
+    /// 按 seq 升序把 pkt 插进 pending（int16 减法判先后处理 wrap）。
     fn insert_sorted(&mut self, pkt: RtpPacket) {
         for i in (0..self.pending.len()).rev() {
             if (pkt.seq.wrapping_sub(self.pending[i].seq) as i16) >= 0 {
@@ -167,7 +159,7 @@ impl FrameReassembler {
         self.pending.insert(0, pkt);
     }
 
-    /// 从 pending 取出能确定顺序的前缀返回（不修改 frame_buf）。锚 Go `popPendingPrefix`。
+    /// 从 pending 取出能确定顺序的前缀返回（不修改 frame_buf）。
     ///
     /// 策略：
     ///   - `marker_in_batch=true`（当前包 marker=1）：pop 整个 pending（frame 末尾不留尾巴）
@@ -184,7 +176,7 @@ impl FrameReassembler {
         self.pending.drain(..pop_count).collect()
     }
 
-    /// 把单个包的 payload 追加到 frame_buf；负责 gap 检测 + cap 检查。锚 Go `appendPacket`。
+    /// 把单个包的 payload 追加到 frame_buf；负责 gap 检测 + cap 检查。
     fn append_packet(&mut self, p: RtpPacket) {
         if !self.expect_seq_set {
             self.expect_seq = p.seq;
@@ -217,7 +209,7 @@ impl FrameReassembler {
         if self.frame_buf.len() + p.payload.len() > FRAME_MAX_BYTES {
             self.drop_frame("oversize");
             // drop 后丢弃当前包（其属于已损坏 frame）；expect 重置等下一 marker
-            // 之后 cut_frame 自然恢复（对齐 Go 同分支）。
+            // 之后 cut_frame 自然恢复。
             self.expect_seq = p.seq.wrapping_add(1);
             self.expect_seq_set = true;
             self.frame_timestamp = p.timestamp;
@@ -231,7 +223,7 @@ impl FrameReassembler {
     }
 
     /// 丢弃当前累积的 frame 字节流并重置状态；reason 记入 `stats.last_drop_reason`
-    /// 并打即时单行日志（不入周期行）。锚 Go `dropFrame`。
+    /// 并打即时单行日志（不入周期行）。
     fn drop_frame(&mut self, reason: &'static str) {
         if self.frame_buf.is_empty() {
             return;
@@ -251,11 +243,9 @@ impl FrameReassembler {
     }
 
     /// 把 frame_buf 按 Annex-B 切 NAL 返回；重置 frame 状态进入下一 frame 累积态。
-    /// 锚 Go `cutFrame`。
     ///
     /// NAL 所有权：[`extract_nals_annexb`] 返回的 `NalUnit.data` 是 `Vec<u8>` 拷贝
-    /// （Go cutFrame 显式深拷的等价物）——随后 `frame_buf.clear()` + 下一 frame 复写
-    /// 不会污染已交付的 NAL（五件套之五的结构性保证）。
+    /// ——随后 `frame_buf.clear()` + 下一 frame 复写不会污染已交付的 NAL（结构性保证）。
     fn cut_frame(&mut self) -> Vec<NalUnit> {
         if self.frame_buf.is_empty() {
             return Vec::new();
@@ -272,20 +262,20 @@ impl FrameReassembler {
         nals
     }
 
-    /// 返当前累积统计的快照（receiver 主循环 stats 周期日志用）。锚 Go `Stats`。
+    /// 返当前累积统计的快照（receiver 主循环 stats 周期日志用）。
     pub fn stats(&self) -> ReassemblerStats {
         self.stats.clone()
     }
 }
 
-// ── 单测（移植 Go reassembler_test.go 等价用例）───────────────────────────────
+// ── 单测 ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::super::rtp::{NAL_TYPE_IDR, NAL_TYPE_PPS, NAL_TYPE_SPS};
     use super::*;
 
-    /// 构造 RtpPacket 测试输入（payload 是裸字节，不含 RTP 头）。锚 Go `mkPkt`。
+    /// 构造 RtpPacket 测试输入（payload 是裸字节，不含 RTP 头）。
     fn mk_pkt(seq: u16, ts: u32, marker: bool, payload: &[u8]) -> RtpPacket {
         RtpPacket {
             seq,
@@ -297,7 +287,7 @@ mod tests {
         }
     }
 
-    /// 移植 Go `TestReassembler_NormalFrame`：一个完整 frame 多包到达。
+    /// 一个完整 frame 多包到达。
     /// 包 1 = SPS+PPS+IDR Annex-B 拼包（首包）/ 包 2 = IDR 中段（无 start code）/
     /// 包 3 = IDR 末段 + marker=1。
     #[test]
@@ -344,7 +334,7 @@ mod tests {
         assert_eq!(stats.packets, 3);
     }
 
-    /// 移植 Go `TestReassembler_OutOfOrderWithinWindow`：窗口内乱序 1,3,2,4(M=1)。
+    /// 窗口内乱序 1,3,2,4(M=1)。
     #[test]
     fn out_of_order_within_window() {
         let mut r = FrameReassembler::new(None);
@@ -375,8 +365,7 @@ mod tests {
         );
     }
 
-    /// 移植 Go `TestReassembler_SeqWrap`：16-bit seq 回绕 65534,65535,0,1(M=1)
-    /// + 窗口内乱序变体（spec 场景「seq 回绕窗口内乱序」）。
+    /// 16-bit seq 回绕 65534,65535,0,1(M=1) + 窗口内乱序变体。
     #[test]
     fn seq_wrap() {
         let mut r = FrameReassembler::new(None);
@@ -429,7 +418,7 @@ mod tests {
         assert_eq!(r.stats().dropped_frames, 0, "回绕不得误判 seq-gap");
     }
 
-    /// 移植 Go `TestReassembler_SeqGapDropsFrame`：超窗 gap（1 → 100）丢 frame。
+    /// 超窗 gap（1 → 100）丢 frame。
     #[test]
     fn seq_gap_drops_frame() {
         let mut r = FrameReassembler::new(None);
@@ -446,7 +435,7 @@ mod tests {
         assert_eq!(stats.last_drop_reason, "seq-gap");
     }
 
-    /// 移植 Go `TestReassembler_FrameSizeCap`：单 frame 超 256KB 触发丢弃 + 状态重置。
+    /// 单 frame 超 256KB 触发丢弃 + 状态重置。
     #[test]
     fn frame_size_cap() {
         let mut r = FrameReassembler::new(None);
@@ -478,8 +467,7 @@ mod tests {
         assert_eq!(nals[0].nal_type, NAL_TYPE_IDR, "post-cap recovery NAL");
     }
 
-    /// 移植 Go `TestReassembler_BufferReuseSafety`（五件套之五）：cut_frame 后
-    /// 底层 buffer 复用不污染前 frame 已交付的 NAL。
+    /// cut_frame 后底层 buffer 复用不污染前 frame 已交付的 NAL。
     #[test]
     fn buffer_reuse_safety() {
         let mut r = FrameReassembler::new(None);
@@ -540,7 +528,7 @@ mod tests {
         assert_eq!(s, s2);
     }
 
-    /// drop 即时单行日志格式（reason / ts / size / seq_range 字段，锚 Go dropFrame）。
+    /// drop 即时单行日志格式（reason / ts / size / seq_range 字段）。
     #[test]
     fn drop_frame_immediate_log_line() {
         use std::sync::{Arc, Mutex};

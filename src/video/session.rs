@@ -1,11 +1,11 @@
-//! session：video session 生命周期 Manager（移植 Go `internal/video/session.go` 全部：
-//! Outdoor/Caller/SessionInfo/Manager/Start/Stop/Shutdown/RefreshTTL/stopInternal/
-//! shutdown teardown/TTL monitor/newUUIDv4/newRandomSSRC/IsValidUUID）。
+//! session：video session 生命周期 Manager（Outdoor/Caller/SessionInfo/Manager/
+//! start/stop/shutdown/refresh_ttl/stop_internal/teardown/TTL monitor/UUID v4/
+//! 随机 SSRC/UUID 校验）。
 //!
-//! 等价纪律（spec「session 生命周期与 TTL 等价」/ design D2/D4/D5）：
+//! 行为纪律：
 //!   - 单 active session；**Start 持 Manager 锁跨 bind + preview 信令全程**
-//!     （Go `session.go:228` defer unlock，最长 ~10s）——互斥对 in-flight Start
-//!     也成立，禁止信令期间放锁（否则并发 Start 双双过 preview 造双 session）
+//!     （最长 ~10s）——互斥对 in-flight Start 也成立，禁止信令期间放锁
+//!     （否则并发 Start 双双过 preview 造双 session）
 //!   - 同 outdoor 幂等复用：**仅 `latest_idr` 三件套齐**才刷 TTL（死 session
 //!     不得被 client retry 反复续命，钉死唯一 active slot）
 //!   - Start 顺序 = bind UDP（同步，先于信令）→ preview start（失败回滚**仅关
@@ -13,28 +13,26 @@
 //!     失败发生在 preview ack 之后，回滚 = 关 socket + **best-effort StopPreview
 //!     （3s）**，否则外机持续推流无人接）→ 起 RTP/RTCP/TTL 三线程
 //!     （per-session `Arc<AtomicBool>` stop flag）
-//!   - TTL 默认 60s；deadline 存 **`Mutex<Instant>`**（D4：MIPS32 禁 64-bit 原子；
-//!     `Instant` 单调，对 Go wall-clock 的有意实现差异）；1s monitor 轮询
-//!   - TTL 过期 → **detached cleanup**（monitor 禁自 join——Go 死锁同坑：monitor
+//!   - TTL 默认 60s；deadline 存 **`Mutex<Instant>`**（MIPS32 禁 64-bit 原子；
+//!     `Instant` 单调）；1s monitor 轮询
+//!   - TTL 过期 → **detached cleanup**（monitor 禁自 join——否则死锁：monitor
 //!     只发起 detached 线程跑 stop_internal，自己继续等 stop 信号 drain RTP/RTCP
 //!     后发 done）；JoinHandle 收进 `Mutex<Vec<JoinHandle>>` + retain 模式
 //!     （复刻 daemon.rs PushTracker 套路）
 //!   - 双驱动竞态（显式 Stop vs TTL 过期）用「摘 current 比对」CAS 守卫
-//!     （等价 Go `stopInternal` 的 `m.current != sess` 早返）保证 teardown 单方执行
+//!     （摘不到 current 即早返）保证 teardown 单方执行
 //!   - teardown 序列：preview stop（best-effort，按剩余预算裁短/跳过）→ RTCP BYE
 //!     （best-effort，照发）→ ~50ms RTP 尾等待（observations §3.4，按剩余预算裁短）→
 //!     置位 stop + 等三线程退出（2s 兜底按剩余预算裁短，超时放弃并 log）→
 //!     `FrameBuffer::close()`（**不受预算约束，永远执行**——资源释放不可跳）
-//!   - teardown 全程受 deadline 总预算约束（锚 Go 三入口真相）：显式 stop 8s
-//!     （video_handlers.go handler 8s ctx 包整个 shutdown）/ TTL 过期 detached
-//!     cleanup 5s（stopInternal 自建 5s ctx）/ daemon shutdown 收 caller deadline
-//!     （main stopCtx 5s），shutdown 内部 teardown 共享同一预算不叠加
+//!   - teardown 全程受 deadline 总预算约束（三入口）：显式 stop 8s（handler ctx
+//!     包整个 shutdown）/ TTL 过期 detached cleanup 5s（stop_internal 自建预算）/
+//!     daemon shutdown 收 caller deadline，shutdown 内部 teardown 共享同一预算不叠加
 //!   - `Manager::shutdown(deadline)` 摘 current 跑 teardown + 对账全部 detached
-//!     cleanup（deadline 内等完，超时放弃 + log——等价 Go cleanupWG.Wait 受 ctx 约束）
+//!     cleanup（deadline 内等完，超时放弃 + log）
 //!
-//! 测试注入口（D8）：`ttl` / `rtp_listen_addr`（等价 Go Manager.TTL/RTPListenAddr
-//! struct 字段）+ `ttl_monitor_interval` / `teardown_tail_wait` / `stop_budget` /
-//! `ttl_cleanup_budget` / `urandom_path`
+//! 测试注入口：`ttl` / `rtp_listen_addr` / `ttl_monitor_interval` /
+//! `teardown_tail_wait` / `stop_budget` / `ttl_cleanup_budget` / `urandom_path`
 //! 均为 per-Manager 字段（无全局 static，无原子，MIPS32 天然合规）。
 
 use std::io::{self, Read};
@@ -51,47 +49,44 @@ use super::rtp::{bind_udp, RtpReceiver};
 use super::{LogFn, SharedLogFn};
 use crate::codec::{self, BcdError, UriError};
 
-/// active session 在无 keepalive 续期时的最大存活时间。锚 Go `DefaultSessionTTL`。
+/// active session 在无 keepalive 续期时的最大存活时间。
 pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(60);
 
-/// RTP receiver 默认监听地址（Go 默认 ":9880"；Rust `UdpSocket::bind` 需显式 host）。
+/// RTP receiver 默认监听地址（`UdpSocket::bind` 需显式 host）。
 const DEFAULT_RTP_LISTEN_ADDR: &str = "0.0.0.0:9880";
 
-/// TTL monitor 默认轮询周期（锚 Go 1s ticker）。
+/// TTL monitor 默认轮询周期（1s ticker）。
 const DEFAULT_TTL_MONITOR_INTERVAL: Duration = Duration::from_secs(1);
 
 /// teardown 第 3 步残余 RTP 尾等待默认值（observations §3.4 停止尾实测均值 ~52ms）。
 const DEFAULT_TEARDOWN_TAIL_WAIT: Duration = Duration::from_millis(50);
 
-/// UUID/SSRC 生成失败回滚时 best-effort StopPreview 的超时（锚 Go
-/// `context.WithTimeout(3s)`，session.go UUID/SSRC 错误分支）。
+/// UUID/SSRC 生成失败回滚时 best-effort StopPreview 的超时（3s）。
 const ROLLBACK_STOP_PREVIEW_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// teardown 第 4 步等三线程退出的兜底上限（锚 Go `<-sess.done` 的 2s abandoning；
+/// teardown 第 4 步等三线程退出的兜底上限（2s abandoning；
 /// 实际等待按剩余预算裁短）。
 const SESSION_THREADS_EXIT_WAIT: Duration = Duration::from_secs(2);
 
-/// 显式 stop 的 teardown 总预算默认值（锚 Go `handleVideoStop` 的 8s handler ctx
-/// ——video_handlers.go：8s ctx 包住 `Manager.Stop` 整个 shutdown 序列，StopPreview
-/// 受 ctx 裁短、50ms 尾等是 `select{After(50ms), ctx.Done()}`）。
+/// 显式 stop 的 teardown 总预算默认值（8s handler ctx 包住整个 stop shutdown
+/// 序列，StopPreview 受 ctx 裁短、50ms 尾等到点即过）。
 const DEFAULT_STOP_BUDGET: Duration = Duration::from_secs(8);
 
-/// TTL 过期 detached cleanup 的 teardown 总预算默认值（锚 Go `stopInternal`
-/// 自建 `context.WithTimeout(5s)`）。
+/// TTL 过期 detached cleanup 的 teardown 总预算默认值（stop_internal 自建 5s 预算）。
 const DEFAULT_TTL_CLEANUP_BUDGET: Duration = Duration::from_secs(5);
 
 /// monitor 线程 stop flag 分片轮询片长（援引 self_unlock HANGUP_POLL_SLICE 惯用法）。
 const MONITOR_POLL_SLICE: Duration = Duration::from_millis(20);
 
-/// 随机源设备节点（design D5：禁 rand/uuid/getrandom crate，`std::fs` 读零新 FFI 面）。
+/// 随机源设备节点（禁 rand/uuid/getrandom crate，`std::fs` 读零新 FFI 面）。
 const URANDOM_PATH: &str = "/dev/urandom";
 
 // ---------------------------------------------------------------------------
-// Outdoor / Caller（锚 Go ParseOutdoor / ParseCaller，复用 codec）
+// Outdoor / Caller（URI 解析，复用 codec）
 // ---------------------------------------------------------------------------
 
 /// Outdoor/Caller URI 解析错误（包装 codec 两类错误；HTTP 400 body 字面由
-/// 组 F 经 `control::format_uri_err` 等价路径生成，本 Display 仅诊断用）。
+/// HTTP 层经 `control::format_uri_err` 等价路径生成，本 Display 仅诊断用）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
     /// SIP URI 拆分失败（缺 @ / 名长 / IPv4 / port）。
@@ -112,7 +107,6 @@ impl core::fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 /// 一个外机的连接参数（从 `cfg.Stations[*].SIP` 解析出的 BCD + IP + port）。
-/// 锚 Go `Outdoor`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outdoor {
     /// 完整 SIP URI 形如 `06020000@172.16.106.152:18022`（idempotent 复用判断 key）。
@@ -128,19 +122,19 @@ pub struct Outdoor {
 }
 
 impl Outdoor {
-    /// 18022 TCP 端点。锚 Go `AddrTCP`。
+    /// 18022 TCP 端点。
     pub fn addr_tcp(&self) -> String {
         format!("{}:{}", self.ip, self.port)
     }
 
     /// RTCP 反馈的 outdoor:6671 地址（端口非标，specs/anjubao-video-stream
-    /// /messages/udp9881-rtcp/format.md：违反 RFC 5761 但稳定行为）。锚 Go `AddrRTCP`。
+    /// /messages/udp9881-rtcp/format.md：违反 RFC 5761 但稳定行为）。
     pub fn addr_rtcp(&self) -> String {
         format!("{}:6671", self.ip)
     }
 }
 
-/// 从 SIP URI 解析 [`Outdoor`]。锚 Go `ParseOutdoor`。
+/// 从 SIP URI 解析 [`Outdoor`]。
 pub fn parse_outdoor(uri: &str) -> Result<Outdoor, ParseError> {
     let (name, ip, port) = codec::parse_uri(uri).map_err(ParseError::Uri)?;
     let bcd = codec::encode_bcd(&name).map_err(ParseError::Bcd)?;
@@ -154,7 +148,7 @@ pub fn parse_outdoor(uri: &str) -> Result<Outdoor, ParseError> {
 }
 
 /// 本机室内机参数（从 cfg.SIP 解析）。preview 帧 BCD caller 字段必须填它，
-/// 外机据此决定把 RTP 推到哪台室内机（不查源 IP）。锚 Go `Caller`。
+/// 外机据此决定把 RTP 推到哪台室内机（不查源 IP）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Caller {
     /// 8 char 号码。
@@ -163,7 +157,7 @@ pub struct Caller {
     pub bcd_name: [u8; 4],
 }
 
-/// 从 cfg.SIP 解析 [`Caller`]。锚 Go `ParseCaller`。
+/// 从 cfg.SIP 解析 [`Caller`]。
 pub fn parse_caller(uri: &str) -> Result<Caller, ParseError> {
     let (name, _, _) = codec::parse_uri(uri).map_err(ParseError::Uri)?;
     let bcd = codec::encode_bcd(&name).map_err(ParseError::Bcd)?;
@@ -174,7 +168,7 @@ pub fn parse_caller(uri: &str) -> Result<Caller, ParseError> {
 }
 
 // ---------------------------------------------------------------------------
-// SessionInfo（锚 Go SessionInfo；组 F 序列化成 /video/start 200 JSON）
+// SessionInfo（HTTP 层序列化成 /video/start 200 JSON）
 // ---------------------------------------------------------------------------
 
 /// `Manager::start` 返回给 HTTP handler 的轻量描述（HACS 端用）。
@@ -191,15 +185,15 @@ pub struct SessionInfo {
 }
 
 // ---------------------------------------------------------------------------
-// StartError（组 F 错误映射面：Conflict→409 / Preview timeout→503 / 其余→503）
+// StartError（错误映射面：Conflict→409 / Preview timeout→503 / 其余→503）
 // ---------------------------------------------------------------------------
 
-/// `Manager::start` 错误。Display 字面对齐 Go 各错误路径的 wrap 格式
-/// （errorJSON 内嵌错误字串是契约，组 F golden 逐字对）。
+/// `Manager::start` 错误。Display 字面是契约（errorJSON 内嵌错误字串，golden
+/// 逐字对，禁随意改写文案）。
 #[derive(Debug)]
 pub enum StartError {
     /// 已有不同 outdoor 的 active session（并发限制 1）→ HTTP 409。
-    /// 锚 Go `ErrConflict` + `fmt.Errorf("%w: active=%s, requested=%s", ...)`。
+    /// 文案格式 `<msg>: active=%s, requested=%s`。
     Conflict {
         /// 现 active session 的 outdoor URI。
         active: String,
@@ -214,11 +208,10 @@ pub enum StartError {
         source: io::Error,
     },
     /// preview 信令失败（dial/ack 5s 内未完成或 ack 校验失败）→ HTTP 503。
-    /// 锚 Go `ErrPreviewTimeout` wrap（`%w: %v`）。
     Preview(PreviewError),
-    /// UUID 生成失败（/dev/urandom 读失败）→ HTTP 503。锚 Go "video: gen UUID"。
+    /// UUID 生成失败（/dev/urandom 读失败）→ HTTP 503（文案 "video: gen UUID"）。
     Uuid(io::Error),
-    /// SSRC 生成失败 → HTTP 503。锚 Go "video: gen SSRC"。
+    /// SSRC 生成失败 → HTTP 503（文案 "video: gen SSRC"）。
     Ssrc(io::Error),
 }
 
@@ -249,28 +242,26 @@ impl std::error::Error for StartError {
 }
 
 impl StartError {
-    /// 是否 conflict（组 F 映射 409）。
+    /// 是否 conflict（映射 409）。
     pub fn is_conflict(&self) -> bool {
         matches!(self, StartError::Conflict { .. })
     }
 
-    /// 是否 preview 超时（组 F 503 preview-timeout 档与「其它失败」档的判别）。
+    /// 是否 preview 超时（503 preview-timeout 档与「其它失败」档的判别）。
     pub fn is_preview_timeout(&self) -> bool {
         matches!(self, StartError::Preview(e) if e.is_timeout())
     }
 }
 
 // ---------------------------------------------------------------------------
-// 依赖注入接口（锚 Go previewClient / rtpReceiver / rtcpSender interface）
+// 依赖注入接口（preview / rtp receiver / rtcp sender）
 // ---------------------------------------------------------------------------
 
-/// Manager 与 preview 信令之间的依赖注入接口（便于五件套单测注入 fake）。
-/// 锚 Go `previewClient`。
+/// Manager 与 preview 信令之间的依赖注入接口（便于单测注入 fake）。
 pub trait PreviewPort: Send + Sync {
     /// 发 req=704 + 等 req=705 ack。
     fn start_preview(&self, outdoor: &Outdoor, caller: &Caller) -> Result<(), PreviewError>;
-    /// 发 req=708 + 等 req=709 ack。`timeout` `None` → 默认 5s；回滚路径传 3s
-    /// （Go ctx 裁短的等价）。
+    /// 发 req=708 + 等 req=709 ack。`timeout` `None` → 默认 5s；回滚路径传 3s。
     fn stop_preview(
         &self,
         outdoor: &Outdoor,
@@ -279,11 +270,11 @@ pub trait PreviewPort: Send + Sync {
     ) -> Result<(), PreviewError>;
 }
 
-/// Manager 与 RTP receiver 之间的依赖注入接口。锚 Go `rtpReceiver`
-/// （仅 RunWithConn 路径——bind 在 Start 内同步执行，conn 经此接口移交）。
+/// Manager 与 RTP receiver 之间的依赖注入接口（仅 run_with_conn 路径——bind 在
+/// Start 内同步执行，conn 经此接口移交）。
 ///
 /// `None`（默认）时 Manager 在 session 线程内 lazy 构造真 [`RtpReceiver`]
-/// （绑 session 的 FrameBuffer 与 streamSSRC sink，等价 Go `m.RTP == nil` 分支）。
+/// （绑 session 的 FrameBuffer 与 streamSSRC sink）。
 pub trait RtpPort: Send + Sync {
     /// 接管已绑定 socket 跑 read loop 直到 stop 置位。
     fn run_with_conn(
@@ -294,7 +285,7 @@ pub trait RtpPort: Send + Sync {
     ) -> io::Result<()>;
 }
 
-/// Manager 与 RTCP sender 之间的依赖注入接口。锚 Go `rtcpSender`。
+/// Manager 与 RTCP sender 之间的依赖注入接口。
 pub trait RtcpPort: Send + Sync {
     /// 周期保活直到 stop 置位。
     fn run(
@@ -373,20 +364,20 @@ impl RtcpPort for WireRtcp {
 }
 
 // ---------------------------------------------------------------------------
-// Session（锚 Go Session）
+// Session
 // ---------------------------------------------------------------------------
 
-/// 单个 active session 的状态。锚 Go `Session`。
+/// 单个 active session 的状态。
 ///
-/// 经 `Arc` 暴露给 http 层（组 F）持引用读 [`Session::frame_buf`]；
+/// 经 `Arc` 暴露给 http 层持引用读 [`Session::frame_buf`]；
 /// 其余字段由 Manager 内部管理。
 pub struct Session {
     id: String,
     outdoor: Outdoor,
 
-    /// TTL 截止时间。D4：**`Mutex<Instant>`**（MIPS32 禁 64-bit 原子；单调时钟，
-    /// 对 Go `atomic.Int64` UnixNano 的有意实现差异）。Start 同 outdoor 且
-    /// `latest_idr` 三件套齐（healthy）时才刷新；monitor 检查时刻 > 此值则自动 stop。
+    /// TTL 截止时间。**`Mutex<Instant>`**（MIPS32 禁 64-bit 原子；单调时钟）。
+    /// Start 同 outdoor 且 `latest_idr` 三件套齐（healthy）时才刷新；
+    /// monitor 检查时刻 > 此值则自动 stop。
     ttl_deadline: Mutex<Instant>,
 
     /// 本端发 RTCP 时的 reporter SSRC（随机生成；与 session 同生命周期）。
@@ -397,21 +388,19 @@ pub struct Session {
     stream_ssrc: AtomicU32,
 
     /// RTP 收到的 NAL 单元缓冲区（种子 + 实时 fan-out）。RTP receiver 写入；
-    /// transmux StreamWriter（组 F handler）读出。
+    /// transmux StreamWriter（HTTP handler）读出。
     pub frame_buf: Arc<FrameBuffer>,
 
-    /// per-session stop flag：终结本 session 的 RTP/RTCP/monitor 三线程
-    /// （Go sess.cancel 的等价物）。
+    /// per-session stop flag：终结本 session 的 RTP/RTCP/monitor 三线程。
     stop: Arc<AtomicBool>,
 
-    /// 三线程 graceful 退出信号接收端（Go sess.done 的等价物）：monitor 线程
-    /// drain RTP/RTCP 后发 `()` 并 drop 发送端。teardown 单方执行（CAS 守卫），
-    /// 故 take 一次即可。
+    /// 三线程 graceful 退出信号接收端：monitor 线程 drain RTP/RTCP 后发 `()`
+    /// 并 drop 发送端。teardown 单方执行（CAS 守卫），故 take 一次即可。
     done_rx: Mutex<Option<mpsc::Receiver<()>>>,
 }
 
 impl Session {
-    /// session UUID（http 层做 RefreshTTL key）。锚 Go `Session.ID`。
+    /// session UUID（http 层做 RefreshTTL key）。
     pub fn id(&self) -> &str {
         &self.id
     }
@@ -421,7 +410,7 @@ impl Session {
         &self.outdoor.uri
     }
 
-    /// 返回 [`SessionInfo`]（HTTP handler 用）。锚 Go `Session.Info`。
+    /// 返回 [`SessionInfo`]（HTTP handler 用）。
     pub fn info(&self, ttl: Duration) -> SessionInfo {
         SessionInfo {
             id: self.id.clone(),
@@ -433,10 +422,10 @@ impl Session {
 }
 
 // ---------------------------------------------------------------------------
-// Manager（锚 Go Manager）
+// Manager
 // ---------------------------------------------------------------------------
 
-/// 协调单 active video session 生命周期的 Manager。锚 Go `Manager`。
+/// 协调单 active video session 生命周期的 Manager。
 ///
 /// daemon 全进程共享 single instance（main.rs 在 `cfg.video.forward=true` 时
 /// 构造，包 `Arc` 注入 http 层）；状态机仅 1 个槽位，并发限制由内部 mutex 保证。
@@ -451,20 +440,19 @@ pub struct Manager {
     pub logf: Option<SharedLogFn>,
 
     /// session TTL（`Duration::ZERO` → [`DEFAULT_SESSION_TTL`]；测试可调小）。
-    /// 锚 Go `Manager.TTL`。
     pub ttl: Duration,
     /// RTP receiver 监听的本地 UDP 地址（空 → `0.0.0.0:9880`；测试填
-    /// `127.0.0.1:0` 避免端口冲突）。锚 Go `Manager.RTPListenAddr`。
+    /// `127.0.0.1:0` 避免端口冲突）。
     pub rtp_listen_addr: String,
     /// TTL monitor 轮询周期（`Duration::ZERO` → 1s；测试压缩用）。
     pub ttl_monitor_interval: Duration,
     /// teardown 第 3 步残余 RTP 尾等待（默认 ~50ms；测试压缩用）。
     pub teardown_tail_wait: Duration,
     /// 显式 [`Manager::stop`] 的 teardown 总预算（`Duration::ZERO` →
-    /// [`DEFAULT_STOP_BUDGET`] 8s，锚 Go handler 8s ctx；测试压缩用）。
+    /// [`DEFAULT_STOP_BUDGET`] 8s；测试压缩用）。
     pub stop_budget: Duration,
     /// TTL 过期 detached cleanup 的 teardown 总预算（`Duration::ZERO` →
-    /// [`DEFAULT_TTL_CLEANUP_BUDGET`] 5s，锚 Go stopInternal 5s ctx；测试压缩用）。
+    /// [`DEFAULT_TTL_CLEANUP_BUDGET`] 5s；测试压缩用）。
     pub ttl_cleanup_budget: Duration,
     /// 随机源路径（默认 `/dev/urandom`；测试指向不存在路径以演练
     /// UUID/SSRC 失败回滚链）。
@@ -477,12 +465,11 @@ pub struct Manager {
     /// RTCP sender 依赖（默认真 [`RtcpSender`] 包装）。
     pub rtcp: Arc<dyn RtcpPort>,
 
-    /// 内部状态：当前 active session（Go `mu + current`）。Start 持本锁跨
-    /// bind + preview 信令全程。
+    /// 内部状态：当前 active session。Start 持本锁跨 bind + preview 信令全程。
     current: Mutex<Option<Arc<Session>>>,
 
-    /// TTL monitor 异步发起的 detached cleanup 线程 handle（Go `cleanupWG` 的
-    /// std-native 等价：`Mutex<Vec<JoinHandle>>` + register 时 retain 回收）。
+    /// TTL monitor 异步发起的 detached cleanup 线程 handle
+    /// （`Mutex<Vec<JoinHandle>>` + register 时 retain 回收）。
     /// `Manager::shutdown` 在清完 current 后于 deadline 内对账排空——否则
     /// SIGTERM 落在 TTL-expired 后、stop_internal 仍在 StopPreview/BYE/50ms
     /// drain 之间时，daemon 退出会把 cleanup 杀在半路（外机持续推流 /
@@ -491,7 +478,7 @@ pub struct Manager {
 }
 
 impl Manager {
-    /// 构造 Manager（注入默认运行时依赖）。锚 Go `New`。
+    /// 构造 Manager（注入默认运行时依赖）。
     pub fn new(caller: Caller, logf: Option<SharedLogFn>) -> Manager {
         Manager {
             preview: Arc::new(WirePreview { logf: logf.clone() }),
@@ -517,7 +504,7 @@ impl Manager {
         }
     }
 
-    /// 生效 TTL（锚 Go `m.ttl()`：非正值回退默认）。
+    /// 生效 TTL（非正值回退默认）。
     fn ttl_value(&self) -> Duration {
         if self.ttl.is_zero() {
             DEFAULT_SESSION_TTL
@@ -552,7 +539,7 @@ impl Manager {
         }
     }
 
-    /// 起 session（或 idempotent 复用）。锚 Go `Manager.Start`。
+    /// 起 session（或 idempotent 复用）。
     ///
     /// 行为：
     ///   - 无 active session → bind UDP 9880 + dial 18022 等 ack + 起三线程
@@ -657,8 +644,7 @@ impl Manager {
                 let res = if let Some(port) = &mgr.rtp {
                     port.run_with_conn(rtp_conn, &expect_ip, &sess.stop)
                 } else {
-                    // lazy 构造真 receiver（绑 session FrameBuffer + SSRC sink，
-                    // 等价 Go m.RTP == nil 分支）。
+                    // lazy 构造真 receiver（绑 session FrameBuffer + SSRC sink）。
                     let sink_sess = Arc::clone(&sess);
                     let recv = RtpReceiver {
                         logf: mgr.logf.clone(),
@@ -702,12 +688,12 @@ impl Manager {
 
         // 4c. TTL monitor 线程：每 monitor_interval 检查；过期则**异步**发起 stop。
         //
-        // TTL 过期路径必须 detached（monitor 禁自 join——Go 死锁同坑）：若 monitor
+        // TTL 过期路径必须 detached（monitor 禁自 join，否则死锁）：若 monitor
         // 同步跑 stop_internal → teardown 内等 done，而 done 只有本 monitor 才会发
         // （在 stop 置位分支里）——自己等自己，只能卡到 2s abandoning 兜底。
-        // 修复形态（复刻 Go 最终版）：过期 → 新线程跑 stop_internal（handle 收进
-        // cleanups 对账）；本 monitor 继续走 stop 置位分支 drain RTP/RTCP 后发 done，
-        // teardown 的 done-wait 立刻完成。done 由本线程唯一负责发（不变量）。
+        // 正确形态：过期 → 新线程跑 stop_internal（handle 收进 cleanups 对账）；
+        // 本 monitor 继续走 stop 置位分支 drain RTP/RTCP 后发 done，teardown 的
+        // done-wait 立刻完成。done 由本线程唯一负责发（不变量）。
         {
             let mgr = Arc::clone(self);
             let sess = Arc::clone(&sess);
@@ -719,8 +705,7 @@ impl Manager {
                 let mut next_tick = Instant::now() + interval;
                 loop {
                     if sess.stop.load(Ordering::SeqCst) {
-                        // session 取消：drain RTP/RTCP（Go bgWG.Wait）后发 done
-                        // （Go close(sess.done)）。
+                        // session 取消：drain RTP/RTCP 后发 done。
                         let _ = h_rtp.join();
                         let _ = h_rtcp.join();
                         let _ = done_tx.send(());
@@ -763,11 +748,11 @@ impl Manager {
     }
 
     /// 终结指定 outdoor 的 active session（idempotent：无匹配 session 时静默返回，
-    /// 上层照样 200）。锚 Go `Manager.Stop`（Go 返 error 但 shutdown 恒 nil；
-    /// teardown 内部失败仅 log——Rust 直接返 `()`，组 F 禁把 Stop 失败映射 503）。
+    /// 上层照样 200）。teardown 内部失败仅 log——直接返 `()`，HTTP 层禁把 Stop
+    /// 失败映射 503。
     ///
-    /// teardown 受 [`Manager::stop_budget`]（默认 8s）总预算约束——锚 Go
-    /// `handleVideoStop` 的 8s handler ctx 包住整个 shutdown 序列。
+    /// teardown 受 [`Manager::stop_budget`]（默认 8s）总预算约束——8s handler ctx
+    /// 包住整个 shutdown 序列。
     pub fn stop(&self, outdoor_uri: &str) {
         let sess = {
             let mut cur = self.current.lock().unwrap_or_else(|e| e.into_inner());
@@ -784,13 +769,12 @@ impl Manager {
     }
 
     /// 按 session_id 查 active session（HTTP `/video/<id>/stream.flv` 用）。
-    /// 锚 Go `CurrentByID`。
     pub fn current_by_id(&self, id: &str) -> Option<Arc<Session>> {
         let cur = self.current.lock().unwrap_or_else(|e| e.into_inner());
         cur.as_ref().filter(|c| c.id == id).cloned()
     }
 
-    /// 返当前 active session（无 active 时 `None`）。锚 Go `Current`。
+    /// 返当前 active session（无 active 时 `None`）。
     pub fn current(&self) -> Option<Arc<Session>> {
         self.current
             .lock()
@@ -799,7 +783,7 @@ impl Manager {
     }
 
     /// 重置当前 session 的 TTL 倒计时（stream handler 拿到 ID 后调用，作为
-    /// 消费者活跃信号）。锚 Go `RefreshTTL`。
+    /// 消费者活跃信号）。
     pub fn refresh_ttl(&self, id: &str) -> bool {
         let cur = self.current.lock().unwrap_or_else(|e| e.into_inner());
         match cur.as_ref() {
@@ -814,9 +798,9 @@ impl Manager {
 
     /// 返指定 session 的 TTL 剩余时间（read-only 观测口；session 不存在返 `None`）。
     ///
-    /// 组 F 追加：HTTP stream handler 的「失败分支禁刷 TTL / 就绪后单次刷」语义
-    /// 对 **concrete** `Manager` 无法以 fake 计数验证（Go 用 fakeVideoMgr 数
-    /// RefreshTTL 调用），改以 deadline 剩余量前后对比断言。不改任何写路径。
+    /// HTTP stream handler 的「失败分支禁刷 TTL / 就绪后单次刷」语义对 **concrete**
+    /// `Manager` 无法以 fake 计数验证，改以 deadline 剩余量前后对比断言。
+    /// 不改任何写路径。
     pub fn ttl_remaining(&self, id: &str) -> Option<Duration> {
         let cur = self.current.lock().unwrap_or_else(|e| e.into_inner());
         cur.as_ref().filter(|c| c.id == id).map(|c| {
@@ -827,8 +811,8 @@ impl Manager {
         })
     }
 
-    /// daemon graceful exit：停止 active session + 对账全部 detached cleanup。
-    /// 锚 Go `Manager.Shutdown(ctx)`（deadline 约束 cleanup 对账等待）。
+    /// daemon graceful exit：停止 active session + 对账全部 detached cleanup
+    /// （deadline 约束 cleanup 对账等待）。
     ///
     /// 必须等 TTL monitor 异步发起的 detached cleanup 完成——否则 SIGTERM 落在
     /// TTL-expired 之后、stop_internal 仍在 StopPreview / BYE / drain 之间时，
@@ -842,12 +826,11 @@ impl Manager {
             cur.take()
         };
         if let Some(sess) = sess {
-            // teardown 共享 caller deadline（同一总预算，不叠加自己的）——锚 Go
-            // Manager.Shutdown 把 ctx 原样传给 shutdown(ctx, sess, ...)。
+            // teardown 共享 caller deadline（同一总预算，不叠加自己的）。
             self.teardown(&sess, "daemon-shutdown", overall);
         }
 
-        // 对账 detached cleanup（Go cleanupWG.Wait 受 ctx deadline 约束）。
+        // 对账 detached cleanup（受 deadline 约束）。
         let drained: Vec<JoinHandle<()>> = {
             let mut v = self.cleanups.lock().unwrap_or_else(|e| e.into_inner());
             std::mem::take(&mut *v)
@@ -868,7 +851,7 @@ impl Manager {
                 let _ = waiter.join();
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                // waiter 线程保持 detached（等价 Go 超时后遗留的 Wait goroutine）。
+                // waiter 线程保持 detached（超时后遗留，继续在后台 join cleanup）。
                 self.logf(&format!(
                     "video: shutdown timeout waiting for TTL cleanups (deadline {deadline:?})"
                 ));
@@ -877,14 +860,12 @@ impl Manager {
     }
 
     /// TTL monitor 触发的自动停止：摘 current 比对（CAS 式守卫），再 teardown。
-    /// 锚 Go `stopInternal`。
     ///
     /// 与 [`Manager::stop`] 区分：stop 是外部 HTTP 驱动；本函数是内部 timer 驱动。
     /// 双驱动同刻竞争同一 session 时，只有摘到 current 的一方执行 teardown
-    /// （Go `m.current != sess` 早返等价）。
+    /// （摘不到 current 即早返）。
     ///
-    /// teardown 受 [`Manager::ttl_cleanup_budget`]（默认 5s）总预算约束——锚 Go
-    /// `stopInternal` 自建 `context.WithTimeout(5s)`。
+    /// teardown 受 [`Manager::ttl_cleanup_budget`]（默认 5s）总预算约束。
     fn stop_internal(&self, sess: &Arc<Session>, reason: &str) {
         {
             let mut cur = self.current.lock().unwrap_or_else(|e| e.into_inner());
@@ -899,12 +880,12 @@ impl Manager {
         self.teardown(sess, reason, deadline);
     }
 
-    /// 终结 session 资源（teardown 序列）。锚 Go `Manager.shutdown(ctx, sess, reason)`。
+    /// 终结 session 资源（teardown 序列）。
     ///
     /// 失败不返业务错（best-effort cleanup），wire send 失败仅 log。
     ///
-    /// `deadline` 是整个 teardown 的总预算（锚 Go：显式 stop 由 handler 8s ctx
-    /// 包住、TTL cleanup 5s ctx、daemon shutdown 收 main stopCtx）：各步骤按剩余
+    /// `deadline` 是整个 teardown 的总预算（显式 stop 由 handler 8s ctx 包住、
+    /// TTL cleanup 5s 预算、daemon shutdown 收 caller deadline）：各步骤按剩余
     /// 预算执行/裁短/跳过；唯独第 5 步 FrameBuffer close **不受预算约束永远执行**
     /// （资源释放不可跳，stop flag 同理永远置位）。
     fn teardown(&self, sess: &Arc<Session>, reason: &str, deadline: Instant) {
@@ -915,10 +896,9 @@ impl Manager {
 
         // 1. 发 req=708 stop preview（best-effort；按剩余预算裁短，预算耗尽则跳过）。
         //    PreviewClient 的 timeout 是 per-segment 语义（dial 一段 + 连接绝对
-        //    deadline 一段，最坏 2×timeout）；Go 等价物靠 dialAndExchange 的 ctx
-        //    watchdog 主动 close conn 把**总**时长硬 cap 在 ctx 剩余内。Rust 拿不到
-        //    socket 句柄做 watchdog，按 剩余/2 折算 per-segment 值保证两段总和
-        //    ≤ 剩余预算（剩余 ≥10s 时与既有默认 5s 一致，行为不变）。
+        //    deadline 一段，最坏 2×timeout）。拿不到 socket 句柄做总时长 watchdog，
+        //    按 剩余/2 折算 per-segment 值保证两段总和 ≤ 剩余预算（剩余 ≥10s 时与
+        //    既有默认 5s 一致，行为不变）。
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             self.logf("video: teardown budget exhausted; skipping stop-preview wire");
@@ -945,7 +925,7 @@ impl Manager {
         }
 
         // 3. 等 ~50ms 残余 RTP 尾（observations §3.4 启动延迟与停止尾，平均 52ms；
-        //    按剩余预算裁短——锚 Go `select{time.After(50ms), ctx.Done()}`）。
+        //    按剩余预算裁短，预算耗尽则不等）。
         let tail = self
             .teardown_tail_wait
             .min(deadline.saturating_duration_since(Instant::now()));
@@ -987,10 +967,10 @@ impl Manager {
 }
 
 // ---------------------------------------------------------------------------
-// helpers（锚 Go newUUIDv4 / newRandomSSRC / IsValidUUID）
+// helpers（UUID v4 / 随机 SSRC / UUID 校验）
 // ---------------------------------------------------------------------------
 
-/// 读随机源 `len` 字节（design D5：`std::fs` 读 `/dev/urandom`，零新 FFI 面；
+/// 读随机源 `len` 字节（`std::fs` 读 `/dev/urandom`，零新 FFI 面；
 /// 失败返错不 panic）。
 fn read_random_from(path: &str, buf: &mut [u8]) -> io::Result<()> {
     let mut f = std::fs::File::open(path)?;
@@ -1027,18 +1007,18 @@ fn random_ssrc_from(path: &str) -> io::Result<u32> {
     }
 }
 
-/// 生成 RFC 4122 v4 UUID 字符串（标准 8-4-4-4-12）。锚 Go `newUUIDv4`。
+/// 生成 RFC 4122 v4 UUID 字符串（标准 8-4-4-4-12）。
 pub fn new_uuid_v4() -> io::Result<String> {
     uuid_v4_from(URANDOM_PATH)
 }
 
-/// 生成随机非零 32-bit SSRC（RFC 3550 推荐随机化避免冲突）。锚 Go `newRandomSSRC`。
+/// 生成随机非零 32-bit SSRC（RFC 3550 推荐随机化避免冲突）。
 pub fn new_random_ssrc() -> io::Result<u32> {
     random_ssrc_from(URANDOM_PATH)
 }
 
-/// 简单校验 36-char UUID 格式（HTTP 路径解析用——组 F 动态路由复用，
-/// 坏 UUID → 400 且先于 method 检查）。锚 Go `IsValidUUID`。
+/// 简单校验 36-char UUID 格式（HTTP 路径解析用——动态路由复用，
+/// 坏 UUID → 400 且先于 method 检查）。
 pub fn is_valid_uuid(s: &str) -> bool {
     let b = s.as_bytes();
     if b.len() != 36 {
@@ -1061,7 +1041,7 @@ pub fn is_valid_uuid(s: &str) -> bool {
     true
 }
 
-// ── 单测（移植 Go session_test.go 全部 + 五件套之一~四 + 任务点名场景）──────────
+// ── 单测（Manager 生命周期用例 + 补充场景）──────────
 
 #[cfg(test)]
 mod tests {
@@ -1071,7 +1051,7 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::atomic::AtomicU32;
 
-    // --- fakes（锚 Go fakePreview / fakeRTP / fakeRTCP）---
+    // --- fakes（preview / rtp / rtcp 测试替身）---
 
     /// PreviewPort 测试 fake：可注入 start 错误 / start・stop 延迟、记录调用。
     #[derive(Default)]
@@ -1079,7 +1059,7 @@ mod tests {
         starts: AtomicU32,
         stops: AtomicU32,
         /// StopPreview 真实返回（含 delay 后）才递增；区分「stop 已发起但还在
-        /// delay」vs「stop 完整返回」（锚 Go stopsCompleted）。
+        /// delay」vs「stop 完整返回」。
         stops_completed: AtomicU32,
         start_err: Mutex<Option<String>>,
         start_delay_ms: AtomicU32,
@@ -1138,7 +1118,7 @@ mod tests {
         }
     }
 
-    /// RtpPort fake：立即 close 传入 conn 避免 leak，阻塞到 stop 置位（锚 Go fakeRTP）。
+    /// RtpPort fake：立即 close 传入 conn 避免 leak，阻塞到 stop 置位。
     #[derive(Default)]
     struct FakeRtp {
         runs: AtomicU32,
@@ -1160,7 +1140,7 @@ mod tests {
         }
     }
 
-    /// RtcpPort fake（锚 Go fakeRTCP）。
+    /// RtcpPort fake。
     #[derive(Default)]
     struct FakeRtcp {
         runs: AtomicU32,
@@ -1188,8 +1168,8 @@ mod tests {
         }
     }
 
-    /// 锚 Go newTestManager：注入三 fake + 测试加速 TTL（200ms）/ ephemeral 端口 /
-    /// monitor 压缩到 25ms（tunable，Go 固定 1s ticker——D8 压缩纪律）。
+    /// 注入三 fake + 测试加速 TTL（200ms）/ ephemeral 端口 / monitor 压缩到
+    /// 25ms（生产 1s ticker 压缩用）。
     /// 返回**未包 Arc** 的 Manager 供 per-test 再调参。
     fn test_manager() -> (Manager, Arc<FakePreview>, Arc<FakeRtp>, Arc<FakeRtcp>) {
         let caller = parse_caller("06021103@10.0.0.91:18022").expect("caller");
@@ -1218,9 +1198,9 @@ mod tests {
         }
     }
 
-    // --- 基本行为（移植 Go TestManager_*）---
+    // --- 基本行为 ---
 
-    /// 移植 Go `TestManager_StartReturnsSessionInfo`。
+    /// start 返回填好的 SessionInfo + 发一次 preview。
     #[test]
     fn start_returns_session_info() {
         let (m, fp, _, _) = test_manager();
@@ -1236,7 +1216,7 @@ mod tests {
         m.shutdown(Duration::from_secs(3));
     }
 
-    /// SessionInfo ttl_secs 用生产 TTL 时为 60（组 F 200 响应 ttl=60 字段源）。
+    /// SessionInfo ttl_secs 用生产 TTL 时为 60（200 响应 ttl=60 字段源）。
     #[test]
     fn session_info_ttl_secs_production_value() {
         let (mut m, _, _, _) = test_manager();
@@ -1249,7 +1229,7 @@ mod tests {
         m.shutdown(Duration::from_secs(3));
     }
 
-    /// 移植 Go `TestManager_StartIdempotentSameOutdoor`。
+    /// 同 outdoor 幂等复用同一 session、不重发 preview。
     #[test]
     fn start_idempotent_same_outdoor() {
         let (m, fp, _, _) = test_manager();
@@ -1266,7 +1246,7 @@ mod tests {
         m.shutdown(Duration::from_secs(3));
     }
 
-    /// 移植 Go `TestManager_StartConflictDifferentOutdoor`（spec 场景「不同 outdoor 冲突」）。
+    /// 不同 outdoor 冲突 → Conflict。
     #[test]
     fn start_conflict_different_outdoor() {
         let (m, _, _, _) = test_manager();
@@ -1277,7 +1257,7 @@ mod tests {
         let err = m.start(b.clone()).expect_err("conflict expected");
         assert!(err.is_conflict(), "err = {err:?}, want Conflict");
         assert!(!err.is_preview_timeout());
-        // Display 字面对齐 Go fmt.Errorf("%w: active=%s, requested=%s")。
+        // Display 字面契约：`<msg>: active=%s, requested=%s`。
         assert_eq!(
             err.to_string(),
             format!(
@@ -1288,7 +1268,7 @@ mod tests {
         m.shutdown(Duration::from_secs(3));
     }
 
-    /// 移植 Go `TestManager_StopReleasesSession`。
+    /// stop 释放 session 并发 BYE。
     #[test]
     fn stop_releases_session() {
         let (m, _, _, frtcp) = test_manager();
@@ -1300,7 +1280,7 @@ mod tests {
         assert_eq!(frtcp.byes.load(Ordering::SeqCst), 1, "BYE not sent");
     }
 
-    /// 移植 Go `TestManager_StopMissingOutdoorIdempotent` + URI 不匹配分支。
+    /// 无 active session / URI 不匹配时 stop 静默幂等。
     #[test]
     fn stop_missing_outdoor_idempotent() {
         let (m, fp, _, frtcp) = test_manager();
@@ -1317,7 +1297,7 @@ mod tests {
         m.shutdown(Duration::from_secs(3));
     }
 
-    /// 移植 Go `TestManager_TTLExpiryAutoStop`。
+    /// TTL 过期后 session 自动停止。
     #[test]
     fn ttl_expiry_auto_stop() {
         let (mut m, _, _, _) = test_manager();
@@ -1336,7 +1316,7 @@ mod tests {
         panic!("session did not auto-stop after TTL");
     }
 
-    /// 移植 Go `TestManager_RefreshTTLPreventsExpiry`（时长 tunable 压缩）。
+    /// 周期 refresh_ttl 阻止过期（时长 tunable 压缩）。
     #[test]
     fn refresh_ttl_prevents_expiry() {
         let (mut m, _, _, _) = test_manager();
@@ -1353,7 +1333,7 @@ mod tests {
         m.shutdown(Duration::from_secs(3));
     }
 
-    /// 移植 Go `TestManager_RefreshTTLWrongID`。
+    /// refresh_ttl 错 ID 返 false。
     #[test]
     fn refresh_ttl_wrong_id() {
         let (m, _, _, _) = test_manager();
@@ -1361,7 +1341,7 @@ mod tests {
         assert!(!m.refresh_ttl("not-a-real-id-aaaaaaaaaaaaaaaaaaaa"));
     }
 
-    /// current_by_id：命中返 Arc、不命中返 None（组 F 动态路由依赖面）。
+    /// current_by_id：命中返 Arc、不命中返 None（动态路由依赖面）。
     #[test]
     fn current_by_id_matches_only_active_id() {
         let (m, _, _, _) = test_manager();
@@ -1378,10 +1358,9 @@ mod tests {
         m.shutdown(Duration::from_secs(3));
     }
 
-    // --- Start 失败回滚链（移植 Go + 任务 5.2 两段回滚断言）---
+    // --- Start 失败回滚链（两段回滚断言）---
 
-    /// 移植 Go `TestManager_StartFailsOnRTPBindBusy`：bind 失败必须先于 preview
-    /// （starts==0），且不留 active session。
+    /// bind 失败必须先于 preview（starts==0），且不留 active session。
     #[test]
     fn start_fails_on_rtp_bind_busy() {
         let occupied = UdpSocket::bind("127.0.0.1:0").expect("occupy port");
@@ -1402,8 +1381,7 @@ mod tests {
         );
     }
 
-    /// 移植 Go `TestManager_StartFailsOnPreviewError` + 回滚链第一段断言：
-    /// preview 失败**仅关 socket**（不发 StopPreview）。
+    /// 回滚链第一段：preview 失败**仅关 socket**（不发 StopPreview）。
     #[test]
     fn start_fails_on_preview_error_rolls_back_socket_only() {
         let (m, fp, _, _) = test_manager();
@@ -1426,9 +1404,8 @@ mod tests {
         );
     }
 
-    /// 回滚链第二段（任务 5.2）：UUID/SSRC 生成失败（urandom 读失败）= 关 socket +
-    /// best-effort StopPreview（3s）。Go 无此测试（crypto/rand 不可注入）——Rust
-    /// 经 `urandom_path` 注入口补上。
+    /// 回滚链第二段：UUID/SSRC 生成失败（urandom 读失败）= 关 socket +
+    /// best-effort StopPreview（3s）。经 `urandom_path` 注入口演练失败链。
     #[test]
     fn start_uuid_failure_rolls_back_with_stop_preview() {
         let (mut m, fp, _, _) = test_manager();
@@ -1455,7 +1432,7 @@ mod tests {
         );
     }
 
-    // --- in-flight 互斥（spec 场景「并发 Start 互斥含 in-flight」）---
+    // --- in-flight 互斥（并发 Start 互斥含 in-flight）---
 
     /// Start 持锁跨 bind+preview 信令全程：B 在 A 信令期间调 Start 必须阻塞到 A
     /// 完成，绝不与其并行通过 bind/preview（starts 恒 1），之后按幂等规则复用。
@@ -1490,9 +1467,8 @@ mod tests {
         m.shutdown(Duration::from_secs(3));
     }
 
-    // --- 五件套之一：死 session 不续命 ---
+    // --- 死 session 不续命 ---
 
-    /// 等价移植 Go `TestManager_StartIdempotentDoesNotExtendDeadSession`：
     /// active session 未收到 IDR（外机 ack 但未推 RTP）时，同 outdoor 幂等 Start
     /// 不刷 TTL；原 TTL 过期后 session 仍被 auto-stop。
     #[test]
@@ -1532,8 +1508,7 @@ mod tests {
         panic!("session did not auto-stop after original TTL despite no IDR ever pushed");
     }
 
-    /// 对偶（移植 Go `TestManager_StartIdempotentRefreshesTTLWhenIDRSeen`）：
-    /// healthy session（三件套已齐）的幂等 Start 应当刷 TTL。
+    /// 对偶：healthy session（三件套已齐）的幂等 Start 应当刷 TTL。
     #[test]
     fn start_idempotent_refreshes_ttl_when_idr_seen() {
         let (mut m, _, _, _) = test_manager();
@@ -1560,11 +1535,10 @@ mod tests {
         m.shutdown(Duration::from_secs(3));
     }
 
-    // --- 五件套之二：TTL cleanup 及时 ---
+    // --- TTL cleanup 及时 ---
 
-    /// 等价移植 Go `TestManager_TTLExpiryCompletesPromptly`：TTL 过期 cleanup
-    /// （BYE 发出 + FrameBuffer 关闭）必须在 2s 内完成，不被 teardown 的 2s
-    /// abandoning 兜底拖死（旧 buggy 路径 monitor 自 join 必卡 ≥2s+）。
+    /// TTL 过期 cleanup（BYE 发出 + FrameBuffer 关闭）必须在 2s 内完成，不被
+    /// teardown 的 2s abandoning 兜底拖死（monitor 自 join 的错误路径必卡 ≥2s+）。
     #[test]
     fn ttl_expiry_completes_promptly() {
         let (mut m, _, _, frtcp) = test_manager();
@@ -1597,11 +1571,10 @@ mod tests {
         );
     }
 
-    // --- 五件套之三：Shutdown 等 detached cleanup ---
+    // --- Shutdown 等 detached cleanup ---
 
-    /// 等价移植 Go `TestManager_ShutdownWaitsForTTLCleanup`：TTL detached cleanup
-    /// 进行中（StopPreview 慢 wire 阻塞 200ms）收到 shutdown，必须等 cleanup
-    /// 完整跑完（stops_completed/BYE/FrameBuffer close）才返回。
+    /// TTL detached cleanup 进行中（StopPreview 慢 wire 阻塞 200ms）收到 shutdown，
+    /// 必须等 cleanup 完整跑完（stops_completed/BYE/FrameBuffer close）才返回。
     #[test]
     fn shutdown_waits_for_ttl_cleanup() {
         let (mut m, fp, _, frtcp) = test_manager();
@@ -1643,11 +1616,10 @@ mod tests {
         );
     }
 
-    // --- 五件套之四：Shutdown 受 deadline 约束 ---
+    // --- Shutdown 受 deadline 约束 ---
 
-    /// 等价移植 Go `TestManager_ShutdownTimeoutOnStuckCleanup`：cleanup 卡死
-    /// （StopPreview 1.5s）超出 shutdown 100ms deadline 时，shutdown 必须按时返
-    /// （不无限阻塞 daemon 退出）。
+    /// cleanup 卡死（StopPreview 1.5s）超出 shutdown 100ms deadline 时，shutdown
+    /// 必须按时返（不无限阻塞 daemon 退出）。
     #[test]
     fn shutdown_timeout_on_stuck_cleanup() {
         let (mut m, fp, _, _) = test_manager();
@@ -1688,11 +1660,11 @@ mod tests {
         }
     }
 
-    // --- teardown deadline 总预算（修复「stop 最坏 ~12s 超 Go 8s handler ctx」）---
+    // --- teardown deadline 总预算（stop 受 8s 总预算约束）---
 
     /// 显式 stop 在 preview-stop 挂死（fake 延迟远超预算）时必须在 ~stop_budget 内
     /// 返回，且 FrameBuffer 已 close、BYE 照发（budget tunable 压缩到 300ms，
-    /// 禁真实 8s 等待）。锚 Go handleVideoStop 8s ctx：StopPreview 受 ctx 裁短。
+    /// 禁真实 8s 等待）。8s 总预算下 StopPreview 受预算裁短。
     #[test]
     fn stop_returns_within_budget_when_preview_stop_hangs() {
         let (mut m, fp, _, frtcp) = test_manager();
@@ -1733,8 +1705,7 @@ mod tests {
 
     /// 预算已耗尽（shutdown 收到立即过期的 deadline）时：preview-stop 被跳过、
     /// 尾等/join 被裁到 0，但 BYE 照发、stop flag 置位、FrameBuffer close 仍执行
-    /// （资源释放不受预算约束）。锚 Go shutdown 各步 select ctx.Done() 即过 +
-    /// FrameBuf.Close 无条件执行。
+    /// （资源释放不受预算约束：各步预算耗尽即跳过，FrameBuffer close 无条件执行）。
     #[test]
     fn exhausted_budget_skips_preview_stop_but_still_closes() {
         let (m, fp, _, frtcp) = test_manager();
@@ -1763,7 +1734,7 @@ mod tests {
         assert!(m.current().is_none());
     }
 
-    // --- 双驱动竞态 CAS 守卫（spec 场景「双 teardown 竞态单方执行」）---
+    // --- 双驱动竞态 CAS 守卫（双 teardown 竞态单方执行）---
 
     /// 显式 Stop 已摘 current 后，TTL 驱动的 stop_internal 必须静默早返
     /// （teardown 单方执行：StopPreview/BYE 各恰一次）。
@@ -1876,9 +1847,9 @@ mod tests {
         assert!(m.current().is_none());
     }
 
-    // --- helpers（移植 Go TestUUIDv4_FormatAndUnique / TestRandomSSRC_NonZero / IsValidUUID）---
+    // --- helpers（UUID v4 / 随机 SSRC / UUID 校验用例）---
 
-    /// 移植 Go `TestUUIDv4_FormatAndUnique` + version/variant 位断言。
+    /// UUID v4 格式 + 唯一性 + version/variant 位断言。
     #[test]
     fn uuid_v4_format_and_unique() {
         let mut seen = std::collections::HashSet::new();
@@ -1895,7 +1866,7 @@ mod tests {
         }
     }
 
-    /// 移植 Go `TestRandomSSRC_NonZero`。
+    /// 随机 SSRC 永不为零。
     #[test]
     fn random_ssrc_non_zero() {
         for i in 0..50 {
@@ -1904,14 +1875,14 @@ mod tests {
         }
     }
 
-    /// urandom 读失败返错不 panic（D5）。
+    /// urandom 读失败返错不 panic。
     #[test]
     fn random_source_failure_returns_error() {
         assert!(uuid_v4_from("/nonexistent-urandom-for-test").is_err());
         assert!(random_ssrc_from("/nonexistent-urandom-for-test").is_err());
     }
 
-    /// IsValidUUID 边界（锚 Go IsValidUUID 行为）。
+    /// is_valid_uuid 边界用例。
     #[test]
     fn is_valid_uuid_boundaries() {
         assert!(is_valid_uuid("12345678-1234-4234-8234-123456789abc"));
@@ -1924,9 +1895,9 @@ mod tests {
         assert!(!is_valid_uuid("12345678-1234-4234-8234-12345678九abc")); // 非 ASCII。
     }
 
-    // --- Outdoor/Caller 解析（移植 Go TestParseOutdoor / TestParseOutdoor_BadURI）---
+    // --- Outdoor/Caller 解析 ---
 
-    /// 移植 Go `TestParseOutdoor`。
+    /// 从 SIP URI 解析出 name/ip/port/BCD 各字段。
     #[test]
     fn parse_outdoor_fields() {
         let o = parse_outdoor("06020000@172.16.106.152:18022").expect("parse_outdoor");
@@ -1939,7 +1910,7 @@ mod tests {
         assert_eq!(o.uri, "06020000@172.16.106.152:18022");
     }
 
-    /// 移植 Go `TestParseOutdoor_BadURI` + Caller。
+    /// 坏 URI → Uri 错误（Outdoor 与 Caller 两路）。
     #[test]
     fn parse_outdoor_and_caller_bad_uri() {
         assert!(matches!(

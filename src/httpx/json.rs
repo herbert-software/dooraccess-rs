@@ -1,4 +1,4 @@
-//! 手写 JSON encoder，复刻 Go `encoding/json` 五项隐式字节行为（0-crate）。
+//! 手写 JSON encoder，固定五项隐式字节行为（0-crate）。
 //!
 //! - map 路径（hapush）：key 字母序
 //! - struct 路径（writeJSON / RenderJSON）：key 声明序
@@ -23,23 +23,23 @@ pub enum JsonValue {
     Map(BTreeMap<String, JsonValue>),
 }
 
-/// 编码选项（复刻 Go Marshal vs Encoder 差异）。
+/// 编码选项（marshal vs encode 两种模式的字节差异）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JsonOptions {
-    /// `true` = Go `json.Marshal` 默认（writeJSON / hapush）；`false` = `SetEscapeHTML(false)`（/info）。
+    /// `true` = HTML 转义（writeJSON / hapush）；`false` = 不转义 HTML（/info）。
     pub escape_html: bool,
-    /// `true` = Go `json.Encoder.Encode`（/info 尾随 `\n`）；`false` = `json.Marshal`。
+    /// `true` = 尾随 `\n`（/info）；`false` = 无尾随换行。
     pub trailing_newline: bool,
 }
 
 impl JsonOptions {
-    /// writeJSON / hapush：`json.Marshal` 等价。
+    /// writeJSON / hapush：HTML 转义 + 无尾随换行。
     pub const MARSHAL: Self = Self {
         escape_html: true,
         trailing_newline: false,
     };
 
-    /// RenderJSON /info：`json.NewEncoder` + `SetEscapeHTML(false)` + `Encode` 等价。
+    /// RenderJSON /info：不转义 HTML + 尾随 `\n`。
     pub const ENCODE: Self = Self {
         escape_html: false,
         trailing_newline: true,
@@ -152,14 +152,14 @@ fn write_string(out: &mut Vec<u8>, s: &str, escape_html: bool) {
             '\t' => out.extend_from_slice(br#"\t"#),
             '\x08' => out.extend_from_slice(br#"\b"#),
             '\x0c' => out.extend_from_slice(br#"\f"#),
-            // Go encoding/json 只转义 C0 控制符（U+0000–U+001F）；不转义 DEL(0x7F) 与
-            // C1(0x80–0x9F)。Rust `char::is_control()` 含 0x7F–0x9F（Unicode Cc）会与 Go
-            // 分叉，故用 `< 0x20` 精确对齐。
+            // 只转义 C0 控制符（U+0000–U+001F）；不转义 DEL(0x7F) 与 C1(0x80–0x9F)。
+            // Rust `char::is_control()` 含 0x7F–0x9F（Unicode Cc）范围过宽，
+            // 故用 `< 0x20` 精确界定。
             c if (c as u32) < 0x20 => write_unicode_escape(out, c as u32),
             '<' if escape_html => out.extend_from_slice(br#"\u003c"#),
             '>' if escape_html => out.extend_from_slice(br#"\u003e"#),
             '&' if escape_html => out.extend_from_slice(br#"\u0026"#),
-            // Go encoding/json 无条件（两种 escape_html 模式都）把 U+2028/U+2029 转义
+            // 无条件（两种 escape_html 模式都）把 U+2028/U+2029 转义
             // （JSONP / JS 字符串安全），不受 escape_html 开关影响。
             '\u{2028}' => write_unicode_escape(out, 0x2028),
             '\u{2029}' => write_unicode_escape(out, 0x2029),
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn escape_edge_cases_match_go() {
-        // Go encoding/json 实测基线（go run 验证）：
+        // 实测基线：
         // U+2028/U+2029 两模式都转  / ；0x7F(DEL) 不转；< 0x20 转 \u00xx。
         // U+2028 在 MARSHAL 与 ENCODE 模式都转义（不受 escape_html 开关影响）。
         let v = JsonValue::String("\u{2028}\u{2029}".into());
@@ -243,7 +243,7 @@ mod tests {
             String::from_utf8(encode_value(&v, JsonOptions::ENCODE)).unwrap(),
             "\"\\u2028\\u2029\"\n"
         );
-        // DEL 0x7F 不转义（Go 原样）；C0 控制符 0x1F 转 。
+        // DEL 0x7F 不转义（原样保留）；C0 控制符 0x1F 转 。
         let del = JsonValue::String("a\u{7f}b".into());
         assert_eq!(
             String::from_utf8(encode_value(&del, JsonOptions::MARSHAL)).unwrap(),
