@@ -20,10 +20,17 @@ hAP ac lite（MIPS 大端 / softfloat / OpenWrt musl / 64MB RAM）上把 dooracc
 
 ## 构建
 
+本机构建（**仅 dev / sanity**，nightly 版本漂移会令字节数浮动）：
+
 ```sh
 make build-mips     # nightly + build-std + OpenWrt SDK musl sysroot + 全静态
 make dist           # = verify-mips + 拷 dist/dooraccess-rs-mips（记 ls -l 字节数）
 ```
+
+⚠️ **生产部署的 binary 取自 CI（CI-canonical 溯源）、非本机 make dist**：cutover 部署
+`release-on-tag.yml`（`workflow_dispatch`）run 的可下载产物（`gh run download <run-id> -n
+dooraccess-rs-mips`），burn-in 测的就是它、v1.0.0 release 发布的也是它（「测什么发什么」）。
+本机字节数与 CI 不必相等（nightly 漂移），以 **CI 产物为权威**。
 
 ## 共存回滚模型（Go 作冻结紧急回滚根）
 

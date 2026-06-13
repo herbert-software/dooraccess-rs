@@ -20,8 +20,10 @@
   稳态 VmRSS ~600KB）。`command` 显式传 `--config /etc/dooraccess/config.ini --state
   /etc/dooraccess/automation.state`。
 - `package/README.md`：直接安装 / 共存回滚（Go-as-rollback）/ 回滚双模式说明。
-- `.github/workflows/release-on-tag.yml`：tag（`v*`）触发交叉构建 MIPS BE softfloat binary +
-  上传 GitHub Release asset（`workflow_dispatch` 供 dry-run）。
+- `.github/workflows/release-on-tag.yml`：交叉构建 MIPS BE softfloat binary + 上传**可下载
+  workflow artifact**（CI-canonical 溯源——cutover `gh run download` 取此被测产物部署）；tag
+  （`v*`）另创 GitHub Release（release asset MUST == burn-in 被测产物，nightly 漂移则
+  `gh release upload --clobber` 替换）。`workflow_dispatch` 供 dry-run / 出 cutover 产物。
 
 ### 生产形态
 - procd init.d 托管（取代灰度 `/tmp` + setsid）；开机自启；Go binary/init.d 转 disabled 紧急回滚根。
