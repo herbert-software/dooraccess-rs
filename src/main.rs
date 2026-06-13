@@ -61,14 +61,15 @@ fn main() {
 /// flag/config 失败均**不启动任何 listener/worker/HTTP 线程**（spec「flag vs config 退出码区分」）。
 pub fn main_impl<W: Write>(args: &[String], stderr: &mut W) -> i32 {
     // ① flag 解析（手写，不引 clap：binary 体型是 OOM 红线）。
-    let config_path = match parse_flags(args) {
+    let (config_path, state_path) = match parse_flags(args) {
         Ok(p) => p,
         Err(msg) => {
             // EARLY-STAGE: central logger unavailable — pre-logger CLI 诊断（flag 解析失败、退出码 2）。
             let _ = writeln!(stderr, "dooraccess-rs: {msg}"); // EARLY-STAGE: central logger unavailable
             let _ = writeln!(
                 stderr, // EARLY-STAGE: central logger unavailable
-                "usage: dooraccess-rs [--config <path>]\n\tdefault config: {DEFAULT_CONFIG_PATH}"
+                "usage: dooraccess-rs [--config <path>] [--state <path>]\n\t\
+                 default config: {DEFAULT_CONFIG_PATH}\n\tdefault state: {AUTOMATION_STATE_PATH}"
             );
             return 2; // flag 解析失败 → 2。
         }
@@ -120,7 +121,9 @@ pub fn main_impl<W: Write>(args: &[String], stderr: &mut W) -> i32 {
     install_signal_handlers();
 
     // ⑥ run：构造并发骨架、阻塞到信号、graceful shutdown。
-    match run(&cfg, &config_path, AUTOMATION_STATE_PATH, stderr) {
+    // state_path 来自 parse_flags（init.d 传 --state /etc/dooraccess/automation.state）；
+    // MUST NOT 在此重传硬编 AUTOMATION_STATE_PATH（否则 --state 中性化失效，回 -go 死文件）。
+    match run(&cfg, &config_path, &state_path, stderr) {
         Ok(()) => {
             logf(stderr, "dooraccess-rs exited cleanly");
             0
@@ -133,9 +136,16 @@ pub fn main_impl<W: Write>(args: &[String], stderr: &mut W) -> i32 {
     }
 }
 
-/// 手写 `--config <path>` 解析（默认 [`DEFAULT_CONFIG_PATH`]）。未知 flag / 缺值 → Err（退出码 2）。
-fn parse_flags(args: &[String]) -> Result<String, String> {
+/// 手写 `--config <path>` / `--state <path>` 解析（默认 [`DEFAULT_CONFIG_PATH`] /
+/// [`AUTOMATION_STATE_PATH`]）。未知 flag / 缺值 → Err（退出码 2）。
+///
+/// `--state` 支撑 config/state 路径中性化（部署到 `/etc/dooraccess/`）：state 路径**不从
+/// config 派生**，由 init.d 显式传 `--state`。binary 默认常量保守留 `-go`（R1-R7 临时 swap /
+/// 手动 setsid 裸跑向后兼容）。返回 `(config_path, state_path)`——call site
+/// [`main_impl`] MUST 把 `state_path` 喂给 [`run`]，**MUST NOT** 再传硬编 [`AUTOMATION_STATE_PATH`]。
+fn parse_flags(args: &[String]) -> Result<(String, String), String> {
     let mut config_path = DEFAULT_CONFIG_PATH.to_string();
+    let mut state_path = AUTOMATION_STATE_PATH.to_string();
     let mut i = 1; // args[0] = bin path
     while i < args.len() {
         match args[i].as_str() {
@@ -150,10 +160,21 @@ fn parse_flags(args: &[String]) -> Result<String, String> {
                 config_path = other["--config=".len()..].to_string();
                 i += 1;
             }
+            "--state" => {
+                let v = args.get(i + 1).ok_or_else(|| {
+                    "--state requires a value (path to automation.state)".to_string()
+                })?;
+                state_path = v.clone();
+                i += 2;
+            }
+            other if other.starts_with("--state=") => {
+                state_path = other["--state=".len()..].to_string();
+                i += 1;
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
-    Ok(config_path)
+    Ok((config_path, state_path))
 }
 
 /// 行日志（写注入的 `W` sink，保留可测性）：经中央 [`format_log_line`] 加墙钟时间戳 + tag。
@@ -669,27 +690,57 @@ fn bool_str(b: bool) -> String {
 mod tests {
     use super::*;
 
-    /// flag 解析：默认路径 / `--config <p>` / `--config=<p>`。
+    /// flag 解析：默认路径 / `--config <p>` / `--config=<p>` / `--state <p>` / `--state=<p>` / 组合。
     #[test]
     fn parse_flags_default_and_explicit() {
+        // 默认：config + state 均回落硬编常量（R1-R7 裸跑向后兼容）。
         assert_eq!(
             parse_flags(&["bin".into()]).unwrap(),
-            DEFAULT_CONFIG_PATH.to_string()
+            (
+                DEFAULT_CONFIG_PATH.to_string(),
+                AUTOMATION_STATE_PATH.to_string()
+            )
         );
+        // --config 仅改 config，state 仍默认。
         assert_eq!(
             parse_flags(&["bin".into(), "--config".into(), "/tmp/x.ini".into()]).unwrap(),
-            "/tmp/x.ini"
+            ("/tmp/x.ini".to_string(), AUTOMATION_STATE_PATH.to_string())
         );
         assert_eq!(
             parse_flags(&["bin".into(), "--config=/tmp/y.ini".into()]).unwrap(),
-            "/tmp/y.ini"
+            ("/tmp/y.ini".to_string(), AUTOMATION_STATE_PATH.to_string())
+        );
+        // --state 仅改 state，config 仍默认（state 路径不从 config 派生）。
+        assert_eq!(
+            parse_flags(&["bin".into(), "--state".into(), "/tmp/s.state".into()]).unwrap(),
+            (DEFAULT_CONFIG_PATH.to_string(), "/tmp/s.state".to_string())
+        );
+        assert_eq!(
+            parse_flags(&["bin".into(), "--state=/tmp/t.state".into()]).unwrap(),
+            (DEFAULT_CONFIG_PATH.to_string(), "/tmp/t.state".to_string())
+        );
+        // 组合：中性路径同时传两参（init.d 的形态）。
+        assert_eq!(
+            parse_flags(&[
+                "bin".into(),
+                "--config".into(),
+                "/etc/dooraccess/config.ini".into(),
+                "--state".into(),
+                "/etc/dooraccess/automation.state".into(),
+            ])
+            .unwrap(),
+            (
+                "/etc/dooraccess/config.ini".to_string(),
+                "/etc/dooraccess/automation.state".to_string()
+            )
         );
     }
 
     /// flag 解析失败 → Err（main_impl 映射退出码 2）。
     #[test]
     fn parse_flags_errors() {
-        assert!(parse_flags(&["bin".into(), "--config".into()]).is_err()); // 缺值
+        assert!(parse_flags(&["bin".into(), "--config".into()]).is_err()); // config 缺值
+        assert!(parse_flags(&["bin".into(), "--state".into()]).is_err()); // state 缺值
         assert!(parse_flags(&["bin".into(), "--bogus".into()]).is_err()); // 未知 flag
     }
 

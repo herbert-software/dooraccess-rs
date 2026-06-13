@@ -55,6 +55,10 @@ pub fn render(tm: &libc::tm, millis: u32, msg: &str) -> String {
 ///
 /// `None` 经纯函数 [`compose`] 降级为全 0 占位 `tm`（`render` 加 `+1900`/`+1` 渲染
 /// `1900/01/00 00:00:00.mmm`）；该决策抽到 `compose` 便于注入 `None` 单测（见 tests）。
+// `libc::time_t` 是 deprecated 别名（libc 预告 musl 1.2.0 转 64-bit）；本处 MIPS32 用 32-bit
+// time_t 正确（由 ffi.rs const-assert `size_of::<time_t>()==4` 钉死），允许 deprecated。
+// revisit on musl 1.2.5 升级（const-assert 届时会失败、捕获转变）。byte-identical 行为。
+#[allow(deprecated)]
 pub fn format_log_line(now: SystemTime, msg: &str) -> String {
     // ① epoch 秒 + 亚秒纳秒；Err（pre-epoch）降级为 0。
     let (secs, nanos): (i64, u32) = match now.duration_since(UNIX_EPOCH) {

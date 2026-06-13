@@ -46,7 +46,7 @@
 
 ## 配置
 
-INI 格式（默认 `/etc/dooraccess-go/config.ini`，可经 `--config <path>` 覆盖）：
+INI 格式（默认 `/etc/dooraccess-go/config.ini`，可经 `--config <path>` 覆盖；生产 init.d 传中性路径 `/etc/dooraccess/config.ini`）：
 
 ```ini
 sip = 06021103@172.16.106.91:18022     ; 本机室内机（monitor）URI
@@ -72,7 +72,7 @@ auto_unlock = false
 auto_hangup = false
 ```
 
-运行时 automation flag 优先读 `/etc/dooraccess-go/automation.state`（持久），其次 `[automation]` 出厂默认。
+运行时 automation flag 持久态默认 `/etc/dooraccess-go/automation.state`，**可经 `--state <path>` 覆盖**（state 路径不从 config 派生；生产 init.d 传中性路径 `/etc/dooraccess/automation.state`）；文件缺失（首装/从未拨 flag）回落 `[automation]` 出厂默认。
 
 ## 构建
 
@@ -108,13 +108,12 @@ bash scripts/check-log-gate.sh  # 日志门禁：无残留无戳直写 stderr + 
 
 ## 部署到 hAP
 
-交叉构建产物是单文件全静态二进制，部署即「上传 + 运行」：
+交叉构建产物是单文件全静态二进制。两种部署形态：
 
-1. `make dist` 得到 `dist/dooraccess-rs-mips`；
-2. `scp -O` 到 hAP `/tmp/dooraccess-rs`，`ls -l` 核字节数（**禁 `sha256sum`/`md5sum`**——一次读全文件进 RAM 会在 64 MB 设备上触发 OOM）；
-3. `chmod +x` 后用 `setsid /tmp/dooraccess-rs --config /etc/dooraccess-go/config.ini >/tmp/rust.log 2>&1 &` 脱控制终端后台运行（hAP busybox 有 `setsid`、无 `nohup`）。
+- **正式生产（procd 托管）**：装 `/usr/bin/dooraccess-rs` + `package/files/etc/init.d/dooraccess-rs`（procd respawn、开机自启、无 GOMEMLIMIT），config/state 走中性路径 `/etc/dooraccess/`，Go 作冻结紧急回滚根。安装/回滚概览见 [`package/README.md`](package/README.md)，**完整权威 SOP 见 `dooraccess-go/DEPLOY.md` §Rust 生产部署 P0-P13**。
+- **临时验证 swap（setsid）**：`scp -O` 到 `/tmp/dooraccess-rs` → `setsid /tmp/dooraccess-rs --config <cfg> --state <state> >/tmp/rust.log 2>&1 &`（hAP busybox 有 `setsid`、无 `nohup`），测完恢复 Go。见 `DEPLOY.md` §Rust 临时验证 swap R1-R7。
 
-> ⚠️ hAP ac lite 64 MB RAM 极紧：SSH 必加 `-o ConnectTimeout=8 -o ServerAliveInterval=15`，失败立即停手不 retry（多 session 累积耗 RAM）。
+> ⚠️ hAP ac lite 64 MB RAM 极紧：`ls -l` 核字节数（**禁 `sha256sum`/`md5sum`**——读全文件进 RAM 触发 OOM）；SSH 必加 `-o ConnectTimeout=8 -o ServerAliveInterval=15`，失败立即停手不 retry。**任何真机操作走 DEPLOY.md，禁自创流程。**
 
 ## 开发约定
 

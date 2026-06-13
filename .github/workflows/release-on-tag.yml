@@ -1,0 +1,58 @@
+name: Release on tag
+
+# tag（v*）触发：交叉构建 MIPS BE softfloat binary + 上传 GitHub Release asset。
+# workflow_dispatch：手动 dry-run（构建 + 验字节，但不创建 Release）——用于验证 release job
+# 本身（SDK fetch 缓存 / tag-ref 上下文 / gh-release token 权限），**不打真 tag**（首个 git tag
+# MUST 是 v1.0.0、真机转正 + procd burn-in 后才打，见 OpenSpec promote-rust-to-production）。
+#
+# 构建步骤复用 ci.yml 的 mips-build（已在 ubuntu 验证）；关键增量 = `make dist`（产出
+# dist/dooraccess-rs-mips，gh-release 上传此 canonical 路径；mips-build 只上传 target/ artifact）。
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # softprops/action-gh-release 创建 Release 需写权限
+
+env:
+  CARGO_TERM_COLOR: always
+  OPENWRT_SDK_VER: "24.10.1"
+
+jobs:
+  release:
+    name: build + release MIPS BE soft-float
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install nightly + rust-src + llvm-tools
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup component add rust-src llvm-tools-preview --toolchain nightly
+      - name: Install zstd
+        run: sudo apt-get update && sudo apt-get install -y zstd
+      - name: Cache OpenWrt SDK sysroot
+        uses: actions/cache@v5
+        with:
+          path: .openwrt-sdk
+          key: openwrt-sdk-${{ env.OPENWRT_SDK_VER }}-ath79-mips_24kc
+      - name: Fetch SDK sysroot
+        run: make fetch-sdk
+      - name: Cross-build static MIPS daemon
+        run: make build-mips
+      - name: Verify MIPS BE + soft-float + static
+        run: make verify-mips
+      - name: Make dist artifact
+        # dist/dooraccess-rs-mips 仅由 make dist (= verify-mips + cp) 产出——gh-release 上传此
+        # canonical 路径（与本机 make dist 同源，供字节等价核对）。
+        run: make dist
+      - name: Record byte count
+        run: ls -l dist/dooraccess-rs-mips
+      - name: Create GitHub Release (tag push only)
+        # workflow_dispatch dry-run 跑到此步即止（不创建 Release），仅验构建链 + 字节。
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/dooraccess-rs-mips
+          fail_on_unmatched_files: true

@@ -1,0 +1,47 @@
+#!/bin/sh /etc/rc.common
+
+# OpenWrt procd init script for dooraccess-rs (Rust 等价移植，转正生产 daemon)。
+#
+# 启动顺序：START=90（network 起来后），停止 STOP=10。进程崩溃 procd 自动 respawn；
+# 输出走 logread。
+#
+# 与 Go 版（/etc/init.d/dooraccess-go）的关键差异：
+#   - DAEMON 路径 /usr/bin/dooraccess-rs（不覆盖 Go binary，Go 作冻结紧急回滚根）。
+#   - CONFIG/STATE 走中性路径 /etc/dooraccess/（config/state 中性化；state 路径由 --state
+#     显式传入，daemon 不从 config 派生 state 路径）。
+#   - **无 GOMEMLIMIT/GOGC/GOMAXPROCS env**：Rust 无 GC、无此机制。Rust daemon 稳态 VmRSS
+#     约 600KB（比 Go 24MiB 软顶低两个数量级），不是 64MB hAP 的 OOM 风险源；崩溃兜底靠
+#     procd respawn，终极兜底靠 kernel OOM-killer。稳态 RSS 异常上升作运行期观察项处理，
+#     不引入人工内存硬杀（异常时只会杀 daemon，respawn 更合适）。
+
+START=90
+STOP=10
+USE_PROCD=1
+
+DAEMON=/usr/bin/dooraccess-rs
+CONFIG=/etc/dooraccess/config.ini
+STATE=/etc/dooraccess/automation.state
+
+start_service() {
+    [ -f "$CONFIG" ] || {
+        echo "dooraccess-rs: $CONFIG missing; copy from config.ini.example and edit"
+        return 1
+    }
+
+    procd_open_instance
+    # state 路径显式传入（中性化由 --state 参数交付，binary 默认常量仍是 -go 作向后兼容）。
+    # automation.state 源缺失（首装/从未拨 flag）由 daemon 内部 NotFound→config 默认处理，
+    # 不阻断启动，故此处不预检 STATE 存在。
+    procd_set_param command "$DAEMON" --config "$CONFIG" --state "$STATE"
+    # respawn 阈值：3600s 内 ≤5 次崩溃就 5s 后 respawn；超 5 次放弃（与 Go 一致）。
+    procd_set_param respawn 3600 5 5
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_set_param file "$CONFIG"  # 配置变更时 procd 自动 reload
+    procd_close_instance
+}
+
+reload_service() {
+    stop
+    start
+}

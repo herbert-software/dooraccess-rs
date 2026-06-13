@@ -138,12 +138,16 @@ const _: () = assert!(
 
 // timeval.tv_sec：mips32 是 32-bit（**非 time64**，T1 实测 timeval=8 / time_t=4）；
 // host（macOS-arm64 / Linux-x86_64）是 64-bit。两处都断言以钉死不分叉到意外宽度。
+// `libc::time_t` 是 deprecated 别名（libc 预告 musl 1.2.0 转 64-bit）；这两个 const-assert
+// 正是钉死 time_t 宽度的守卫，允许 deprecated。revisit on musl 1.2.5 升级。
 #[cfg(target_arch = "mips")]
+#[allow(deprecated)]
 const _: () = assert!(
     core::mem::size_of::<libc::time_t>() == 4,
     "time_t must be 32-bit on mips (timeval=8)"
 );
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+#[allow(deprecated)]
 const _: () = assert!(
     core::mem::size_of::<libc::time_t>() == 8,
     "time_t must be 64-bit on 64-bit linux"
@@ -306,6 +310,9 @@ mod linux {
     /// `setsockopt(SOL_SOCKET, SO_RCVTIMEO, timeval{0, 500_000})`（500ms 周期 wakeup）。
     ///
     /// 失败**不致命**（与 Go 一致——仅 log 后继续）：返回 errno 让调用方决定是否仅 log。
+    // `libc::time_t`/`suseconds_t` 是 deprecated 别名（libc 预告 musl 1.2.0 转 64-bit）；
+    // 宽度由上方 const-assert 钉死，允许 deprecated。revisit on musl 1.2.5 升级。
+    #[allow(deprecated)]
     pub fn set_rcvtimeo(fd: RawFd, sec: i64, usec: i64) -> Result<(), FfiError> {
         // tv_sec/tv_usec 是 time_t/suseconds_t；mips32=32-bit、host=64-bit（见 int 宽度断言）。
         let tv = libc::timeval {
