@@ -62,7 +62,7 @@ jobs:
         #   burn-in 测过的产物。release asset MUST == 被测产物——打 tag 后校验字节、不一致则
         #   `gh release upload <tag> <tested-binary> --clobber` 用被测产物替换（见 DEPLOY.md §Rust 生产部署 / tasks 5.3）。
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/dooraccess-rs-mips
           fail_on_unmatched_files: true
