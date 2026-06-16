@@ -1037,8 +1037,11 @@ impl Manager {
             ));
         }
         // 重置 last_rtp_at：避免下个 tick 立刻再判 idle（min_interval 已是主闸，
-        // 此处把 idle 时钟也归零，双保险）。
-        *sess.last_rtp_at.lock().unwrap_or_else(|e| e.into_inner()) = now;
+        // 此处把 idle 时钟也归零，双保险）。用 post-dial 的 `Instant::now()` 而非
+        // pre-dial 的 `now`——start_preview 阻塞期间 packet_hook 可能已把 last_rtp_at
+        // 更新成更新值，用 stale `now` 会把它倒退（多触发一次 re-invite，被 min_interval
+        // 兜住但精度差）。post-dial 时刻严格 ≥ dial 期间任何到达包的时刻，不倒退。
+        *sess.last_rtp_at.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
     }
 
     /// daemon graceful exit：停止 active session + 对账全部 detached cleanup
