@@ -20,7 +20,7 @@ use crate::httpx::{
 use crate::info;
 use crate::sender::Sender;
 use crate::unlock::{UnlockOutcome, WireKind};
-use crate::video::frame_buffer::WaitIdrError;
+use crate::video::frame_buffer::{FrameBuffer, WaitIdrError};
 use crate::video::session::{
     is_valid_uuid, parse_outdoor, Manager as VideoManager, ParseError as VideoParseError, Session,
 };
@@ -1578,7 +1578,7 @@ fn handle_video_dynamic(
         return;
     };
     match resource {
-        "stream.flv" => serve_video_stream(mgr, logf, w, &state),
+        "stream.flv" => serve_video_stream(mgr, logf, w, r, &state),
         "snapshot.jpg" => serve_video_snapshot(w),
         _ => error_json(w, STATUS_NOT_FOUND, "video: unknown resource"),
     }
@@ -1615,12 +1615,16 @@ impl Write for ResponseBodyWriter<'_> {
 ///     Content-Length → httpx 自动 chunked；连接 write_timeout=None 已预留）
 ///  6. 起 TTL refresh 线程（30s tunable 周期；`refresh_ttl` 返 false——session
 ///     消失——即停；stream 结束经 done flag 收口）
-///  7. `StreamWriter::run`：client 断开 = write Err 退出（不写响应体），打
-///     `video: stream writer exited: ...` 行
+///  7. 起 FIN peek 线程（持连接 try_clone；对端半关 `Ok(0)` → close FrameBuffer
+///     令 StreamWriter 即时退出，覆盖"RTP 仍在推、客户端却断开"场景）
+///  8. `StreamWriter::run`：client 断开 = write Err 退出（不写响应体），打
+///     `video: stream writer exited: ...` 行；退出后主动 teardown（解 CLOSE_WAIT /
+///     僵尸 session，复用 `Manager::stop` 内的 CAS 守卫防双触发）
 fn serve_video_stream(
     mgr: &Arc<VideoManager>,
     logf: Option<&SharedLogFn>,
     w: &mut dyn ResponseWriter,
+    r: &Request,
     state: &Arc<Session>,
 ) {
     match state.frame_buf.wait_idr(stream_startup_timeout()) {
@@ -1670,14 +1674,78 @@ fn serve_video_stream(
         std::thread::spawn(move || refresh_ttl_loop(&mgr, &sid, &done))
     };
 
+    // 后台 FIN peek watcher：对端半关（FIN）时 peek 返 Ok(0) → close FrameBuffer，
+    // 令 StreamWriter 即时退出（覆盖"RTP 仍在推、客户端却断开"——此时写循环忙、
+    // recv 不超时，靠本探测兜住）。try_clone 失败则无 watcher（退化为：有帧流靠
+    // write-error、停流靠 re-invite-fail/TTL 兜底——有界，非即时）。
+    let peek_watcher = r
+        .peek_conn
+        .as_ref()
+        .and_then(|s| s.try_clone().ok())
+        .map(|conn| {
+            let done = Arc::clone(&done);
+            let frame_buf = Arc::clone(&state.frame_buf);
+            std::thread::spawn(move || fin_peek_loop(conn, &done, &frame_buf))
+        });
+
     let mut sw = StreamWriter::new(ResponseBodyWriter { w });
     let res = sw.run(&state.frame_buf);
     done.store(true, Ordering::SeqCst);
     refresher.thread().unpark();
     let _ = refresher.join();
+    if let Some(h) = peek_watcher {
+        h.thread().unpark();
+        let _ = h.join();
+    }
     if let Err(e) = res {
         if let Some(f) = logf {
             f(&format!("video: stream writer exited: {e}"));
+        }
+    }
+    // 消费端断开（write Err 或 FIN peek close）→ 主动 teardown 解 CLOSE_WAIT /
+    // 僵尸 session（按 session id 匹配，避免误拆同 URI 后继会话；与 TTL/显式 stop
+    // 竞态安全）。正常退出（FrameBuffer 已被既有 teardown close）时幂等静默返回。
+    mgr.stop_by_id(state.id());
+}
+
+/// FIN peek watcher：周期 `peek` 底层连接探测对端半关。
+///   - `Ok(0)` = 对端已 FIN → close FrameBuffer（StreamWriter 即时退出）后返回；
+///   - `Ok(n>0)` = 流式响应期对端不应发数据，忽略（续探）；
+///   - `WouldBlock`/`TimedOut` = 无数据仍连，续探；
+///   - 其它 Err = 连接已坏 → 同 FIN 处理。
+///
+/// `done` 置位（stream 正常收口）即退出，不再探测。
+fn fin_peek_loop(conn: std::net::TcpStream, done: &AtomicBool, frame_buf: &Arc<FrameBuffer>) {
+    const PROBE_PERIOD: Duration = Duration::from_millis(500);
+    let _ = conn.set_read_timeout(Some(PROBE_PERIOD));
+    let mut buf = [0u8; 1];
+    loop {
+        if done.load(Ordering::SeqCst) {
+            return;
+        }
+        match conn.peek(&mut buf) {
+            Ok(0) => {
+                // 对端半关：close FrameBuffer 令写循环退出。
+                frame_buf.close();
+                return;
+            }
+            Ok(_) => {
+                // 流式响应期对端发了数据（不预期）：续探，由 done / FIN 收口。
+                std::thread::park_timeout(PROBE_PERIOD);
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                // 无数据可读但仍连接：续探。
+            }
+            Err(_) => {
+                // 连接已坏：同 FIN 处理。
+                frame_buf.close();
+                return;
+            }
         }
     }
 }
@@ -2071,6 +2139,7 @@ mod tests {
             host: String::new(),
             remote_addr: String::new(),
             content_length: body.len() as i64,
+            peek_conn: None,
         }
     }
 
@@ -2335,6 +2404,7 @@ mod tests {
             host: String::new(),
             remote_addr: String::new(),
             content_length: body.len() as i64,
+            peek_conn: None,
         }
     }
 
@@ -2748,7 +2818,12 @@ mod tests {
     struct VideoFakePreview;
 
     impl PreviewPort for VideoFakePreview {
-        fn start_preview(&self, _o: &Outdoor, _c: &Caller) -> Result<(), PreviewError> {
+        fn start_preview(
+            &self,
+            _o: &Outdoor,
+            _c: &Caller,
+            _timeout: Option<Duration>,
+        ) -> Result<(), PreviewError> {
             Ok(())
         }
 
@@ -2831,6 +2906,7 @@ mod tests {
             nal_type,
             data: vec![nal_type | 0x60, 0x01, 0x02, 0x03],
             timestamp: ts,
+            stream_epoch: 0,
         }
     }
 
@@ -3135,5 +3211,64 @@ mod tests {
 
         set_stream_startup_timeout_ms(old_to);
         set_ttl_refresh_period_ms(old_rp);
+    }
+
+    /// 5.3：消费端断开（FIN）→ fin_peek_loop peek 得 Ok(0) → close FrameBuffer
+    /// （StreamWriter 据此退出 → 上层 teardown）。模拟客户端关闭连接。
+    #[test]
+    fn fin_peek_closes_frame_buffer_on_disconnect() {
+        use std::net::{TcpListener, TcpStream};
+        let ln = TcpListener::bind("127.0.0.1:0").expect("listen");
+        let addr = ln.local_addr().unwrap();
+        let client = TcpStream::connect(addr).expect("connect");
+        let (server_conn, _) = ln.accept().expect("accept");
+
+        let frame_buf = Arc::new(FrameBuffer::new());
+        let done = Arc::new(AtomicBool::new(false));
+        let fb = Arc::clone(&frame_buf);
+        let dn = Arc::clone(&done);
+        let watcher = std::thread::spawn(move || fin_peek_loop(server_conn, &dn, &fb));
+
+        // 客户端关闭连接（发 FIN）。
+        drop(client);
+
+        // watcher 必在数个 peek 周期内 close FrameBuffer。
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && !frame_buf.closed() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            frame_buf.closed(),
+            "对端 FIN 后 fin_peek_loop 必须 close FrameBuffer 触发退出/teardown"
+        );
+        let _ = watcher.join();
+    }
+
+    /// 5.3 对偶：done 置位（stream 正常收口）时 fin_peek_loop 退出且**不** close
+    /// FrameBuffer（连接仍活、由正常路径收口，不误触发 teardown）。
+    #[test]
+    fn fin_peek_exits_on_done_without_closing() {
+        use std::net::{TcpListener, TcpStream};
+        let ln = TcpListener::bind("127.0.0.1:0").expect("listen");
+        let addr = ln.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).expect("connect"); // 保持连接活。
+        let (server_conn, _) = ln.accept().expect("accept");
+
+        let frame_buf = Arc::new(FrameBuffer::new());
+        let done = Arc::new(AtomicBool::new(false));
+        let fb = Arc::clone(&frame_buf);
+        let dn = Arc::clone(&done);
+        let watcher = std::thread::spawn(move || fin_peek_loop(server_conn, &dn, &fb));
+
+        // 模拟 stream 正常收口：置 done + unpark。
+        std::thread::sleep(Duration::from_millis(50));
+        done.store(true, Ordering::SeqCst);
+        watcher.thread().unpark();
+        let _ = watcher.join();
+
+        assert!(
+            !frame_buf.closed(),
+            "done 收口路径不得由 peek watcher close FrameBuffer"
+        );
     }
 }

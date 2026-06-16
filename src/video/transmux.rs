@@ -18,7 +18,9 @@
 //!     ——有意省略）
 
 use std::io::{self, Write};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::frame_buffer::FrameBuffer;
 use super::rtp::{NalUnit, NAL_TYPE_IDR, NAL_TYPE_PPS, NAL_TYPE_SPS};
@@ -39,6 +41,17 @@ pub const FLV_AVC_NALU: u8 = 0x01;
 pub const FLV_FRAME_TYPE_KEY: u8 = 0x10;
 /// FrameType 高 nibble：inter (P/B)。
 pub const FLV_FRAME_TYPE_INTER: u8 = 0x20;
+
+/// 跨 re-invite 段间 FLV timestamp 正向步进（一帧 ~40ms）。新段首帧的输出 ts =
+/// 上段高水位 + 此值，保证时间轴严格单调递增、不产生 0/负 duration
+/// （播放器跨段无缝续播；实测段间 ~165ms 起播缝可接受，此处只需正向间隙）。
+pub const SEGMENT_GAP_MS: u32 = 40;
+
+/// 订阅循环 `recv_timeout` 周期（500ms）：RTP 停（外机预算耗尽）时 handler 不再
+/// 永久阻塞等下一帧——每周期醒来以观测 FrameBuffer 是否已关闭（断开由 FIN-peek
+/// watcher 关 FrameBuffer 驱动；有帧流时 write 失败也会暴露断开）。flush 仅
+/// best-effort，向半关 peer 写不报错，不保证探到 FIN。
+const IDLE_PROBE: Duration = Duration::from_millis(500);
 
 const FLV_SIGNATURE: &[u8; 3] = b"FLV";
 const FLV_VERSION: u8 = 0x01;
@@ -206,9 +219,24 @@ impl std::error::Error for StreamError {
 pub struct StreamWriter<W: Write> {
     /// 输出目标（chunked HTTP body writer）。
     pub w: W,
-    /// 0 点基准：priming 取**种子 IDR** 的 RTP 时间戳（非订阅到的首 NAL）。
+    /// 0 点基准：priming 取**种子 IDR** 的 RTP 时间戳（非订阅到的首 NAL）；
+    /// 跨 re-invite 换流时重置为新段首 NAL 的 RTP ts（见 [`SEGMENT_GAP_MS`]）。
     base_rtp_timestamp: u32,
     base_rtp_set: bool,
+    /// 当前段（stream epoch）：receiver 每次外机换 SSRC（re-invite）+1。
+    /// NAL 的 epoch 与此不同 → 触发 FLV 时间轴重基准。
+    current_epoch: u32,
+    /// 当前段的 FLV 起始 ts（段内输出 = `segment_base_flv + (rtp_ts-base)/90`）。
+    /// 种子段为 0；每换段 = 上段高水位 + [`SEGMENT_GAP_MS`]。
+    segment_base_flv: u32,
+    /// 已输出 FLV timestamp 高水位（保证跨段单调递增、不回退/跳变）。
+    last_flv_ts: u32,
+    /// 当前段缓存的 SPS/PPS（换段时用于重发 AVC sequence header 让解码器重初始化）。
+    seg_sps: Option<Vec<u8>>,
+    seg_pps: Option<Vec<u8>>,
+    /// 跨 re-invite 检测到换段后置位：推迟到本段 IDR 前用**已刷新**的 seg_sps/seg_pps
+    /// 发 seq-header（避免用上段缓存的旧参数集前缀本段 IDR）。
+    pending_seq_header: bool,
 }
 
 impl<W: Write> StreamWriter<W> {
@@ -218,6 +246,12 @@ impl<W: Write> StreamWriter<W> {
             w,
             base_rtp_timestamp: 0,
             base_rtp_set: false,
+            current_epoch: 0,
+            segment_base_flv: 0,
+            last_flv_ts: 0,
+            seg_sps: None,
+            seg_pps: None,
+            pending_seq_header: false,
         }
     }
 
@@ -241,9 +275,14 @@ impl<W: Write> StreamWriter<W> {
             return Err(StreamError::Closed);
         };
 
-        // 0 点基准 = 种子 IDR 的 RTP ts。
+        // 0 点基准 = 种子 IDR 的 RTP ts；种子段世代取种子 IDR 的 epoch。
         self.base_rtp_timestamp = idr.timestamp;
         self.base_rtp_set = true;
+        self.current_epoch = idr.stream_epoch;
+        self.segment_base_flv = 0;
+        self.last_flv_ts = 0;
+        self.seg_sps = Some(sps.data.clone());
+        self.seg_pps = Some(pps.data.clone());
         // AVC sequence header（流首 tag，ts=0）；打包失败（SPS/PPS 边界）静默跳过
         // （已知行为保持）。
         if let Some(seq) = build_avc_sequence_header_tag(&sps.data, &pps.data, 0) {
@@ -258,15 +297,59 @@ impl<W: Write> StreamWriter<W> {
         // 订阅后续 NAL stream（种子与订阅起点之间的间隙是已知行为）。
         let (rx, _sub) = buf.subscribe();
         loop {
-            let n = match rx.recv() {
+            let n = match rx.recv_timeout(IDLE_PROBE) {
                 Ok(n) => n,
+                // RTP 停（外机预算耗尽，re-invite 在 session 层后台续命）：周期醒来
+                // 观测 FrameBuffer 是否已关闭（断开由 FIN-peek watcher 关 FrameBuffer
+                // 驱动，下次循环 recv 返回 Disconnected 即退出）。flush 仅 best-effort，
+                // 向半关 peer 写不报错、不保证探到 FIN；写真坏才返 Err。
+                Err(RecvTimeoutError::Timeout) => {
+                    self.w.flush().map_err(StreamError::Io)?;
+                    continue;
+                }
                 // channel 断开 = buffer close / 退订 → 正常退出。
-                Err(_) => return Ok(()),
+                Err(RecvTimeoutError::Disconnected) => return Ok(()),
             };
-            // 仅跳过 SPS/PPS（重复参数集，已在 sequence header 中）；IDR 不跳过
-            // ——后续每个 IDR 以 keyframe tag（0x17）写出。
-            if n.nal_type == NAL_TYPE_SPS || n.nal_type == NAL_TYPE_PPS {
-                continue;
+
+            // 跨 re-invite 换流：epoch 前进 → 重基准 FLV 时间轴（新段 base = 本 NAL
+            // RTP ts；高水位 += 一帧间隙保证单调递增）+ 标记本段需重发 seq-header。
+            if n.stream_epoch != self.current_epoch {
+                self.current_epoch = n.stream_epoch;
+                self.base_rtp_timestamp = n.timestamp;
+                self.base_rtp_set = true;
+                // 新段基线 = 上段高水位 + 一帧间隙（严格单调，不回退/跳变）。
+                self.segment_base_flv = self.last_flv_ts.saturating_add(SEGMENT_GAP_MS);
+                self.last_flv_ts = self.segment_base_flv;
+                // 推迟重发 seq-header 到本段 IDR 前：紧随的 SPS/PPS NAL 先刷新缓存
+                // （in-band 每段都带），seq-header 才用**本段**而非上段的参数集。
+                self.pending_seq_header = true;
+            }
+
+            // 缓存本段 SPS/PPS（供换段重发 seq-header）；SPS/PPS 本身不作 NALU tag
+            // 写出（重复参数集，已在 sequence header 中）。
+            match n.nal_type {
+                NAL_TYPE_SPS => {
+                    self.seg_sps = Some(n.data.clone());
+                    continue;
+                }
+                NAL_TYPE_PPS => {
+                    self.seg_pps = Some(n.data.clone());
+                    continue;
+                }
+                _ => {}
+            }
+            // IDR 不跳过——后续每个 IDR 以 keyframe tag（0x17）写出。
+            // 换段后第一个 IDR 前补发 seq-header（用本段已刷新的 SPS/PPS，ts 同段基线）；
+            // 若本段未带新 SPS/PPS 则 seg_sps/seg_pps 仍是上段缓存（与旧 fallback 等价）。
+            if self.pending_seq_header && n.nal_type == NAL_TYPE_IDR {
+                if let (Some(sps), Some(pps)) = (self.seg_sps.clone(), self.seg_pps.clone()) {
+                    if let Some(seq) =
+                        build_avc_sequence_header_tag(&sps, &pps, self.segment_base_flv)
+                    {
+                        self.w.write_all(&seq).map_err(StreamError::Io)?;
+                    }
+                }
+                self.pending_seq_header = false;
             }
             let ts = self.relative_flv_timestamp(n.timestamp);
             if let Some(t) = build_avc_nalu_tag(std::slice::from_ref(&n), ts) {
@@ -276,17 +359,23 @@ impl<W: Write> StreamWriter<W> {
         }
     }
 
-    /// RTP 90kHz timestamp → FLV 1ms 相对值。
+    /// RTP 90kHz timestamp → FLV 1ms 输出值。
     ///
-    /// 32-bit `wrapping_sub` 自然处理回绕；未 priming 直接调用时退化为首个 NAL
-    /// ts 作基准。
+    /// 输出 = `last_flv_ts(段基线高水位) + (rtp_ts - base)/90`；32-bit `wrapping_sub`
+    /// 自然处理回绕；同时把高水位推进到本帧（保证后续帧 + 跨段单调）。
+    /// 未 priming 直接调用时退化为首个 NAL ts 作基准（段基线 0）。
     fn relative_flv_timestamp(&mut self, rtp_ts: u32) -> u32 {
         if !self.base_rtp_set {
             self.base_rtp_timestamp = rtp_ts;
             self.base_rtp_set = true;
-            return 0;
+            return self.segment_base_flv;
         }
-        rtp_ts.wrapping_sub(self.base_rtp_timestamp) / 90
+        let within = rtp_ts.wrapping_sub(self.base_rtp_timestamp) / 90;
+        let out = self.segment_base_flv.saturating_add(within);
+        if out > self.last_flv_ts {
+            self.last_flv_ts = out;
+        }
+        out
     }
 
     /// per-tag flush（错误吞——下一次 Write 自然失败退出）。
@@ -307,6 +396,7 @@ mod tests {
             nal_type,
             data: data.to_vec(),
             timestamp: 0,
+            stream_epoch: 0,
         }
     }
 
@@ -483,6 +573,17 @@ mod stream_writer_tests {
             nal_type,
             data: data.to_vec(),
             timestamp: ts,
+            stream_epoch: 0,
+        }
+    }
+
+    /// 带显式 stream_epoch 的 NAL（跨 re-invite 重基准测试用）。
+    fn nal_ep(nal_type: u8, data: &[u8], ts: u32, epoch: u32) -> NalUnit {
+        NalUnit {
+            nal_type,
+            data: data.to_vec(),
+            timestamp: ts,
+            stream_epoch: epoch,
         }
     }
 
@@ -712,5 +813,190 @@ mod stream_writer_tests {
             .run(&buf)
             .expect_err("write failure must surface");
         assert!(matches!(err, StreamError::Io(_)), "err = {err:?}");
+    }
+
+    /// 5.2：FLV 时间轴跨 re-invite 重基准化——两段不同 SSRC（epoch）+ 不同 RTP ts
+    /// 基准，输出 FLV ts 必须单调递增、无跳变/回退，每段重发 seq-header。
+    #[test]
+    fn flv_timeline_rebaselines_across_reinvite() {
+        let buf = Arc::new(FrameBuffer::new());
+        // 段 0：种子 IDR @ RTP ts=90000（epoch 0）。
+        seed(&buf, 90000);
+        buf.wait_idr(Duration::from_millis(100)).expect("seeded");
+
+        let out = SharedBuf::default();
+        let out_c = out.clone();
+        let buf_c = Arc::clone(&buf);
+        let join = thread::spawn(move || StreamWriter::new(out_c).run(&buf_c));
+
+        thread::sleep(Duration::from_millis(50));
+        // 段 0 续：P-frame @ +90 ticks = +1ms（epoch 0）。
+        buf.push(nal_ep(NAL_TYPE_NON_IDR, &[0x61, 0x01], 90090, 0));
+        thread::sleep(Duration::from_millis(30));
+
+        // re-invite：段 1 用全新 RTP ts 基准（远小于段 0，模拟新随机起点）+ epoch 1。
+        // 新段重带 SPS/PPS/IDR（in-band，每段都带）。
+        buf.push(nal_ep(NAL_TYPE_SPS, &[0x67, 0x64, 0xc0, 0x16], 5000, 1));
+        buf.push(nal_ep(NAL_TYPE_PPS, &[0x68, 0xee, 0x31], 5000, 1));
+        buf.push(nal_ep(NAL_TYPE_IDR, &[0x65, 0xab], 5000, 1)); // 段 1 首 IDR。
+        buf.push(nal_ep(NAL_TYPE_NON_IDR, &[0x61, 0x02], 5090, 1)); // 段 1 +1ms。
+        thread::sleep(Duration::from_millis(50));
+        buf.close();
+        join.join().unwrap().expect("run exits Ok on close");
+
+        let tags = walk_tags(&out.bytes());
+        // 时间轴必须单调非递减（跨段不回退、不跳变）。
+        let mut prev_ts = 0u32;
+        for (i, (ts, _body)) in tags.iter().enumerate() {
+            assert!(
+                *ts >= prev_ts,
+                "FLV ts 必须单调递增：tag[{i}] ts={ts} < prev={prev_ts}（跨 re-invite 回退/跳变）"
+            );
+            prev_ts = *ts;
+        }
+        // 段 1 的帧 ts 必须 > 段 0 最大 ts（段间正向间隙 SEGMENT_GAP_MS）——
+        // 即新段不会因 RTP ts=5000 < 90000 而把输出时间轴拉回 0。
+        // 段 0：seq-header(0) + IDR(0) + P(1ms)；段 1 基线 = 1 + 40 = 41ms 起。
+        // 至少存在一个 ts >= SEGMENT_GAP_MS 的 tag（段 1 段基线）。
+        assert!(
+            tags.iter().any(|(ts, _)| *ts >= SEGMENT_GAP_MS),
+            "段 1 输出 ts 必须跨过段间间隙（最大 ts={}）",
+            tags.iter().map(|(t, _)| *t).max().unwrap_or(0)
+        );
+        // 至少 2 个 AVC sequence header（每段一个，让解码器重初始化）。
+        let seq_headers = tags
+            .iter()
+            .filter(|(_, b)| b.len() >= 2 && b[0] == 0x17 && b[1] == FLV_AVC_SEQ_HEADER)
+            .count();
+        assert!(
+            seq_headers >= 2,
+            "每段须重发 AVC sequence header（got {seq_headers}）"
+        );
+        // 段 1 IDR 须作 keyframe NALU tag 写出。
+        let kf = tags.iter().filter(|(_, b)| is_keyframe_nalu(b)).count();
+        assert!(kf >= 2, "段 0/段 1 IDR 均须 keyframe tag（got {kf}）");
+    }
+
+    /// 跨 re-invite seq-header 用**本段**而非上段 SPS：段 1 带与段 0 不同字节的 SPS，
+    /// 断言段 1 IDR 前的 seq-header 含段 1 的 SPS 字节（而非段 0 的），且 seq-header
+    /// 仍每段恰一次、仍在该段 IDR keyframe 之前。
+    #[test]
+    fn reinvite_seq_header_uses_new_segment_sps() {
+        // 段 0 / 段 1 的 SPS 在 byte 3（level）等处不同字节——足以区分。
+        let sps0: [u8; 4] = [0x67, 0x64, 0xc0, 0x16];
+        let sps1: [u8; 4] = [0x67, 0x64, 0xc0, 0x29];
+        assert_ne!(sps0, sps1, "两段 SPS 必须不同字节");
+
+        let buf = Arc::new(FrameBuffer::new());
+        // 段 0：种子 IDR（epoch 0）。
+        buf.push(nal_ep(NAL_TYPE_SPS, &sps0, 90000, 0));
+        buf.push(nal_ep(NAL_TYPE_PPS, &[0x68, 0xee, 0x31], 90000, 0));
+        buf.push(nal_ep(NAL_TYPE_IDR, &[0x65, 0xaa], 90000, 0));
+        buf.wait_idr(Duration::from_millis(100)).expect("seeded");
+
+        let out = SharedBuf::default();
+        let out_c = out.clone();
+        let buf_c = Arc::clone(&buf);
+        let join = thread::spawn(move || StreamWriter::new(out_c).run(&buf_c));
+
+        thread::sleep(Duration::from_millis(50));
+        // re-invite：段 1 带不同 SPS（epoch 1），SPS/PPS 先于 IDR 到达。
+        buf.push(nal_ep(NAL_TYPE_SPS, &sps1, 5000, 1));
+        buf.push(nal_ep(NAL_TYPE_PPS, &[0x68, 0xee, 0x31], 5000, 1));
+        buf.push(nal_ep(NAL_TYPE_IDR, &[0x65, 0xab], 5000, 1)); // 段 1 首 IDR。
+        thread::sleep(Duration::from_millis(50));
+        buf.close();
+        join.join().unwrap().expect("run exits Ok on close");
+
+        let tags = walk_tags(&out.bytes());
+        // 收集所有 seq-header tag（body[0]=0x17 && body[1]=seq）。
+        let seq_headers: Vec<&(u32, Vec<u8>)> = tags
+            .iter()
+            .filter(|(_, b)| b.len() >= 2 && b[0] == 0x17 && b[1] == FLV_AVC_SEQ_HEADER)
+            .collect();
+        assert_eq!(
+            seq_headers.len(),
+            2,
+            "seq-header 仍每段恰一次（段 0 priming + 段 1 换段）：{tags:?}"
+        );
+        // 段 0 seq-header 含 sps0、不含 sps1；段 1 seq-header 含 sps1。
+        let contains = |body: &[u8], pat: &[u8]| body.windows(pat.len()).any(|w| w == pat);
+        assert!(
+            contains(&seq_headers[0].1, &sps0),
+            "段 0 seq-header 须含段 0 SPS"
+        );
+        assert!(
+            contains(&seq_headers[1].1, &sps1),
+            "段 1 seq-header 必须含段 1 的 SPS（修复前用的是段 0 旧缓存）"
+        );
+        assert!(
+            !contains(&seq_headers[1].1, &sps0),
+            "段 1 seq-header 不得含段 0 的旧 SPS"
+        );
+        // seq-header 必须出现在段 1 IDR keyframe NALU tag 之前：
+        // 找段 1 seq-header 与其后首个 keyframe NALU tag 的下标顺序。
+        let seq1_ts = seq_headers[1].0;
+        let seq1_idx = tags
+            .iter()
+            .position(|(ts, b)| {
+                *ts == seq1_ts
+                    && b.len() >= 2
+                    && b[0] == 0x17
+                    && b[1] == FLV_AVC_SEQ_HEADER
+                    && contains(b, &sps1)
+            })
+            .expect("段 1 seq-header 下标");
+        let kf_after = tags[seq1_idx + 1..]
+            .iter()
+            .position(|(_, b)| is_keyframe_nalu(b));
+        assert!(
+            kf_after.is_some(),
+            "段 1 seq-header 之后须紧随段 1 IDR keyframe NALU tag"
+        );
+    }
+
+    /// 5.3：recv 超时（RTP 停）期间 socket 写探测失败 → run 返回 Err(Io)
+    /// （消费端断开被探测到，不再永久阻塞等下一帧）。
+    #[test]
+    fn idle_probe_detects_disconnect_via_flush() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtoOrd};
+        // 写正常但 flush 在被标记后失败（模拟 RTP 停期间 socket 写探测发现 FIN）。
+        #[derive(Clone)]
+        struct ProbeWriter {
+            fail_flush: Arc<AtomicBool>,
+        }
+        impl Write for ProbeWriter {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                if self.fail_flush.load(AtoOrd::SeqCst) {
+                    Err(io::Error::new(io::ErrorKind::BrokenPipe, "client gone"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let buf = Arc::new(FrameBuffer::new());
+        seed(&buf, 1000);
+        buf.wait_idr(Duration::from_millis(100)).expect("seeded");
+
+        let fail = Arc::new(AtomicBool::new(false));
+        let w = ProbeWriter {
+            fail_flush: Arc::clone(&fail),
+        };
+        let buf_c = Arc::clone(&buf);
+        let join = thread::spawn(move || StreamWriter::new(w).run(&buf_c));
+
+        // priming 写完（flush 还成功），随后无新帧 → 进入 recv_timeout 周期探测。
+        thread::sleep(Duration::from_millis(50));
+        // 标记 flush 失败：下一次 IDLE_PROBE(500ms) 醒来探测 → broken-pipe → 退出。
+        fail.store(true, AtoOrd::SeqCst);
+
+        let res = join.join().unwrap();
+        assert!(
+            matches!(res, Err(StreamError::Io(_))),
+            "RTP 停期间写探测失败必须返回 Io 错（断开检测），got {res:?}"
+        );
     }
 }

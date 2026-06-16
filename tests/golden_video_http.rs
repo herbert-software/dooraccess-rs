@@ -132,7 +132,12 @@ fn roundtrip_raw_server(handler: Arc<dyn Handler>, raw_req: &[u8]) -> Vec<u8> {
 struct OkPreview;
 
 impl PreviewPort for OkPreview {
-    fn start_preview(&self, _o: &Outdoor, _c: &Caller) -> Result<(), PreviewError> {
+    fn start_preview(
+        &self,
+        _o: &Outdoor,
+        _c: &Caller,
+        _timeout: Option<Duration>,
+    ) -> Result<(), PreviewError> {
         Ok(())
     }
 
@@ -150,7 +155,12 @@ impl PreviewPort for OkPreview {
 struct TimeoutPreview;
 
 impl PreviewPort for TimeoutPreview {
-    fn start_preview(&self, _o: &Outdoor, _c: &Caller) -> Result<(), PreviewError> {
+    fn start_preview(
+        &self,
+        _o: &Outdoor,
+        _c: &Caller,
+        _timeout: Option<Duration>,
+    ) -> Result<(), PreviewError> {
         Err(PreviewError::Timeout { stage: "dial" })
     }
 
@@ -365,6 +375,7 @@ fn video_endpoints_golden() {
                     nal_type: NAL_TYPE_IDR,
                     data: vec![0x65, 0xb8, 0x00, 0x04],
                     timestamp: 100_000,
+                    stream_epoch: 0,
                 });
                 cleanup_mgr = Some(Arc::clone(&m));
                 server_with(Some(m))

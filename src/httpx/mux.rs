@@ -108,5 +108,6 @@ pub fn request_with_path(path: &str) -> Request {
         host: String::new(),
         remote_addr: String::new(),
         content_length: 0,
+        peek_conn: None,
     }
 }

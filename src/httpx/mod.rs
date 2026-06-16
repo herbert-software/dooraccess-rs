@@ -161,6 +161,10 @@ pub struct Request {
     pub host: String,
     pub remote_addr: String,
     pub content_length: i64,
+    /// 底层连接的只读克隆（`try_clone`），供长连接 handler（video stream）`peek`
+    /// 探测对端 FIN——`Ok(0)` = 对端已半关 → 主动 teardown，不再永久阻塞等下一帧。
+    /// 非长连接 handler / 测试构造为 `None`（仅 server.rs 真连接路径填）。
+    pub peek_conn: Option<std::net::TcpStream>,
 }
 
 // 手写 Debug：body 是裸字节，只打长度（避免在 panic/expect 输出里 dump 整个 body）。

@@ -291,6 +291,7 @@ fn golden_video_flv() {
                             nal_type: data[0] & 0x1f,
                             data,
                             timestamp: ts,
+                            stream_epoch: 0,
                         }
                     })
                     .collect();

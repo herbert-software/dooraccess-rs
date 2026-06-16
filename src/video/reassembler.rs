@@ -266,6 +266,15 @@ impl FrameReassembler {
     pub fn stats(&self) -> ReassemblerStats {
         self.stats.clone()
     }
+
+    /// 重置 frame 累积态（清 pending + frame_buf + `expect_seq_set=false`），
+    /// 保留累计 stats。re-invite 换流（新 SSRC = 新 seq 空间）时调用，避免跨流
+    /// 字节拼接污染首帧；seq-gap 本能自然恢复，此处仅优化换段首帧。
+    pub fn reset_stream(&mut self) {
+        self.pending.clear();
+        self.frame_buf.clear();
+        self.expect_seq_set = false;
+    }
 }
 
 // ── 单测 ──────────────────────────────────────────────────────────────────────
