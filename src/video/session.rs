@@ -81,6 +81,34 @@ const MONITOR_POLL_SLICE: Duration = Duration::from_millis(20);
 /// 随机源设备节点（禁 rand/uuid/getrandom crate，`std::fs` 读零新 FFI 面）。
 const URANDOM_PATH: &str = "/dev/urandom";
 
+/// re-invite 触发阈值：RTP 停超过此值且有活跃消费者 → 判外机推流预算耗尽，
+/// 重发 req=704 取下一波（实测外机段内最大间隔仅 ~82ms，1s 远大于不误触发；
+/// observations §10.1）。
+const DEFAULT_REINVITE_IDLE: Duration = Duration::from_millis(1000);
+
+/// re-invite 两次最小间隔（防 thrash：外机离线时 re-invite 发 704 无 705 ack，
+/// 加间隔下限避免 monitor 每 tick 狂发）。
+const DEFAULT_REINVITE_MIN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// re-invite 连续失败阈值：连续 N 次重发 req=704 仍无 RTP（外机离线 / 无 ack）
+/// → 主动 teardown，禁无限重试（spec「re-invite 失败兜底」）。
+const DEFAULT_REINVITE_FAIL_THRESHOLD: u32 = 3;
+
+/// re-invite 的 start_preview dial 超时（收紧到 2s，避免阻塞 monitor 轮询；
+/// 生产默认 preview 5s 在 monitor 线程里会拖慢 TTL 检查）。
+const DEFAULT_REINVITE_DIAL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// re-invite 驱动器的 per-monitor 本地状态（无锁、单线程独占）。
+#[derive(Default)]
+struct ReinviteState {
+    /// 上次重发 req=704 的时刻（`None` = 从未重发）。最小间隔保护用。
+    last_reinvite_at: Option<Instant>,
+    /// 上次重发时的 RTP 包计数快照（判「重发后 RTP 是否恢复」=成败）。
+    packets_at_reinvite: u32,
+    /// 连续失败计数（重发后 RTP 未恢复）；达阈值 → 主动 teardown。
+    consecutive_failures: u32,
+}
+
 // ---------------------------------------------------------------------------
 // Outdoor / Caller（URI 解析，复用 codec）
 // ---------------------------------------------------------------------------
@@ -259,8 +287,14 @@ impl StartError {
 
 /// Manager 与 preview 信令之间的依赖注入接口（便于单测注入 fake）。
 pub trait PreviewPort: Send + Sync {
-    /// 发 req=704 + 等 req=705 ack。
-    fn start_preview(&self, outdoor: &Outdoor, caller: &Caller) -> Result<(), PreviewError>;
+    /// 发 req=704 + 等 req=705 ack。`timeout` `None` → 默认 5s（初次 Start 用）；
+    /// re-invite 路径传 ~2s 收紧 dial（避免阻塞 monitor 轮询）。
+    fn start_preview(
+        &self,
+        outdoor: &Outdoor,
+        caller: &Caller,
+        timeout: Option<Duration>,
+    ) -> Result<(), PreviewError>;
     /// 发 req=708 + 等 req=709 ack。`timeout` `None` → 默认 5s；回滚路径传 3s。
     fn stop_preview(
         &self,
@@ -314,10 +348,15 @@ struct WirePreview {
 }
 
 impl PreviewPort for WirePreview {
-    fn start_preview(&self, outdoor: &Outdoor, caller: &Caller) -> Result<(), PreviewError> {
+    fn start_preview(
+        &self,
+        outdoor: &Outdoor,
+        caller: &Caller,
+        timeout: Option<Duration>,
+    ) -> Result<(), PreviewError> {
         let client = PreviewClient {
             logf: boxed_logf(&self.logf),
-            timeout: None, // 默认 5s（dial + 连接 deadline 两段）。
+            timeout, // None → 默认 5s（dial + 连接 deadline 两段）；re-invite 传 2s。
         };
         client.start_preview(&outdoor.ip, outdoor.port, outdoor.bcd_name, caller.bcd_name)
     }
@@ -384,8 +423,19 @@ pub struct Session {
     reporter_ssrc: u32,
 
     /// 从 RTP 流解析出的外机端 SSRC（RTCP RR report block 用）。
-    /// 0 表示尚未收到 RTP（哨兵——SSRC 生成已排除 0）；RTP 首包 sink 写入。
+    /// 0 表示尚未收到 RTP（哨兵——SSRC 生成已排除 0）；RTP 首包 sink 写入，
+    /// re-invite 换流时 re-lock 更新（RTCP `ssrc_source` 动态读它自动跟上新流）。
     stream_ssrc: AtomicU32,
+
+    /// 最近一次收到 RTP 包的时刻（receiver 每包更新）。
+    /// **`Mutex<Instant>`**（MIPS32 禁 64-bit 原子；单调时钟）。TTL monitor 读
+    /// 差值判外机推流预算是否耗尽（RTP 停 > 阈值且有活跃消费者 → re-invite）。
+    last_rtp_at: Mutex<Instant>,
+
+    /// 收到的 RTP 包累计计数（receiver 每包 +1；32-bit 原子，MIPS32 合规）。
+    /// re-invite 驱动器据「重发 704 后此计数是否前进」判 re-invite 成败
+    /// （连续失败 N 次 → 主动 teardown）。
+    rtp_packets: AtomicU32,
 
     /// RTP 收到的 NAL 单元缓冲区（种子 + 实时 fan-out）。RTP receiver 写入；
     /// transmux StreamWriter（HTTP handler）读出。
@@ -458,6 +508,19 @@ pub struct Manager {
     /// UUID/SSRC 失败回滚链）。
     pub urandom_path: String,
 
+    /// re-invite 触发阈值：RTP 停超过此值 + 有活跃消费者 → 重发 req=704
+    /// （`Duration::ZERO` → [`DEFAULT_REINVITE_IDLE`] 1s；测试压缩用）。
+    pub reinvite_idle: Duration,
+    /// re-invite 两次最小间隔（`Duration::ZERO` → [`DEFAULT_REINVITE_MIN_INTERVAL`]
+    /// 5s；测试压缩用）。
+    pub reinvite_min_interval: Duration,
+    /// re-invite 连续失败阈值（`0` → [`DEFAULT_REINVITE_FAIL_THRESHOLD`] 3；
+    /// 连续 N 次重发仍无 RTP → 主动 teardown）。
+    pub reinvite_fail_threshold: u32,
+    /// re-invite 的 start_preview dial 超时（`Duration::ZERO` →
+    /// [`DEFAULT_REINVITE_DIAL_TIMEOUT`] 2s；收紧避免阻塞 monitor 轮询）。
+    pub reinvite_dial_timeout: Duration,
+
     /// preview 信令依赖（默认真 [`PreviewClient`] 包装）。
     pub preview: Arc<dyn PreviewPort>,
     /// RTP receiver 依赖（`None` → session 线程内 lazy 构造真 [`RtpReceiver`]）。
@@ -493,6 +556,10 @@ impl Manager {
             stop_budget: DEFAULT_STOP_BUDGET,
             ttl_cleanup_budget: DEFAULT_TTL_CLEANUP_BUDGET,
             urandom_path: URANDOM_PATH.to_string(),
+            reinvite_idle: DEFAULT_REINVITE_IDLE,
+            reinvite_min_interval: DEFAULT_REINVITE_MIN_INTERVAL,
+            reinvite_fail_threshold: DEFAULT_REINVITE_FAIL_THRESHOLD,
+            reinvite_dial_timeout: DEFAULT_REINVITE_DIAL_TIMEOUT,
             current: Mutex::new(None),
             cleanups: Mutex::new(Vec::new()),
         }
@@ -536,6 +603,42 @@ impl Manager {
             DEFAULT_TTL_CLEANUP_BUDGET
         } else {
             self.ttl_cleanup_budget
+        }
+    }
+
+    /// 生效 re-invite 触发阈值（ZERO 回退默认 1s）。
+    fn reinvite_idle_value(&self) -> Duration {
+        if self.reinvite_idle.is_zero() {
+            DEFAULT_REINVITE_IDLE
+        } else {
+            self.reinvite_idle
+        }
+    }
+
+    /// 生效 re-invite 最小间隔（ZERO 回退默认 5s）。
+    fn reinvite_min_interval_value(&self) -> Duration {
+        if self.reinvite_min_interval.is_zero() {
+            DEFAULT_REINVITE_MIN_INTERVAL
+        } else {
+            self.reinvite_min_interval
+        }
+    }
+
+    /// 生效 re-invite 失败阈值（0 回退默认 3）。
+    fn reinvite_fail_threshold_value(&self) -> u32 {
+        if self.reinvite_fail_threshold == 0 {
+            DEFAULT_REINVITE_FAIL_THRESHOLD
+        } else {
+            self.reinvite_fail_threshold
+        }
+    }
+
+    /// 生效 re-invite dial 超时（ZERO 回退默认 2s）。
+    fn reinvite_dial_timeout_value(&self) -> Duration {
+        if self.reinvite_dial_timeout.is_zero() {
+            DEFAULT_REINVITE_DIAL_TIMEOUT
+        } else {
+            self.reinvite_dial_timeout
         }
     }
 
@@ -591,7 +694,7 @@ impl Manager {
         })?;
 
         // 2. dial 18022 + 等 req=705 ack（回滚链第一段：preview 失败仅关 socket）。
-        if let Err(e) = self.preview.start_preview(&outdoor, &self.caller) {
+        if let Err(e) = self.preview.start_preview(&outdoor, &self.caller, None) {
             drop(rtp_conn);
             return Err(StartError::Preview(e));
         }
@@ -630,6 +733,8 @@ impl Manager {
             ttl_deadline: Mutex::new(Instant::now() + self.ttl_value()),
             reporter_ssrc,
             stream_ssrc: AtomicU32::new(0),
+            last_rtp_at: Mutex::new(Instant::now()),
+            rtp_packets: AtomicU32::new(0),
             frame_buf: Arc::new(FrameBuffer::new()),
             stop: Arc::new(AtomicBool::new(false)),
             done_rx: Mutex::new(Some(done_rx)),
@@ -644,15 +749,24 @@ impl Manager {
                 let res = if let Some(port) = &mgr.rtp {
                     port.run_with_conn(rtp_conn, &expect_ip, &sess.stop)
                 } else {
-                    // lazy 构造真 receiver（绑 session FrameBuffer + SSRC sink）。
+                    // lazy 构造真 receiver（绑 session FrameBuffer + SSRC sink +
+                    // per-packet last_rtp_at 更新）。SSRC sink 在 re-invite 换流时
+                    // re-lock 更新 stream_ssrc（RTCP RR 自动跟随）。
                     let sink_sess = Arc::clone(&sess);
+                    let hook_sess = Arc::clone(&sess);
                     let recv = RtpReceiver {
                         logf: mgr.logf.clone(),
                         buf: Arc::clone(&sess.frame_buf),
                         ssrc_sink: Some(Box::new(move |s| {
                             sink_sess.stream_ssrc.store(s, Ordering::SeqCst)
                         })),
-                        packet_hook: None,
+                        packet_hook: Some(Box::new(move |_pkt| {
+                            *hook_sess
+                                .last_rtp_at
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = Instant::now();
+                            hook_sess.rtp_packets.fetch_add(1, Ordering::SeqCst);
+                        })),
                     };
                     recv.run_with_conn(rtp_conn, &expect_ip, &sess.stop)
                 };
@@ -703,6 +817,8 @@ impl Manager {
             let _ = thread::spawn(move || {
                 let mut fired = false;
                 let mut next_tick = Instant::now() + interval;
+                // re-invite 状态：上次重发时刻 + 重发时的 RTP 包计数快照 + 连续失败计数。
+                let mut rs = ReinviteState::default();
                 loop {
                     if sess.stop.load(Ordering::SeqCst) {
                         // session 取消：drain RTP/RTCP 后发 done。
@@ -731,6 +847,12 @@ impl Manager {
                             // 不 return：继续等 stop 置位把 RTP/RTCP drain 掉再发
                             // done——否则 done 永远不来 → teardown 卡 2s 兜底。
                         }
+                        // re-invite 段：仅未 fired（未 TTL 过期/未在 teardown）时跑。
+                        // reuse 分支（session.rs reuse 仅刷 TTL）与本段正交——本段是
+                        // 后台续命，靠 RTP 停信号触发，不在 reuse 路径重发 704。
+                        if !fired {
+                            mgr.tick_reinvite(&sess, &mut rs, now);
+                        }
                     }
                     thread::park_timeout(
                         MONITOR_POLL_SLICE.min(next_tick.saturating_duration_since(Instant::now())),
@@ -758,6 +880,25 @@ impl Manager {
             let mut cur = self.current.lock().unwrap_or_else(|e| e.into_inner());
             match cur.as_ref() {
                 Some(c) if c.outdoor.uri == outdoor_uri => cur.take(),
+                _ => None,
+            }
+        };
+        // 真正 teardown 在锁外执行（避免持锁等待 RTP socket 关闭等慢操作）。
+        if let Some(sess) = sess {
+            let deadline = Instant::now() + self.stop_budget_value();
+            self.teardown(&sess, "explicit-stop", deadline);
+        }
+    }
+
+    /// 终结指定 session_id 的 active session（idempotent：无匹配 session 时静默
+    /// 返回）。与 [`Manager::stop`] 同结构，但匹配条件按 session id（per-session
+    /// UUID，等价身份匹配）而非 outdoor URI——避免同 URI 会话快速更替时误拆**后继**
+    /// 会话。消费端断开 teardown 用本方法（teardown 用 explicit-stop 预算）。
+    pub fn stop_by_id(&self, id: &str) {
+        let sess = {
+            let mut cur = self.current.lock().unwrap_or_else(|e| e.into_inner());
+            match cur.as_ref() {
+                Some(c) if c.id == id => cur.take(),
                 _ => None,
             }
         };
@@ -809,6 +950,95 @@ impl Manager {
                 .unwrap_or_else(|e| e.into_inner())
                 .saturating_duration_since(Instant::now())
         })
+    }
+
+    /// re-invite 驱动器一拍（TTL monitor 每 tick 调用，仅未 TTL-expired 时）。
+    ///
+    /// 决策（design 决策 3/决策 1）：
+    ///   - 仅 `consumer_count>0`（有人拉流）才触发——无人看不骚扰外机；
+    ///   - RTP 停 > `reinvite_idle`（默认 1s，远大于段内最大间隔 ~82ms）= 外机
+    ///     推流预算耗尽 → 重发 req=704 取下一波；
+    ///   - 两次 re-invite 至少隔 `reinvite_min_interval`（默认 5s）防 thrash；
+    ///   - 重发前先结算上一次 re-invite 成败（RTP 包计数是否前进）：成功 → 失败计数
+    ///     清零；失败 → +1，达 `reinvite_fail_threshold`（默认 3）→ `stop_internal`
+    ///     主动 teardown（spec「re-invite 失败兜底」，禁无限重试）。
+    ///
+    /// **session 级单触发**：本驱动器是 per-session monitor 单例（design 决策 1），
+    /// 多 consumer fan-out 不会各自重发 704。
+    fn tick_reinvite(self: &Arc<Self>, sess: &Arc<Session>, rs: &mut ReinviteState, now: Instant) {
+        // 无活跃消费者：禁 re-invite（不骚扰外机），并清空 re-invite 历史
+        // （下次有人观看时从干净状态起算，旧失败计数不跨观看窗累积）。
+        if sess.frame_buf.consumer_count() == 0 {
+            *rs = ReinviteState::default();
+            return;
+        }
+
+        let rtp_idle = now
+            .saturating_duration_since(*sess.last_rtp_at.lock().unwrap_or_else(|e| e.into_inner()));
+        // RTP 仍在推（预算未耗尽）：无需 re-invite。
+        if rtp_idle <= self.reinvite_idle_value() {
+            return;
+        }
+
+        // 最小间隔保护：上次重发后未满 min_interval 不再发（给外机恢复时间）。
+        if let Some(last) = rs.last_reinvite_at {
+            if now.saturating_duration_since(last) < self.reinvite_min_interval_value() {
+                return;
+            }
+            // 结算上一次 re-invite：自上次重发以来 RTP 包计数是否前进。
+            let packets_now = sess.rtp_packets.load(Ordering::SeqCst);
+            if packets_now != rs.packets_at_reinvite {
+                rs.consecutive_failures = 0; // RTP 恢复过 → 成功。
+            } else {
+                rs.consecutive_failures += 1; // 重发后无任何 RTP → 失败。
+                if rs.consecutive_failures >= self.reinvite_fail_threshold_value() {
+                    self.logf(&format!(
+                        "video: session id={} outdoor={} re-invite failed {} times; tearing down",
+                        sess.id, sess.outdoor.uri, rs.consecutive_failures
+                    ));
+                    let cleanup = thread::spawn({
+                        let mgr = Arc::clone(self);
+                        let sess = Arc::clone(sess);
+                        move || mgr.stop_internal(&sess, "reinvite-failed")
+                    });
+                    self.register_cleanup(cleanup);
+                    return;
+                }
+            }
+        }
+
+        // 竞态守卫：teardown 一旦摘走 current，本 session 正在/已被拆，禁止再发
+        // req=704 重启外机。锁只用于 ptr_eq 瞬时检查，释放后再 start_preview
+        // （不得持锁 dial）。
+        {
+            let cur = self.current.lock().unwrap_or_else(|e| e.into_inner());
+            if !cur.as_ref().is_some_and(|c| Arc::ptr_eq(c, sess)) {
+                return;
+            }
+        }
+
+        // 重发 req=704（dial 超时收紧到 2s，避免阻塞 monitor 轮询）。
+        self.logf(&format!(
+            "video: session id={} outdoor={} RTP idle {:?}; re-invite (req=704)",
+            sess.id, sess.outdoor.uri, rtp_idle
+        ));
+        rs.last_reinvite_at = Some(now);
+        rs.packets_at_reinvite = sess.rtp_packets.load(Ordering::SeqCst);
+        if let Err(e) = self.preview.start_preview(
+            &sess.outdoor,
+            &self.caller,
+            Some(self.reinvite_dial_timeout_value()),
+        ) {
+            // 信令本身失败（dial/ack）：记为一次失败结算的前奏——下个间隔窗
+            // 若 RTP 仍未恢复会计入 consecutive_failures。此处仅 log。
+            self.logf(&format!(
+                "video: session id={} re-invite preview signal failed (continuing): {e}",
+                sess.id
+            ));
+        }
+        // 重置 last_rtp_at：避免下个 tick 立刻再判 idle（min_interval 已是主闸，
+        // 此处把 idle 时钟也归零，双保险）。
+        *sess.last_rtp_at.lock().unwrap_or_else(|e| e.into_inner()) = now;
     }
 
     /// daemon graceful exit：停止 active session + 对账全部 detached cleanup
@@ -1064,6 +1294,8 @@ mod tests {
         start_err: Mutex<Option<String>>,
         start_delay_ms: AtomicU32,
         stop_delay_ms: AtomicU32,
+        /// start_preview 最近一次收到的 timeout 参数（外层 None = 尚未被调）。
+        last_start_timeout: Mutex<Option<Option<Duration>>>,
         /// stop_preview 最近一次收到的 timeout 参数（外层 None = 尚未被调）。
         last_stop_timeout: Mutex<Option<Option<Duration>>>,
         /// true 时 stop 延迟尊重传入 timeout（睡 min(delay, 2×timeout) 后返
@@ -1072,8 +1304,17 @@ mod tests {
     }
 
     impl PreviewPort for FakePreview {
-        fn start_preview(&self, _o: &Outdoor, _c: &Caller) -> Result<(), PreviewError> {
+        fn start_preview(
+            &self,
+            _o: &Outdoor,
+            _c: &Caller,
+            timeout: Option<Duration>,
+        ) -> Result<(), PreviewError> {
             self.starts.fetch_add(1, Ordering::SeqCst);
+            *self
+                .last_start_timeout
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(timeout);
             let d = self.start_delay_ms.load(Ordering::SeqCst);
             if d > 0 {
                 thread::sleep(Duration::from_millis(u64::from(d)));
@@ -1195,6 +1436,7 @@ mod tests {
             nal_type,
             data: data.to_vec(),
             timestamp: 0,
+            stream_epoch: 0,
         }
     }
 
@@ -1758,6 +2000,226 @@ mod tests {
             "CAS 守卫必须保证 teardown 单方执行"
         );
         assert_eq!(frtcp.byes.load(Ordering::SeqCst), 1);
+    }
+
+    // --- re-invite 驱动器（tick_reinvite 判据 + 失败兜底）---
+
+    /// 起一个长 TTL / 长 monitor interval 的 active session 供 tick_reinvite 单测
+    /// 直接驱动（背景 monitor 在测试窗内不 tick，不污染 starts 计数）。
+    fn reinvite_manager() -> (Arc<Manager>, Arc<FakePreview>, Arc<Session>) {
+        let caller = parse_caller("06021103@10.0.0.91:18022").expect("caller");
+        let fp = Arc::new(FakePreview::default());
+        let frtp = Arc::new(FakeRtp::default());
+        let frtcp = Arc::new(FakeRtcp::default());
+        let mut m = Manager::new(caller, None);
+        m.ttl = Duration::from_secs(3600); // 不 TTL-过期。
+        m.rtp_listen_addr = "127.0.0.1:0".to_string();
+        m.ttl_monitor_interval = Duration::from_secs(3600); // 背景 monitor 不 tick。
+        m.reinvite_idle = Duration::from_millis(500);
+        m.reinvite_min_interval = Duration::from_millis(100);
+        m.reinvite_fail_threshold = 3;
+        m.preview = Arc::clone(&fp) as Arc<dyn PreviewPort>;
+        m.rtp = Some(Arc::clone(&frtp) as Arc<dyn RtpPort>);
+        m.rtcp = Arc::clone(&frtcp) as Arc<dyn RtcpPort>;
+        let m = Arc::new(m);
+        m.start(must_outdoor("06020000@172.16.106.152:18022"))
+            .expect("start");
+        let sess = m.current().expect("current");
+        (m, fp, sess)
+    }
+
+    /// 设 last_rtp_at 为「now - age」（模拟 RTP 已停 age）。
+    fn set_rtp_idle(sess: &Session, age: Duration) {
+        *sess.last_rtp_at.lock().unwrap() = Instant::now() - age;
+    }
+
+    /// 5.1：RTP 停 > 阈值 + 有 consumer → 触发 re-invite（重发 704）。
+    #[test]
+    fn reinvite_triggers_when_rtp_stalls_with_consumer() {
+        let (m, fp, sess) = reinvite_manager();
+        let starts0 = fp.starts.load(Ordering::SeqCst); // start 已发 1 次。
+        let (_rx, _sub) = sess.frame_buf.subscribe(); // 注册活跃 consumer。
+        assert_eq!(sess.frame_buf.consumer_count(), 1);
+
+        set_rtp_idle(&sess, Duration::from_millis(800)); // > 500ms 阈值。
+        let mut rs = ReinviteState::default();
+        m.tick_reinvite(&sess, &mut rs, Instant::now());
+
+        assert_eq!(
+            fp.starts.load(Ordering::SeqCst),
+            starts0 + 1,
+            "RTP 停 > 阈值 + 有 consumer 必须重发 req=704"
+        );
+        // re-invite dial 超时收紧到 2s（reinvite_dial_timeout）。
+        let to = fp
+            .last_start_timeout
+            .lock()
+            .unwrap()
+            .expect("start_preview 未被调")
+            .expect("re-invite 必须传显式 dial timeout");
+        assert_eq!(to, Duration::from_secs(2), "re-invite dial 超时须收紧到 2s");
+        m.shutdown(Duration::from_secs(3));
+    }
+
+    /// 5.1：无活跃消费者 → 禁 re-invite（不骚扰外机）。
+    #[test]
+    fn reinvite_skipped_without_consumer() {
+        let (m, fp, sess) = reinvite_manager();
+        let starts0 = fp.starts.load(Ordering::SeqCst);
+        assert_eq!(sess.frame_buf.consumer_count(), 0, "无 consumer 前提");
+
+        set_rtp_idle(&sess, Duration::from_secs(5)); // RTP 早就停了。
+        let mut rs = ReinviteState::default();
+        m.tick_reinvite(&sess, &mut rs, Instant::now());
+
+        assert_eq!(
+            fp.starts.load(Ordering::SeqCst),
+            starts0,
+            "无活跃消费者禁止 re-invite"
+        );
+        m.shutdown(Duration::from_secs(3));
+    }
+
+    /// 5.1：段内间隔 82ms（< 阈值）不误触发。
+    #[test]
+    fn reinvite_not_triggered_within_segment_gap() {
+        let (m, fp, sess) = reinvite_manager();
+        let starts0 = fp.starts.load(Ordering::SeqCst);
+        let (_rx, _sub) = sess.frame_buf.subscribe();
+
+        set_rtp_idle(&sess, Duration::from_millis(82)); // 实测段内最大间隔 ~82ms。
+        let mut rs = ReinviteState::default();
+        m.tick_reinvite(&sess, &mut rs, Instant::now());
+
+        assert_eq!(
+            fp.starts.load(Ordering::SeqCst),
+            starts0,
+            "段内间隔 82ms < 500ms 阈值不得误触发"
+        );
+        m.shutdown(Duration::from_secs(3));
+    }
+
+    /// 5.1：最小间隔保护——刚 re-invite 过、未满 min_interval 不再发。
+    #[test]
+    fn reinvite_respects_min_interval() {
+        let (m, fp, sess) = reinvite_manager();
+        let (_rx, _sub) = sess.frame_buf.subscribe();
+        let mut rs = ReinviteState::default();
+
+        set_rtp_idle(&sess, Duration::from_millis(800));
+        let now = Instant::now();
+        m.tick_reinvite(&sess, &mut rs, now); // 第 1 次：发。
+        let after_first = fp.starts.load(Ordering::SeqCst);
+
+        // 紧接着再 tick（仍 idle，但未满 100ms min_interval）→ 不发。
+        set_rtp_idle(&sess, Duration::from_millis(800));
+        m.tick_reinvite(&sess, &mut rs, now + Duration::from_millis(20));
+        assert_eq!(
+            fp.starts.load(Ordering::SeqCst),
+            after_first,
+            "未满 min_interval 不得再发 704"
+        );
+        m.shutdown(Duration::from_secs(3));
+    }
+
+    /// 5.4：连续 N 次 re-invite 仍无 RTP（rtp_packets 不前进）→ 主动 teardown。
+    #[test]
+    fn reinvite_fail_fallback_tears_down() {
+        let (m, fp, sess) = reinvite_manager();
+        let (_rx, _sub) = sess.frame_buf.subscribe();
+        let mut rs = ReinviteState::default();
+
+        // 模拟外机离线：每次 re-invite 后 rtp_packets 恒不前进（FakeRtp 不推包）。
+        // 连续 tick（每次都满足 idle + 间隔），直到失败计数达阈值触发 teardown。
+        let mut now = Instant::now();
+        for _ in 0..10 {
+            if m.current().is_none() {
+                break; // 已 teardown。
+            }
+            set_rtp_idle(&sess, Duration::from_millis(800));
+            m.tick_reinvite(&sess, &mut rs, now);
+            now += Duration::from_millis(150); // 跨过 100ms min_interval。
+        }
+
+        // 失败兜底：session 被主动摘除 + teardown（等 detached cleanup 完成）。
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && m.current().is_some() {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            m.current().is_none(),
+            "连续 {} 次 re-invite 无 RTP 必须主动 teardown",
+            m.reinvite_fail_threshold
+        );
+        assert!(
+            fp.starts.load(Ordering::SeqCst) > DEFAULT_REINVITE_FAIL_THRESHOLD,
+            "应已多次重发 704"
+        );
+        m.shutdown(Duration::from_secs(3));
+    }
+
+    /// 5.4 对偶：re-invite 后 RTP 恢复（rtp_packets 前进）→ 失败计数清零、不 teardown。
+    #[test]
+    fn reinvite_success_resets_failure_count() {
+        let (m, _fp, sess) = reinvite_manager();
+        let (_rx, _sub) = sess.frame_buf.subscribe();
+        let mut rs = ReinviteState::default();
+
+        let mut now = Instant::now();
+        // 第 1 次 re-invite。
+        set_rtp_idle(&sess, Duration::from_millis(800));
+        m.tick_reinvite(&sess, &mut rs, now);
+        // 模拟 RTP 恢复：包计数前进。
+        sess.rtp_packets.fetch_add(5, Ordering::SeqCst);
+        // 多轮：每轮 RTP 都恢复 → 失败计数恒清零、永不 teardown。
+        for _ in 0..6 {
+            now += Duration::from_millis(150);
+            set_rtp_idle(&sess, Duration::from_millis(800));
+            m.tick_reinvite(&sess, &mut rs, now);
+            sess.rtp_packets.fetch_add(5, Ordering::SeqCst); // 每次都恢复。
+            assert_eq!(rs.consecutive_failures, 0, "RTP 恢复必须清零失败计数");
+        }
+        assert!(m.current().is_some(), "RTP 持续恢复不得 teardown");
+        m.shutdown(Duration::from_secs(3));
+    }
+
+    /// 修复 1：re-invite 竞态守卫——session 已非 current（teardown 摘走 current）
+    /// 时，即便满足 idle + consumer + 间隔条件也禁发 req=704（防晚到的 704 在 708
+    /// 之后重启外机）。
+    #[test]
+    fn reinvite_skipped_when_session_no_longer_current() {
+        let (m, fp, sess) = reinvite_manager();
+        let starts0 = fp.starts.load(Ordering::SeqCst);
+        let (_rx, _sub) = sess.frame_buf.subscribe(); // 注册活跃 consumer。
+
+        // 模拟 teardown 已摘走 current（但本 tick 仍持有旧 sess Arc）。
+        *m.current.lock().unwrap() = None;
+
+        set_rtp_idle(&sess, Duration::from_millis(800)); // > 阈值，本应触发。
+        let mut rs = ReinviteState::default();
+        m.tick_reinvite(&sess, &mut rs, Instant::now());
+
+        assert_eq!(
+            fp.starts.load(Ordering::SeqCst),
+            starts0,
+            "session 已非 current 时禁发 req=704"
+        );
+    }
+
+    /// 修复 2：stop_by_id 按 session id 匹配——错误 id 不拆当前 session；正确 id 才拆。
+    #[test]
+    fn stop_by_id_matches_session_identity() {
+        let (m, _fp, sess) = reinvite_manager();
+        let real_id = sess.id().to_string();
+
+        // 错误 id：current 不动。
+        m.stop_by_id("00000000-0000-4000-8000-000000000000");
+        assert!(m.current().is_some(), "错误 session id 不得拆当前 session");
+
+        // 正确 id：摘除并 teardown。
+        m.stop_by_id(&real_id);
+        assert!(m.current().is_none(), "正确 session id 必须拆当前 session");
+        m.shutdown(Duration::from_secs(3));
     }
 
     // --- mock 18022 外机：真 PreviewClient 全链路 Start 成功 / teardown stop ---

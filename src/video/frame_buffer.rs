@@ -158,10 +158,19 @@ impl FrameBuffer {
     }
 
     /// 返回最近 (SPS, PPS, IDR) 三件套种子（任一缺失返 `None`）。
+    ///
+    /// 种子三槽是 per-NAL 分别更新的，re-invite 换流首帧 SPS→PPS→IDR 三次 push
+    /// 之间存在 µs 窗口可凑出混 epoch 三元组（新参数集 + 旧 IDR slice）。仅当三者
+    /// `stream_epoch` 全相等才返 `Some`，否则 `None`——复用既有「None → 504 + 不刷
+    /// TTL」健康闸（消费者重试，µs 窗后必得一致三元组）。
     pub fn latest_idr(&self) -> Option<(NalUnit, NalUnit, NalUnit)> {
         let inner = self.inner.lock().unwrap();
         match (&inner.sps, &inner.pps, &inner.idr) {
-            (Some(sps), Some(pps), Some(idr)) => Some((sps.clone(), pps.clone(), idr.clone())),
+            (Some(sps), Some(pps), Some(idr))
+                if sps.stream_epoch == idr.stream_epoch && pps.stream_epoch == idr.stream_epoch =>
+            {
+                Some((sps.clone(), pps.clone(), idr.clone()))
+            }
             _ => None,
         }
     }
@@ -208,6 +217,14 @@ impl FrameBuffer {
         self.inner.lock().unwrap().closed
     }
 
+    /// 返当前活跃 consumer 数量（订阅 `stream.flv` 的拉流者数）。
+    ///
+    /// re-invite 驱动器据此判活跃消费者：无人观看（0）时禁止重发 req=704
+    /// 骚扰外机。
+    pub fn consumer_count(&self) -> usize {
+        self.inner.lock().unwrap().consumers.len()
+    }
+
     /// 摘除指定 consumer（退订句柄内部用）。
     fn remove_consumer(&self, id: u64) {
         let mut inner = self.inner.lock().unwrap();
@@ -252,6 +269,7 @@ mod tests {
             nal_type,
             data: data.to_vec(),
             timestamp: ts,
+            stream_epoch: 0,
         }
     }
 
@@ -280,6 +298,37 @@ mod tests {
         b.push(nal(NAL_TYPE_SPS, &[0x67], 0));
         b.push(nal(NAL_TYPE_IDR, &[0x65], 0));
         assert!(b.latest_idr().is_none(), "missing PPS must yield None");
+    }
+
+    /// 种子三元组 epoch 一致性：re-invite 换流首帧 SPS→PPS→IDR 三次 push 之间的
+    /// µs 窗里 sps/pps 已是新 epoch、idr 仍旧 epoch → latest_idr 返 None（避免新
+    /// 参数集解旧 IDR slice）；三者同 epoch → 返 Some。
+    #[test]
+    fn latest_idr_requires_consistent_epoch() {
+        let b = FrameBuffer::new();
+        let with_epoch = |nal_type: u8, data: &[u8], epoch: u32| NalUnit {
+            nal_type,
+            data: data.to_vec(),
+            timestamp: 0,
+            stream_epoch: epoch,
+        };
+        // 混 epoch：sps/pps 新世代(1)、idr 旧世代(0)。
+        b.push(with_epoch(NAL_TYPE_SPS, &[0x67], 1));
+        b.push(with_epoch(NAL_TYPE_PPS, &[0x68], 1));
+        b.push(with_epoch(NAL_TYPE_IDR, &[0x65], 0));
+        assert!(
+            b.latest_idr().is_none(),
+            "mixed-epoch triple must yield None"
+        );
+        // 新 epoch 的 IDR 到达 → 三槽一致 → Some。
+        b.push(with_epoch(NAL_TYPE_IDR, &[0x65], 1));
+        let (sps, pps, idr) = b
+            .latest_idr()
+            .expect("consistent-epoch triple must yield Some");
+        assert_eq!(
+            (sps.stream_epoch, pps.stream_epoch, idr.stream_epoch),
+            (1, 1, 1)
+        );
     }
 
     /// IDR 已 push 后 wait_idr 立即返回。

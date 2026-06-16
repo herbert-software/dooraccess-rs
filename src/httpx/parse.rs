@@ -108,6 +108,7 @@ pub fn read_request<R: BufRead>(
         host,
         remote_addr: String::new(),
         content_length,
+        peek_conn: None,
     })
 }
 

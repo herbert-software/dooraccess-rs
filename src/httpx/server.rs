@@ -272,6 +272,9 @@ fn serve_conn_inner(stream: &mut TcpStream, ctx: &ServerConnCtx) {
     if let Ok(addr) = stream.peer_addr() {
         req.remote_addr = addr.to_string();
     }
+    // 只读克隆底层连接，供长连接 handler（video stream）peek 探测对端 FIN。
+    // try_clone 失败（罕见）→ None，handler 退化为仅靠写探测检断开。
+    req.peek_conn = stream.try_clone().ok();
 
     let mut write_wrapper = WriteDeadlineWriter {
         stream,

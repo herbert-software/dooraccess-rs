@@ -104,7 +104,7 @@ pub fn parse_rtp(b: &[u8]) -> Result<RtpPacket, RtpError> {
 ///
 /// `data` 持有所有权：切 frame 时 NAL 字节脱离重组 buffer（深拷），
 /// 下一 frame 复写 buffer 不会污染已交付的 NAL。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NalUnit {
     /// NAL 类型（5 IDR / 7 SPS / 8 PPS / 1 non-IDR / ...）。
     pub nal_type: u8,
@@ -112,6 +112,11 @@ pub struct NalUnit {
     pub data: Vec<u8>,
     /// RTP 时间戳 90kHz。
     pub timestamp: u32,
+    /// 流分段世代（stream epoch）：每次外机换 SSRC（re-invite 取下一波推流）
+    /// receiver 递增并打在该波所有 NAL 上。transmux 据此检出"流重启"以重基准
+    /// 输出 FLV timestamp（跨 re-invite 单调连续）。`extract_nals_annexb` 内部
+    /// 构造默认 0；唯一权威打戳点是 receiver 的 push 循环（持当前 SSRC 世代）。
+    pub stream_epoch: u32,
 }
 
 /// 4 字节 Annex-B start code `00 00 00 01`（实测外机用 4 字节版本，
@@ -136,6 +141,7 @@ pub fn extract_nals_annexb(payload: &[u8], ts: u32) -> Vec<NalUnit> {
                     nal_type: payload[0] & 0x1f,
                     data: payload.to_vec(),
                     timestamp: ts,
+                    stream_epoch: 0,
                 });
             }
             return out;
@@ -147,6 +153,7 @@ pub fn extract_nals_annexb(payload: &[u8], ts: u32) -> Vec<NalUnit> {
             nal_type: payload[0] & 0x1f,
             data: payload[..idx].to_vec(),
             timestamp: ts,
+            stream_epoch: 0,
         });
     }
     let mut rest = &payload[idx + START_CODE.len()..];
@@ -158,6 +165,7 @@ pub fn extract_nals_annexb(payload: &[u8], ts: u32) -> Vec<NalUnit> {
                         nal_type: rest[0] & 0x1f,
                         data: rest.to_vec(),
                         timestamp: ts,
+                        stream_epoch: 0,
                     });
                 }
                 return out;
@@ -169,6 +177,7 @@ pub fn extract_nals_annexb(payload: &[u8], ts: u32) -> Vec<NalUnit> {
                         nal_type: nal[0] & 0x1f,
                         data: nal.to_vec(),
                         timestamp: ts,
+                        stream_epoch: 0,
                     });
                 }
                 rest = &rest[next + START_CODE.len()..];
@@ -234,8 +243,9 @@ pub struct RtpReceiver {
     pub logf: Option<SharedLogFn>,
     /// NAL 写入目标。
     pub buf: Arc<FrameBuffer>,
-    /// 解析到外机 SSRC 时回调（**仅首包**锁存；RTCP RR report block 字段用——
-    /// 外机中途重启换 SSRC 不更新，已知行为保持）。
+    /// 解析到外机 SSRC 时回调（首包锁存 + **SSRC 变化时 re-lock 重新回调**——
+    /// re-invite 取下一波推流外机换新 SSRC，RTCP RR report block 须跟随更新为新
+    /// SSRC；session 层 sink 写 `stream_ssrc`，RTCP `ssrc_source` 动态读它自动跟上）。
     pub ssrc_sink: Option<SsrcSink>,
     /// 测试 hook：每收到一个合法 RTP 包调一次。
     pub packet_hook: Option<PacketHook>,
@@ -284,7 +294,10 @@ impl RtpReceiver {
         let mut last_stats = ReassemblerStats::default();
         let mut next_stats = Instant::now() + interval;
 
-        let mut ssrc_seen = false;
+        let mut locked_ssrc: Option<u32> = None;
+        // 流分段世代：每检出新 SSRC（首包 + 之后每次 re-invite 换流）递增，
+        // 打在该波所有 NAL 上供 transmux 重基准 FLV 时间轴。
+        let mut stream_epoch: u32 = 0;
         let mut buf = [0u8; RECV_BUF_LEN];
         loop {
             if stop.load(Ordering::SeqCst) {
@@ -329,11 +342,24 @@ impl RtpReceiver {
                     continue;
                 }
             };
-            // SSRC 仅首包锁存。
-            if !ssrc_seen {
+            // SSRC 首包锁存 + 变化时 re-lock：外机 re-invite 取下一波推流换新 SSRC，
+            // 检出变化即回调 sink（更新 stream_ssrc 让 RTCP RR 跟随）+ 递增流世代
+            // （首包 epoch=0，之后每次换流 +1；transmux 据此重基准 FLV 时间轴）。
+            if locked_ssrc != Some(pkt.ssrc) {
+                if locked_ssrc.is_some() {
+                    stream_epoch = stream_epoch.wrapping_add(1);
+                    self.logf(&format!(
+                        "video: rtp ssrc re-lock 0x{:08x} -> 0x{:08x} (epoch={})",
+                        locked_ssrc.unwrap_or(0),
+                        pkt.ssrc,
+                        stream_epoch
+                    ));
+                    // 新 SSRC = 新 seq 空间：重置重组态避免跨流字节拼接污染首帧。
+                    reasm.reset_stream();
+                }
+                locked_ssrc = Some(pkt.ssrc);
                 if let Some(sink) = &self.ssrc_sink {
                     sink(pkt.ssrc);
-                    ssrc_seen = true;
                 }
             }
             if let Some(hook) = &self.packet_hook {
@@ -342,7 +368,8 @@ impl RtpReceiver {
             // payload 所有权已在 parse_rtp 深拷（read loop 复用 buf 不会踩烂
             // 重组器持有的 frame 字节流）。
             let (nals, _) = reasm.push(pkt);
-            for nal in nals {
+            for mut nal in nals {
+                nal.stream_epoch = stream_epoch;
                 self.buf.push(nal);
             }
         }
@@ -600,9 +627,9 @@ mod receiver_tests {
         join.join().unwrap().expect("receiver exit");
     }
 
-    /// SSRC 仅首包锁存（外机中途换 SSRC 不更新，已知行为保持）。
+    /// SSRC 首包锁存 + re-invite 换 SSRC 时 re-lock 重新回调（每次换流各一次）。
     #[test]
-    fn ssrc_sink_latches_first_packet_only() {
+    fn ssrc_sink_relocks_on_change() {
         let seen: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_c = Arc::clone(&seen);
         let sink: Box<dyn Fn(u32) + Send + Sync> = Box::new(move |s| {
@@ -613,19 +640,27 @@ mod receiver_tests {
 
         let cli = UdpSocket::bind("127.0.0.1:0").unwrap();
         let payload = [0x00, 0x00, 0x00, 0x01, 0x61, 0x01];
+        // 首包：SSRC=A → epoch 0。
         cli.send_to(&mk_rtp(1, 100, 0x1111_1111, true, &payload), target)
             .unwrap();
-        let _ = rx.recv_timeout(Duration::from_secs(2)).expect("NAL 1");
-        // 第二包换 SSRC——sink 不得再触发。
-        cli.send_to(&mk_rtp(2, 200, 0x2222_2222, true, &payload), target)
+        let n1 = rx.recv_timeout(Duration::from_secs(2)).expect("NAL 1");
+        assert_eq!(n1.stream_epoch, 0, "首波 epoch=0");
+        // 同 SSRC 再推一包——sink 不得重复触发。
+        cli.send_to(&mk_rtp(2, 150, 0x1111_1111, true, &payload), target)
             .unwrap();
-        let _ = rx.recv_timeout(Duration::from_secs(2)).expect("NAL 2");
+        let n1b = rx.recv_timeout(Duration::from_secs(2)).expect("NAL 1b");
+        assert_eq!(n1b.stream_epoch, 0, "同 SSRC 不进位");
+        // re-invite：换 SSRC=B → re-lock + epoch +1。
+        cli.send_to(&mk_rtp(3, 200, 0x2222_2222, true, &payload), target)
+            .unwrap();
+        let n2 = rx.recv_timeout(Duration::from_secs(2)).expect("NAL 2");
+        assert_eq!(n2.stream_epoch, 1, "换 SSRC 后 epoch=1");
 
         let got = seen.lock().unwrap().clone();
         assert_eq!(
             got,
-            vec![0x1111_1111],
-            "SSRC must latch on first packet only"
+            vec![0x1111_1111, 0x2222_2222],
+            "SSRC must latch first packet then re-lock on change"
         );
 
         stop.store(true, Ordering::SeqCst);
