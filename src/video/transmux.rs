@@ -234,6 +234,9 @@ pub struct StreamWriter<W: Write> {
     /// 当前段缓存的 SPS/PPS（换段时用于重发 AVC sequence header 让解码器重初始化）。
     seg_sps: Option<Vec<u8>>,
     seg_pps: Option<Vec<u8>>,
+    /// 跨 re-invite 检测到换段后置位：推迟到本段 IDR 前用**已刷新**的 seg_sps/seg_pps
+    /// 发 seq-header（避免用上段缓存的旧参数集前缀本段 IDR）。
+    pending_seq_header: bool,
 }
 
 impl<W: Write> StreamWriter<W> {
@@ -248,6 +251,7 @@ impl<W: Write> StreamWriter<W> {
             last_flv_ts: 0,
             seg_sps: None,
             seg_pps: None,
+            pending_seq_header: false,
         }
     }
 
@@ -316,16 +320,9 @@ impl<W: Write> StreamWriter<W> {
                 // 新段基线 = 上段高水位 + 一帧间隙（严格单调，不回退/跳变）。
                 self.segment_base_flv = self.last_flv_ts.saturating_add(SEGMENT_GAP_MS);
                 self.last_flv_ts = self.segment_base_flv;
-                // 新段重发 AVC sequence header 让解码器重初始化（用已知的 SPS/PPS；
-                // 若本段尚未带新 SPS/PPS 则沿用上段缓存——in-band 每段都带，
-                // 紧随的 SPS/PPS NAL 会刷新缓存）。
-                if let (Some(sps), Some(pps)) = (self.seg_sps.clone(), self.seg_pps.clone()) {
-                    if let Some(seq) =
-                        build_avc_sequence_header_tag(&sps, &pps, self.segment_base_flv)
-                    {
-                        self.w.write_all(&seq).map_err(StreamError::Io)?;
-                    }
-                }
+                // 推迟重发 seq-header 到本段 IDR 前：紧随的 SPS/PPS NAL 先刷新缓存
+                // （in-band 每段都带），seq-header 才用**本段**而非上段的参数集。
+                self.pending_seq_header = true;
             }
 
             // 缓存本段 SPS/PPS（供换段重发 seq-header）；SPS/PPS 本身不作 NALU tag
@@ -342,6 +339,18 @@ impl<W: Write> StreamWriter<W> {
                 _ => {}
             }
             // IDR 不跳过——后续每个 IDR 以 keyframe tag（0x17）写出。
+            // 换段后第一个 IDR 前补发 seq-header（用本段已刷新的 SPS/PPS，ts 同段基线）；
+            // 若本段未带新 SPS/PPS 则 seg_sps/seg_pps 仍是上段缓存（与旧 fallback 等价）。
+            if self.pending_seq_header && n.nal_type == NAL_TYPE_IDR {
+                if let (Some(sps), Some(pps)) = (self.seg_sps.clone(), self.seg_pps.clone()) {
+                    if let Some(seq) =
+                        build_avc_sequence_header_tag(&sps, &pps, self.segment_base_flv)
+                    {
+                        self.w.write_all(&seq).map_err(StreamError::Io)?;
+                    }
+                }
+                self.pending_seq_header = false;
+            }
             let ts = self.relative_flv_timestamp(n.timestamp);
             if let Some(t) = build_avc_nalu_tag(std::slice::from_ref(&n), ts) {
                 self.w.write_all(&t).map_err(StreamError::Io)?;
@@ -866,6 +875,84 @@ mod stream_writer_tests {
         // 段 1 IDR 须作 keyframe NALU tag 写出。
         let kf = tags.iter().filter(|(_, b)| is_keyframe_nalu(b)).count();
         assert!(kf >= 2, "段 0/段 1 IDR 均须 keyframe tag（got {kf}）");
+    }
+
+    /// 跨 re-invite seq-header 用**本段**而非上段 SPS：段 1 带与段 0 不同字节的 SPS，
+    /// 断言段 1 IDR 前的 seq-header 含段 1 的 SPS 字节（而非段 0 的），且 seq-header
+    /// 仍每段恰一次、仍在该段 IDR keyframe 之前。
+    #[test]
+    fn reinvite_seq_header_uses_new_segment_sps() {
+        // 段 0 / 段 1 的 SPS 在 byte 3（level）等处不同字节——足以区分。
+        let sps0: [u8; 4] = [0x67, 0x64, 0xc0, 0x16];
+        let sps1: [u8; 4] = [0x67, 0x64, 0xc0, 0x29];
+        assert_ne!(sps0, sps1, "两段 SPS 必须不同字节");
+
+        let buf = Arc::new(FrameBuffer::new());
+        // 段 0：种子 IDR（epoch 0）。
+        buf.push(nal_ep(NAL_TYPE_SPS, &sps0, 90000, 0));
+        buf.push(nal_ep(NAL_TYPE_PPS, &[0x68, 0xee, 0x31], 90000, 0));
+        buf.push(nal_ep(NAL_TYPE_IDR, &[0x65, 0xaa], 90000, 0));
+        buf.wait_idr(Duration::from_millis(100)).expect("seeded");
+
+        let out = SharedBuf::default();
+        let out_c = out.clone();
+        let buf_c = Arc::clone(&buf);
+        let join = thread::spawn(move || StreamWriter::new(out_c).run(&buf_c));
+
+        thread::sleep(Duration::from_millis(50));
+        // re-invite：段 1 带不同 SPS（epoch 1），SPS/PPS 先于 IDR 到达。
+        buf.push(nal_ep(NAL_TYPE_SPS, &sps1, 5000, 1));
+        buf.push(nal_ep(NAL_TYPE_PPS, &[0x68, 0xee, 0x31], 5000, 1));
+        buf.push(nal_ep(NAL_TYPE_IDR, &[0x65, 0xab], 5000, 1)); // 段 1 首 IDR。
+        thread::sleep(Duration::from_millis(50));
+        buf.close();
+        join.join().unwrap().expect("run exits Ok on close");
+
+        let tags = walk_tags(&out.bytes());
+        // 收集所有 seq-header tag（body[0]=0x17 && body[1]=seq）。
+        let seq_headers: Vec<&(u32, Vec<u8>)> = tags
+            .iter()
+            .filter(|(_, b)| b.len() >= 2 && b[0] == 0x17 && b[1] == FLV_AVC_SEQ_HEADER)
+            .collect();
+        assert_eq!(
+            seq_headers.len(),
+            2,
+            "seq-header 仍每段恰一次（段 0 priming + 段 1 换段）：{tags:?}"
+        );
+        // 段 0 seq-header 含 sps0、不含 sps1；段 1 seq-header 含 sps1。
+        let contains = |body: &[u8], pat: &[u8]| body.windows(pat.len()).any(|w| w == pat);
+        assert!(
+            contains(&seq_headers[0].1, &sps0),
+            "段 0 seq-header 须含段 0 SPS"
+        );
+        assert!(
+            contains(&seq_headers[1].1, &sps1),
+            "段 1 seq-header 必须含段 1 的 SPS（修复前用的是段 0 旧缓存）"
+        );
+        assert!(
+            !contains(&seq_headers[1].1, &sps0),
+            "段 1 seq-header 不得含段 0 的旧 SPS"
+        );
+        // seq-header 必须出现在段 1 IDR keyframe NALU tag 之前：
+        // 找段 1 seq-header 与其后首个 keyframe NALU tag 的下标顺序。
+        let seq1_ts = seq_headers[1].0;
+        let seq1_idx = tags
+            .iter()
+            .position(|(ts, b)| {
+                *ts == seq1_ts
+                    && b.len() >= 2
+                    && b[0] == 0x17
+                    && b[1] == FLV_AVC_SEQ_HEADER
+                    && contains(b, &sps1)
+            })
+            .expect("段 1 seq-header 下标");
+        let kf_after = tags[seq1_idx + 1..]
+            .iter()
+            .position(|(_, b)| is_keyframe_nalu(b));
+        assert!(
+            kf_after.is_some(),
+            "段 1 seq-header 之后须紧随段 1 IDR keyframe NALU tag"
+        );
     }
 
     /// 5.3：recv 超时（RTP 停）期间 socket 写探测失败 → run 返回 Err(Io)

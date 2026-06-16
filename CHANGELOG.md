@@ -23,6 +23,8 @@
   并打「流分段世代（stream epoch）」标在该波 NAL 上；transmux 检出 epoch 变化即重基准 FLV
   timestamp（新段 = 上段高水位 + ~40ms 一帧间隙），保证输出**单调递增不跳变**，并每段重发
   AVC sequence header 让解码器重初始化。RTCP RR 的 `ssrc_source` 自动跟随新 SSRC。
+  换段重发的 seq-header 推迟到本段首 IDR 之前发出，确保用**本段**刷新后的 SPS/PPS
+  而非上段旧缓存（Bugbot Low；与 Go 对称）。
 - **消费端断开检测 + teardown**：
   - transmux `rx.recv()` → `recv_timeout(500ms)` + socket 写探测（RTP 停时周期探测，broken-pipe → 退出）；
   - httpx 层暴露连接只读克隆（`Request::peek_conn`）；stream handler 起 FIN peek 线程，
