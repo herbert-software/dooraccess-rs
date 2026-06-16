@@ -9,7 +9,7 @@
 > （见 `dooraccess-go/DEPLOY.md` §Rust 生产部署 + OpenSpec `promote-rust-to-production`）。
 > 下列实测占位符在打 tag 前据真机结果填实。
 
-## Unreleased — 视频转发推流维持 + 消费端断开 teardown（`harden-video-sustain-and-teardown`）
+## v1.0.1 — 2026-06-16 — 视频转发推流维持 + 消费端断开 teardown（`harden-video-sustain-and-teardown`）
 
 修两个共享根因的视频转发缺陷（实证 `samples/anjubao-video-stream/observations.md` §10）：
 ① 外机对单 `req=704` 仅推 ≈16.3s/~330 帧自停，daemon 不重发 → HA/HomeKit ~16s 后冻帧；
