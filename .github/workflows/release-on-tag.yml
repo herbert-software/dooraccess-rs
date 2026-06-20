@@ -25,7 +25,7 @@ jobs:
     name: build + release MIPS BE soft-float
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install nightly + rust-src + llvm-tools
         run: |
           rustup toolchain install nightly --profile minimal
